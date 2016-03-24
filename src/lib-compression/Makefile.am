@@ -15,7 +15,7 @@ libcompression_la_SOURCES = \
 	ostream-zlib.c \
 	ostream-bzlib.c
 libcompression_la_LIBADD = \
-	$(COMPRESS_LIBS)
+	$(COMPRESS_LIBS) -ldl
 
 pkginc_libdir = $(pkgincludedir)
 pkginc_lib_HEADERS = \
