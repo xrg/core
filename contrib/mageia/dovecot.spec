@@ -1,3 +1,6 @@
+%define git_repo dovecot
+%define git_head HEAD
+
 %define url_ver %(echo %{version} | cut -d. -f1,2)
 
 %define build_gssapi 1
@@ -30,23 +33,15 @@
 
 Summary:	Secure IMAP and POP3 server
 Name:		dovecot
-Version:	2.2.6
+Version:	%git_get_ver
 %define subrel 2
-Release:	%mkrel 2
+Release:	%mkrel %git_get_rel2
 License:	MIT and LGPLv2 and BSD-like and Public Domain
 Group:		System/Servers
 URL:		http://dovecot.org
-Source0:	http://dovecot.org/releases/%{url_ver}/%{name}-%{version}.tar.gz
-Source1:	http://dovecot.org/releases/%{url_ver}/%{name}-%{version}.tar.gz.sig
-Source2:	%{name}-pamd
-Source4:	http://dovecot.org/tools/migration_wuimp_to_dovecot.pl
-Source5:	http://dovecot.org/tools/mboxcrypt.pl
-Source6:	http://www.rename-it.nl/%{name}/%{url_ver}/%{name}-%{url_ver}-pigeonhole-%{pigeonhole_ver}.tar.gz
-Source7:	http://www.rename-it.nl/%{name}/%{url_ver}/%{name}-%{url_ver}-pigeonhole-%{pigeonhole_ver}.tar.gz.sig
-Source8:	http://www.earth.ox.ac.uk/~steve/sieve/procmail2sieve.pl
-Source9:	%{name}-tmpfiles.conf
-Patch0:		dovecot-2.2.6-compress-ldl.patch
-Patch1:		dovecot-2.2.6-CVE-2014-3430.diff
+Source:		%git_bs_source %{name}-%{version}.tar.gz
+Source1:	%{name}-gitrpm.version
+Source2:	%{name}-changelog.gitrpm.txt
 Provides:	imap-server pop3-server
 Provides:	imaps-server pop3s-server
 Requires(post):	systemd >= %{systemd_required_version}
@@ -114,82 +109,82 @@ You can build %{name} with some conditional build swithes;
 
 %if %{build_pigeonhole}
 
-%package	pigeonhole
+%package pigeonhole
 Summary:	Pigeonhole Sieve/ManageSieve plugin for dovecot LDA
 Group:		System/Servers
 Requires:	%{name} >= %{version}
 Obsoletes:	%{name}-plugins-sieve < 2.0, %{name}-plugins-managesieve < 2.0
 
-%description	pigeonhole
+%description pigeonhole
 This package provides the Pigeonhole Sieve/ManageSieve plugin version %{pigeonhole_ver}
 for dovecot LDA.
 
-%package	pigeonhole-devel
+%package pigeonhole-devel
 Summary:	Pigeonhole Sieve/ManageSieve development files
 Group:		Development/C
 Requires:	%{name}-pigeonhole >= %{version}
 
-%description	pigeonhole-devel
+%description pigeonhole-devel
 This package contains development files for Pigeonhole Sieve/ManageSieve %{pigeonhole_ver}.
 
 %endif
 
 %if %{build_pgsql}
-%package	plugins-pgsql
+%package plugins-pgsql
 Summary:	Postgres SQL backend for dovecot
 Group:		System/Servers
 Requires:	%{name} >= %{version}
 
-%description	plugins-pgsql
+%description plugins-pgsql
 This package provides the Postgres SQL backend for dovecot-auth etc.
 %endif
 
 %if %{build_mysql}
-%package	plugins-mysql
+%package plugins-mysql
 Summary:	MySQL backend for dovecot
 Group:		System/Servers
 Requires:	%{name} >= %{version}
 
-%description	plugins-mysql
+%description plugins-mysql
 This package provides the MySQL backend for dovecot-auth etc.
 %endif
 
 %if %{build_ldap}
-%package	plugins-ldap
+%package plugins-ldap
 Summary:	LDAP support for dovecot
 Group:		System/Servers
 Requires:	%{name} >= %{version}
 
-%description	plugins-ldap
+%description plugins-ldap
 This package provides LDAP capabilities to dovecot in a modular form.
 %endif
 
 %if %{build_gssapi}
-%package	plugins-gssapi
+%package plugins-gssapi
 Summary:	GSSAPI support for dovecot
 Group:		System/Servers
 Requires:	%{name} >= %{version}
 
-%description	plugins-gssapi
+%description plugins-gssapi
 This package provides GSSAPI capabilities to dovecot in a modular form.
 %endif
 
 %if %{build_sqlite}
-%package	plugins-sqlite
+%package plugins-sqlite
 Summary:	SQLite backend for dovecot
 Group:		System/Servers
 Requires:	%{name} >= %{version}
 
-%description	plugins-sqlite
+%description plugins-sqlite
 This package provides the SQLite backend for dovecot-auth etc.
 %endif
 
-%package	devel
+%package devel
 Summary:	Development files for Dovecot IMAP and POP3 server
 Group:		Development/C
 Requires:	%{name} >= %{version}
 
-%description	devel
+%description devel
 Dovecot is an IMAP and POP3 server for Linux/UNIX-like systems, written with
 security primarily in mind. Although it's written with C, it uses several
 coding techniques to avoid most of the common pitfalls.
@@ -202,6 +197,7 @@ This package contains development files for dovecot.
 
 %prep
 
+%git_get_source
 %setup -q
 # Bug #27491
 %if %{build_lucene}
@@ -209,11 +205,9 @@ sed -i '/DEFAULT_INCLUDES *=/s|$| '"$(pkg-config --cflags libclucene-core)|" src
 %endif
 
 %if %{build_pigeonhole}
-%setup -q -D -T -a 6
 %define	pigeonhole_dir %{name}-%{url_ver}-pigeonhole-%{pigeonhole_ver}
 %endif
 
-%apply_patches
 
 %build
 %serverbuild
@@ -284,7 +278,7 @@ install -d -m 755 %{buildroot}%{_docdir}/%{name}-pigeonhole
 
 %endif
 
-cat %{SOURCE2} > %{buildroot}%{_sysconfdir}/pam.d/%{name}
+cat contrib/mageia/dovecot-pamd > %{buildroot}%{_sysconfdir}/pam.d/%{name}
 
 install -m 644 doc/example-config/%{name}*.conf* %{buildroot}%{_sysconfdir}/%{name}
 install -m 644 doc/example-config/conf.d/*.conf* %{buildroot}%{_sysconfdir}/%{name}/conf.d
@@ -294,16 +288,16 @@ install -m 644 doc/example-config/conf.d/*.conf* %{buildroot}%{_sysconfdir}/%{na
 # Let's switch to IPv4-only configuration for now.
 sed -e "/listen =/ a\listen = *" -i %{buildroot}%{_sysconfdir}/%{name}/dovecot.conf
 
-cp %{SOURCE4} .
-cp %{SOURCE5} .
+cp contrib/mageia/migration_wuimp_to_dovecot.pl .
+cp contrib/mageia/mboxcrypt.pl .
 
 # procmail2sieve converter
 install -d -m 755 %{buildroot}%{_bindir}
-install %{SOURCE8} -m 755 %{buildroot}%{_bindir}
+install contrib/mageia/procmail2sieve.pl -m 755 %{buildroot}%{_bindir}
 perl -pi -e 's|#!/usr/local/bin/perl|#!%{_bindir}/perl|' \
     %{buildroot}%{_bindir}/procmail2sieve.pl
 
-install -D -p -m 0644 %{SOURCE9} %{buildroot}%{_tmpfilesdir}/%{name}.conf
+install -D -p -m 0644 contrib/mageia/dovecot-tmpfiles.conf %{buildroot}%{_tmpfilesdir}/%{name}.conf
 
  # automatic reloading for new plugins
 install -d %{buildroot}%{_var}/lib/rpm/filetriggers
