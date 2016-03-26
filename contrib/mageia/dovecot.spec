@@ -9,6 +9,7 @@
 %define build_mysql 1
 %define build_pgsql 1
 %define build_sqlite 1
+%define build_fts 1
 
 %{?_with_gssapi: %{expand: %%global build_gssapi 1}}
 %{?_without_gssapi: %{expand: %%global build_gssapi 0}}
@@ -73,6 +74,9 @@ BuildRequires:	krb5-devel
 %endif
 %if %{build_sqlite}
 BuildRequires: sqlite3-devel
+%endif
+%if %{build_fts}
+BuildRequires: libicu-devel
 %endif
 BuildRequires:	rpm-helper >= 0.21
 BuildRequires:	zlib-devel
@@ -147,6 +151,16 @@ Requires:	%{name} >= %{version}
 
 %description plugins-sqlite
 This package provides the SQLite backend for dovecot-auth etc.
+%endif
+
+%if %{build_fts}
+%package plugins-fts
+Summary:        Full Text Search engine for dovecot
+Group:          System/Servers
+Requires:       %{name} >= %{version}
+
+%description plugins-fts
+This package provides FTS engine for dovecot.
 %endif
 
 %package devel
@@ -417,6 +431,13 @@ find %{buildroot} -name '*.la' -delete
 %{_libdir}/%{name}/modules/auth/libdriver_pgsql.so
 %{_libdir}/%{name}/modules/dict/libdriver_pgsql.so
 %endif
+
+%if %{build_fts}
+%files plugins-fts
+%{_datadir}/%{name}/stopwords/stopwords_*.txt
+%{_libdir}/%{name}/libdovecot-fts.so*
+%endif
+
 
 %files devel
 %dir %{_includedir}/%{name}
