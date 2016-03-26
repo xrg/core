@@ -166,18 +166,19 @@ accessing the mailboxes directly.
 This package contains development files for dovecot.
 
 %prep
-
 %git_get_source
 %setup -q
 # Bug #27491
-%if %{build_lucene}
-sed -i '/DEFAULT_INCLUDES *=/s|$| '"$(pkg-config --cflags libclucene-core)|" src/plugins/fts-lucene/Makefile.in
-%endif
 
 
 
 %build
 %serverbuild
+./autogen.sh
+%if %{build_lucene}
+sed -i '/DEFAULT_INCLUDES *=/s|$| '"$(pkg-config --cflags libclucene-core)|" src/plugins/fts-lucene/Makefile.in
+%endif
+
 %configure2_5x \
     --disable-static \
     --with-sql=plugin \
