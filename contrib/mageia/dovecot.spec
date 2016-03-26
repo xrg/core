@@ -274,7 +274,7 @@ find %{buildroot} -name '*.la' -delete
 %_postun_groupdel dovenull
 
 %files
-%doc AUTHORS ChangeLog COPYING* NEWS README TODO
+%doc AUTHORS COPYING* NEWS README TODO
 %doc mboxcrypt.pl migration_wuimp_to_dovecot.pl
 %doc %{_docdir}/%{name}
 
@@ -290,6 +290,7 @@ find %{buildroot} -name '*.la' -delete
 %config(noreplace) %{_sysconfdir}/dovecot/conf.d/10-auth.conf
 %config(noreplace) %{_sysconfdir}/dovecot/conf.d/10-director.conf
 %config(noreplace) %{_sysconfdir}/dovecot/conf.d/10-logging.conf
+%config(noreplace) %{_sysconfdir}/dovecot/conf.d/11-object-storage.conf
 %config(noreplace) %{_sysconfdir}/dovecot/conf.d/10-mail.conf
 %config(noreplace) %{_sysconfdir}/dovecot/conf.d/10-master.conf
 %config(noreplace) %{_sysconfdir}/dovecot/conf.d/10-ssl.conf
