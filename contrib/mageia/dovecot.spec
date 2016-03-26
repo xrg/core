@@ -1,7 +1,6 @@
 %define git_repo dovecot
 %define git_head HEAD
 
-%define url_ver %(echo %{version} | cut -d. -f1,2)
 
 %define build_gssapi 1
 %define build_ldap 1
@@ -29,7 +28,6 @@
 Summary:	Secure IMAP and POP3 server
 Name:		dovecot
 Version:	%git_get_ver
-%define subrel 2
 Release:	%mkrel %git_get_rel2
 License:	MIT and LGPLv2 and BSD-like and Public Domain
 Group:		System/Servers
