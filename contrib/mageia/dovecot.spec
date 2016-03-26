@@ -10,7 +10,6 @@
 %define build_mysql 1
 %define build_pgsql 1
 %define build_sqlite 1
-%define build_pigeonhole 1
 
 %{?_with_gssapi: %{expand: %%global build_gssapi 1}}
 %{?_without_gssapi: %{expand: %%global build_gssapi 0}}
@@ -26,10 +25,6 @@
 %{?_without_pgsql: %{expand: %%global build_pgsql 0}}
 %{?_with_sqlite: %{expand: %%global build_sqlite 1}}
 %{?_without_sqlite: %{expand: %%global build_sqlite 0}}
-%{?_with_pigeonhole: %{expand: %%global build_pigeonhole 1}}
-%{?_without_pigeonhole: %{expand: %%global build_pigeonhole 0}}
-
-%define pigeonhole_ver 0.4.2
 
 Summary:	Secure IMAP and POP3 server
 Name:		dovecot
@@ -105,29 +100,6 @@ You can build %{name} with some conditional build swithes;
     --with[out] mysql		MySQL support (enabled)
     --with[out] pgsql		PostgreSQL support (enabled)
     --with[out] sqlite		SQLite support (enabled)
-    --with[out] sieve		Pigeonhole Sieve and ManageSieve support (enabled)
-
-%if %{build_pigeonhole}
-
-%package pigeonhole
-Summary:	Pigeonhole Sieve/ManageSieve plugin for dovecot LDA
-Group:		System/Servers
-Requires:	%{name} >= %{version}
-Obsoletes:	%{name}-plugins-sieve < 2.0, %{name}-plugins-managesieve < 2.0
-
-%description pigeonhole
-This package provides the Pigeonhole Sieve/ManageSieve plugin version %{pigeonhole_ver}
-for dovecot LDA.
-
-%package pigeonhole-devel
-Summary:	Pigeonhole Sieve/ManageSieve development files
-Group:		Development/C
-Requires:	%{name}-pigeonhole >= %{version}
-
-%description pigeonhole-devel
-This package contains development files for Pigeonhole Sieve/ManageSieve %{pigeonhole_ver}.
-
-%endif
 
 %if %{build_pgsql}
 %package plugins-pgsql
@@ -204,9 +176,6 @@ This package contains development files for dovecot.
 sed -i '/DEFAULT_INCLUDES *=/s|$| '"$(pkg-config --cflags libclucene-core)|" src/plugins/fts-lucene/Makefile.in
 %endif
 
-%if %{build_pigeonhole}
-%define	pigeonhole_dir %{name}-%{url_ver}-pigeonhole-%{pigeonhole_ver}
-%endif
 
 
 %build
@@ -247,16 +216,6 @@ sed -i '/DEFAULT_INCLUDES *=/s|$| '"$(pkg-config --cflags libclucene-core)|" src
 
 %make
 
-%if %{build_pigeonhole}
-pushd %{pigeonhole_dir}
-autoreconf -fi
-%configure2_5x \
-    --disable-static \
-    --with-dovecot=../ \
-    --with-unfinished-features 
-%make
-popd
-%endif
 
 %install
 install -d %{buildroot}%{_sysconfdir}/%{name}/conf.d
@@ -265,18 +224,6 @@ install -d %{buildroot}%{_libdir}/%{name}/modules
 install -d %{buildroot}%{_localstatedir}/lib/%{name}
 
 %makeinstall_std
-
-%if %{build_pigeonhole}
-
-pushd %{pigeonhole_dir}
-%makeinstall_std
-mv %{buildroot}%{_libdir}/%{name}/sieve %{buildroot}%{_libdir}/%{name}/modules
-install -m 644 doc/example-config/conf.d/*.conf* %{buildroot}%{_sysconfdir}/%{name}/conf.d
-popd
-
-install -d -m 755 %{buildroot}%{_docdir}/%{name}-pigeonhole
-
-%endif
 
 cat contrib/mageia/dovecot-pamd > %{buildroot}%{_sysconfdir}/pam.d/%{name}
 
@@ -291,15 +238,9 @@ sed -e "/listen =/ a\listen = *" -i %{buildroot}%{_sysconfdir}/%{name}/dovecot.c
 cp contrib/mageia/migration_wuimp_to_dovecot.pl .
 cp contrib/mageia/mboxcrypt.pl .
 
-# procmail2sieve converter
-install -d -m 755 %{buildroot}%{_bindir}
-install contrib/mageia/procmail2sieve.pl -m 755 %{buildroot}%{_bindir}
-perl -pi -e 's|#!/usr/local/bin/perl|#!%{_bindir}/perl|' \
-    %{buildroot}%{_bindir}/procmail2sieve.pl
-
 install -D -p -m 0644 contrib/mageia/dovecot-tmpfiles.conf %{buildroot}%{_tmpfilesdir}/%{name}.conf
 
- # automatic reloading for new plugins
+#  automatic reloading for new plugins
 install -d %{buildroot}%{_var}/lib/rpm/filetriggers
 cat > %{buildroot}%{_var}/lib/rpm/filetriggers/%{name}.filter << EOF
 ^.%{_libdir}/%{name}/modules/.*\.so$
@@ -376,13 +317,6 @@ find %{buildroot} -name '*.la' -delete
 
 %attr(0750,dovecot,dovecot) %dir %{_localstatedir}/lib/%{name}
 
-%if %{build_pigeonhole}
-%exclude %{_libdir}/%{name}/modules/lib90_sieve_plugin.so
-%exclude %{_libdir}/%{name}/modules/sieve
-%exclude %{_libdir}/%{name}/modules/doveadm/lib10_doveadm_sieve_plugin.so
-%exclude %{_libdir}/%{name}/modules/settings/libmanagesieve*.so
-%endif
-
 %{_bindir}/doveadm
 %{_bindir}/doveconf
 %{_bindir}/dsync
@@ -449,39 +383,6 @@ find %{buildroot} -name '*.la' -delete
 
 %{_var}/lib/rpm/filetriggers/%{name}.*
 
-%if %{build_pigeonhole}
-%files pigeonhole
-%doc %{pigeonhole_dir}/{AUTHORS,ChangeLog,COPYING*,INSTALL,NEWS,README}
-%doc %{pigeonhole_dir}/doc/*
-%{_sysconfdir}/%{name}/conf.d/20-managesieve.conf
-%{_sysconfdir}/%{name}/conf.d/90-sieve.conf
-%{_sysconfdir}/%{name}/conf.d/90-sieve-extprograms.conf
-%{_bindir}/procmail2sieve.pl
-%{_bindir}/sieve-dump
-%{_bindir}/sieve-filter
-%{_bindir}/sieve-test
-%{_bindir}/sievec
-%{_libdir}/%{name}/lib%{name}-sieve.so*
-%{_libexecdir}/%{name}/managesieve
-%{_libexecdir}/%{name}/managesieve-login
-%{_libdir}/%{name}/modules/lib90_sieve_plugin.so
-%dir %{_libdir}/%{name}/modules/sieve
-%{_libdir}/%{name}/modules/sieve/lib90_sieve_extprograms_plugin.so
-%{_libdir}/%{name}/modules/doveadm/lib10_doveadm_sieve_plugin.so
-%{_libdir}/%{name}/modules/settings/libmanagesieve_settings.so
-%{_libdir}/%{name}/modules/settings/libmanagesieve_login_settings.so
-%{_mandir}/man1/sievec.1*
-%{_mandir}/man1/sieved.1*
-%{_mandir}/man1/sieve-dump.1*
-%{_mandir}/man1/sieve-filter.1*
-%{_mandir}/man1/sieve-test.1*
-%{_mandir}/man7/pigeonhole.7*
-
-%files pigeonhole-devel
-%{_includedir}/%{name}/sieve
-
-%endif
-
 %if %{build_ldap}
 %files plugins-ldap
 %{_libdir}/%{name}/modules/auth/libauthdb_ldap.so
@@ -518,6 +419,3 @@ find %{buildroot} -name '*.la' -delete
 %{_includedir}/%{name}/*
 %{_libdir}/%{name}/dovecot-config
 %{_datadir}/aclocal/%{name}.m4
-%if %{build_pigeonhole}
-%exclude %{_includedir}/%{name}/sieve
-%endif
