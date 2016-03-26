@@ -82,7 +82,7 @@ mech_apop_auth_initial(struct auth_request *auth_request,
 
 	if (data_size == 0) {
 		/* Should never happen */
-		auth_request_log_info(auth_request, "apop",
+		auth_request_log_info(auth_request, AUTH_SUBSYS_MECH,
 				      "no initial respone");
 		auth_request_fail(auth_request);
 		return;
@@ -105,7 +105,8 @@ mech_apop_auth_initial(struct auth_request *auth_request,
 
 	if (tmp + 1 + 16 != end) {
 		/* Should never happen */
-		auth_request_log_info(auth_request, "apop", "malformed data");
+		auth_request_log_info(auth_request, AUTH_SUBSYS_MECH,
+				      "malformed data");
 		auth_request_fail(auth_request);
 		return;
 	}
@@ -122,7 +123,7 @@ mech_apop_auth_initial(struct auth_request *auth_request,
 	    connect_uid != auth_request->connect_uid ||
             pid != (unsigned long)getpid() ||
 	    (time_t)timestamp < process_start_time) {
-		auth_request_log_info(auth_request, "apop",
+		auth_request_log_info(auth_request, AUTH_SUBSYS_MECH,
 				      "invalid challenge");
 		auth_request_fail(auth_request);
 		return;
@@ -130,7 +131,7 @@ mech_apop_auth_initial(struct auth_request *auth_request,
 
 	if (!auth_request_set_username(auth_request, (const char *)username,
 				       &error)) {
-		auth_request_log_info(auth_request, "apop", "%s", error);
+		auth_request_log_info(auth_request, AUTH_SUBSYS_MECH, "%s", error);
 		auth_request_fail(auth_request);
 		return;
 	}
@@ -144,7 +145,7 @@ static struct auth_request *mech_apop_auth_new(void)
 	struct apop_auth_request *request;
 	pool_t pool;
 
-	pool = pool_alloconly_create("apop_auth_request", 1024);
+	pool = pool_alloconly_create(MEMPOOL_GROWING"apop_auth_request", 2048);
 	request = p_new(pool, struct apop_auth_request, 1);
 	request->pool = pool;
 

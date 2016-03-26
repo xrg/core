@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,6 +7,7 @@
 #include "abspath.h"
 #include "restrict-access.h"
 #include "fd-close-on-exec.h"
+#include "anvil-client.h"
 #include "master-service.h"
 #include "master-service-settings.h"
 #include "master-interface.h"
@@ -16,7 +17,6 @@
 #include "client.h"
 #include "main.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 
 #define DNS_CLIENT_SOCKET_PATH "dns-client"
@@ -27,6 +27,7 @@
 
 const char *dns_client_socket_path, *base_dir;
 struct mail_storage_service_ctx *storage_service;
+struct anvil_client *anvil;
 
 static void client_connected(struct master_service_connection *conn)
 {
@@ -69,6 +70,8 @@ static void main_init(void)
 static void main_deinit(void)
 {
 	clients_destroy();
+	if (anvil != NULL)
+		anvil_client_deinit(&anvil);
 }
 
 int main(int argc, char *argv[])
@@ -78,20 +81,22 @@ int main(int argc, char *argv[])
 		&lmtp_setting_parser_info,
 		NULL
 	};
-	enum master_service_flags service_flags = 0;
+	enum master_service_flags service_flags =
+		MASTER_SERVICE_FLAG_USE_SSL_SETTINGS;
 	enum mail_storage_service_flags storage_service_flags =
 		MAIL_STORAGE_SERVICE_FLAG_DISALLOW_ROOT |
 		MAIL_STORAGE_SERVICE_FLAG_USERDB_LOOKUP |
 		MAIL_STORAGE_SERVICE_FLAG_TEMP_PRIV_DROP |
 		MAIL_STORAGE_SERVICE_FLAG_NO_LOG_INIT |
-		MAIL_STORAGE_SERVICE_FLAG_NO_IDLE_TIMEOUT;
+		MAIL_STORAGE_SERVICE_FLAG_NO_IDLE_TIMEOUT |
+		MAIL_STORAGE_SERVICE_FLAG_AUTOEXPUNGE;
 	int c;
 
 	if (IS_STANDALONE()) {
 		service_flags |= MASTER_SERVICE_FLAG_STANDALONE |
 			MASTER_SERVICE_FLAG_STD_CLIENT;
 	} else {
-		service_flags |= MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN;
+		service_flags |= MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN  ;
 	}
 
 	master_service = master_service_init("lmtp", service_flags,

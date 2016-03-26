@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "hash.h"
@@ -350,20 +350,20 @@ dsync_log_set(struct dsync_transaction_log_scan *ctx,
 {
 	uint32_t log_seq, end_seq;
 	uoff_t log_offset, end_offset;
+	const char *reason;
 	bool reset;
 	int ret;
 
-	if (modseq == 0 ||
-	    !mail_index_modseq_get_next_log_offset(view, modseq,
-						   &log_seq, &log_offset))
-		ret = 0;
-	else {
+	end_seq = view->log_file_head_seq;
+	end_offset = view->log_file_head_offset;
+
+	if (modseq != 0 &&
+	    mail_index_modseq_get_next_log_offset(view, modseq,
+						  &log_seq, &log_offset)) {
 		/* scan the view only up to end of the current view.
 		   if there are more changes, we don't care about them until
 		   the next sync. the modseq may however already point to
 		   beyond the current view's end (FIXME: why?) */
-		end_seq = view->log_file_head_seq;
-		end_offset = view->log_file_head_offset;
 		if (log_seq > end_seq ||
 		    (log_seq == end_seq && log_offset > end_offset)) {
 			end_seq = log_seq;
@@ -372,15 +372,42 @@ dsync_log_set(struct dsync_transaction_log_scan *ctx,
 		ret = mail_transaction_log_view_set(log_view,
 						    log_seq, log_offset,
 						    end_seq, end_offset,
-						    &reset);
+						    &reset, &reason);
+		if (ret != 0)
+			return ret;
 	}
+
+	/* return everything we've got (until the end of the view) */
+	if (!pvt_scan)
+		ctx->returned_all_changes = TRUE;
+	if (mail_transaction_log_view_set_all(log_view) < 0)
+		return -1;
+
+	mail_transaction_log_view_get_prev_pos(log_view, &log_seq, &log_offset);
+	if (log_seq > end_seq ||
+	    (log_seq == end_seq && log_offset > end_offset)) {
+		end_seq = log_seq;
+		end_offset = log_offset;
+	}
+	ret = mail_transaction_log_view_set(log_view,
+					    log_seq, log_offset,
+					    end_seq, end_offset,
+					    &reset, &reason);
 	if (ret == 0) {
-		/* return everything we've got */
-		if (!pvt_scan)
-			ctx->returned_all_changes = TRUE;
-		return mail_transaction_log_view_set_all(log_view);
+		/* we shouldn't get here. _view_set_all() already
+		   reserved all the log files, the _view_set() only
+		   removed unwanted ones. */
+		i_error("%s: Couldn't set transaction log view (seq %u..%u): %s",
+			view->index->filepath, log_seq, end_seq, reason);
+		ret = -1;
 	}
-	return ret < 0 ? -1 : 0;
+	if (ret < 0)
+		return -1;
+	if (modseq != 0) {
+		/* we didn't see all the changes that we wanted to */
+		return 0;
+	}
+	return 1;
 }
 
 static int
@@ -393,9 +420,10 @@ dsync_log_scan(struct dsync_transaction_log_scan *ctx,
 	uint32_t file_seq, max_seq;
 	uoff_t file_offset, max_offset;
 	uint64_t cur_modseq;
+	int ret;
 
 	log_view = mail_transaction_log_view_open(view->index->log);
-	if (dsync_log_set(ctx, view, pvt_scan, log_view, modseq) < 0) {
+	if ((ret = dsync_log_set(ctx, view, pvt_scan, log_view, modseq)) < 0) {
 		mail_transaction_log_view_close(&log_view);
 		return -1;
 	}
@@ -456,7 +484,7 @@ dsync_log_scan(struct dsync_transaction_log_scan *ctx,
 		ctx->last_log_offset = file_offset;
 	}
 	mail_transaction_log_view_close(&log_view);
-	return 0;
+	return ret;
 }
 
 static int
@@ -480,10 +508,14 @@ int dsync_transaction_log_scan_init(struct mail_index_view *view,
 				    struct mail_index_view *pvt_view,
 				    uint32_t highest_wanted_uid,
 				    uint64_t modseq, uint64_t pvt_modseq,
-				    struct dsync_transaction_log_scan **scan_r)
+				    struct dsync_transaction_log_scan **scan_r,
+				    bool *pvt_too_old_r)
 {
 	struct dsync_transaction_log_scan *ctx;
 	pool_t pool;
+	int ret, ret2;
+
+	*pvt_too_old_r = FALSE;
 
 	pool = pool_alloconly_create(MEMPOOL_GROWING"dsync transaction log scan",
 				     10240);
@@ -496,15 +528,19 @@ int dsync_transaction_log_scan_init(struct mail_index_view *view,
 	ctx->view = view;
 	ctx->highest_wanted_uid = highest_wanted_uid;
 
-	if (dsync_log_scan(ctx, view, modseq, FALSE) < 0)
+	if ((ret = dsync_log_scan(ctx, view, modseq, FALSE)) < 0)
 		return -1;
 	if (pvt_view != NULL) {
-		if (dsync_log_scan(ctx, pvt_view, pvt_modseq, TRUE) < 0)
+		if ((ret2 = dsync_log_scan(ctx, pvt_view, pvt_modseq, TRUE)) < 0)
 			return -1;
+		if (ret2 == 0) {
+			ret = 0;
+			*pvt_too_old_r = TRUE;
+		}
 	}
 
 	*scan_r = ctx;
-	return 0;
+	return ret;
 }
 
 HASH_TABLE_TYPE(dsync_uid_mail_change)
@@ -532,6 +568,7 @@ dsync_transaction_log_scan_find_new_expunge(struct dsync_transaction_log_scan *s
 	struct mail_transaction_log_view *log_view;
 	const struct mail_transaction_header *hdr;
 	const void *data;
+	const char *reason;
 	bool reset, found = FALSE;
 
 	i_assert(uid > 0);
@@ -544,7 +581,7 @@ dsync_transaction_log_scan_find_new_expunge(struct dsync_transaction_log_scan *s
 					  scan->last_log_seq,
 					  scan->last_log_offset,
 					  (uint32_t)-1, (uoff_t)-1,
-					  &reset) > 0) {
+					  &reset, &reason) > 0) {
 		while (!found &&
 		       mail_transaction_log_view_next(log_view, &hdr, &data) > 0) {
 			switch (hdr->type & MAIL_TRANSACTION_TYPE_MASK) {

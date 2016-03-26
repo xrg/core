@@ -1,7 +1,9 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
+#include "istream.h"
+#include "ostream.h"
 #include "iostream-private.h"
 
 static void
@@ -62,6 +64,34 @@ void io_stream_set_max_buffer_size(struct iostream_private *stream,
 	stream->set_max_buffer_size(stream, max_size);
 }
 
+void io_stream_add_destroy_callback(struct iostream_private *stream,
+				    void (*callback)(void *), void *context)
+{
+	struct iostream_destroy_callback *dc;
+
+	if (!array_is_created(&stream->destroy_callbacks))
+		i_array_init(&stream->destroy_callbacks, 2);
+	dc = array_append_space(&stream->destroy_callbacks);
+	dc->callback = callback;
+	dc->context = context;
+}
+
+void io_stream_remove_destroy_callback(struct iostream_private *stream,
+				       void (*callback)(void *))
+{
+	const struct iostream_destroy_callback *dcs;
+	unsigned int i, count;
+
+	dcs = array_get(&stream->destroy_callbacks, &count);
+	for (i = 0; i < count; i++) {
+		if (dcs[i].callback == callback) {
+			array_delete(&stream->destroy_callbacks, i, 1);
+			return;
+		}
+	}
+	i_unreached();
+}
+
 void io_stream_set_error(struct iostream_private *stream,
 			 const char *fmt, ...)
 {
@@ -77,4 +107,26 @@ void io_stream_set_verror(struct iostream_private *stream,
 {
 	i_free(stream->error);
 	stream->error = i_strdup_vprintf(fmt, args);
+}
+
+const char *io_stream_get_disconnect_reason(struct istream *input,
+					    struct ostream *output)
+{
+	const char *errstr;
+
+	if (input != NULL && input->stream_errno != 0) {
+		errno = input->stream_errno;
+		errstr = i_stream_get_error(input);
+	} else if (output != NULL && output->stream_errno != 0) {
+		errno = output->stream_errno;
+		errstr = o_stream_get_error(output);
+	} else {
+		errno = 0;
+		errstr = "";
+	}
+
+	if (errno == 0 || errno == EPIPE)
+		return "Connection closed";
+	else
+		return t_strdup_printf("Connection closed: %s", errstr);
 }

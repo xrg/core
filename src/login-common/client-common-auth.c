@@ -1,7 +1,8 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "hostpid.h"
 #include "login-common.h"
+#include "iostream.h"
 #include "istream.h"
 #include "ostream.h"
 #include "str.h"
@@ -12,8 +13,6 @@
 #include "dsasl-client.h"
 #include "master-service-ssl-settings.h"
 #include "client-common.h"
-
-#include <stdlib.h>
 
 #define PROXY_FAILURE_MSG "Account is temporarily unavailable."
 #define PROXY_DEFAULT_TIMEOUT_MSECS (1000*30)
@@ -95,18 +94,32 @@ static void client_auth_parse_args(struct client *client,
 			reply_r->host = value;
 		else if (strcmp(key, "hostip") == 0)
 			reply_r->hostip = value;
-		else if (strcmp(key, "port") == 0)
-			reply_r->port = atoi(value);
-		else if (strcmp(key, "destuser") == 0)
+		else if (strcmp(key, "source_ip") == 0)
+			reply_r->source_ip = value;
+		else if (strcmp(key, "port") == 0) {
+			if (net_str2port(value, &reply_r->port) < 0) {
+				i_error("Auth service returned invalid "
+					"port number: %s", value);
+			}
+		} else if (strcmp(key, "destuser") == 0)
 			reply_r->destuser = value;
 		else if (strcmp(key, "pass") == 0)
 			reply_r->password = value;
-		else if (strcmp(key, "proxy_timeout") == 0)
-			reply_r->proxy_timeout_msecs = 1000*atoi(value);
-		else if (strcmp(key, "proxy_refresh") == 0)
-			reply_r->proxy_refresh_secs = atoi(value);
-		else if (strcmp(key, "proxy_mech") == 0)
+		else if (strcmp(key, "proxy_timeout") == 0) {
+			if (str_to_uint(value, &reply_r->proxy_timeout_msecs) < 0) {
+				i_error("BUG: Auth service returned invalid "
+					"proxy_timeout value: %s", value);
+			}
+			reply_r->proxy_timeout_msecs *= 1000;
+		} else if (strcmp(key, "proxy_refresh") == 0) {
+			if (str_to_uint(value, &reply_r->proxy_refresh_secs) < 0) {
+				i_error("BUG: Auth service returned invalid "
+					"proxy_refresh value: %s", value);
+			}
+		} else if (strcmp(key, "proxy_mech") == 0)
 			reply_r->proxy_mech = value;
+		else if (strcmp(key, "proxy_nopipelining") == 0)
+			reply_r->proxy_nopipelining = TRUE;
 		else if (strcmp(key, "master") == 0)
 			reply_r->master_user = value;
 		else if (strcmp(key, "ssl") == 0) {
@@ -120,8 +133,9 @@ static void client_auth_parse_args(struct client *client,
 				PROXY_SSL_FLAG_STARTTLS;
 			if (strcmp(value, "any-cert") == 0)
 				reply_r->ssl_flags |= PROXY_SSL_FLAG_ANY_CERT;
-		} else if (strcmp(key, "user") == 0) {
-			/* already handled in login-common */
+		} else if (strcmp(key, "user") == 0 ||
+			   strcmp(key, "postlogin_socket") == 0) {
+			/* already handled in sasl-server.c */
 		} else if (client->set->auth_debug)
 			i_debug("Ignoring unknown passdb extra field: %s", key);
 	}
@@ -212,16 +226,10 @@ void client_proxy_failed(struct client *client, bool send_line)
 	client_auth_failed(client);
 }
 
-static const char *get_disconnect_reason(struct istream *input)
-{
-	errno = input->stream_errno;
-	return errno == 0 || errno == EPIPE ? "Connection closed" :
-		t_strdup_printf("Connection closed: %m");
-}
-
 static void proxy_input(struct client *client)
 {
 	struct istream *input;
+	struct ostream *output;
 	const char *line;
 	unsigned int duration;
 
@@ -257,7 +265,7 @@ static void proxy_input(struct client *client)
 			"(state=%u, duration=%us)%s",
 			login_proxy_get_host(client->login_proxy),
 			login_proxy_get_port(client->login_proxy),
-			get_disconnect_reason(input),
+			io_stream_get_disconnect_reason(input, NULL),
 			client->proxy_state, duration,
 			line == NULL ? "" : t_strdup_printf(
 				" - BUG: line not read: %s", line)));
@@ -265,10 +273,15 @@ static void proxy_input(struct client *client)
 		return;
 	}
 
+	output = client->output;
+	o_stream_ref(output);
+	o_stream_cork(output);
 	while ((line = i_stream_next_line(input)) != NULL) {
 		if (client->v.proxy_parse_line(client, line) != 0)
 			break;
 	}
+	o_stream_uncork(output);
+	o_stream_unref(&output);
 }
 
 static int proxy_start(struct client *client,
@@ -328,6 +341,15 @@ static int proxy_start(struct client *client,
 	if (reply->hostip != NULL &&
 	    net_addr2ip(reply->hostip, &proxy_set.ip) < 0)
 		proxy_set.ip.family = 0;
+	if (reply->source_ip != NULL) {
+		if (net_addr2ip(reply->source_ip, &proxy_set.source_ip) < 0)
+			proxy_set.source_ip.family = 0;
+	} else if (login_source_ips_count > 0) {
+		/* select the next source IP with round robin. */
+		proxy_set.source_ip = login_source_ips[login_source_ips_idx];
+		login_source_ips_idx =
+			(login_source_ips_idx + 1) % login_source_ips_count;
+	}
 	proxy_set.port = reply->port;
 	proxy_set.connect_timeout_msecs = reply->proxy_timeout_msecs;
 	if (proxy_set.connect_timeout_msecs == 0)
@@ -344,6 +366,7 @@ static int proxy_start(struct client *client,
 	client->proxy_user = i_strdup(reply->destuser);
 	client->proxy_master_user = i_strdup(reply->master_user);
 	client->proxy_password = i_strdup(reply->password);
+	client->proxy_nopipelining = reply->proxy_nopipelining;
 
 	/* disable input until authentication is finished */
 	if (client->io != NULL)
@@ -355,7 +378,9 @@ static void ATTR_NULL(3, 4)
 client_auth_result(struct client *client, enum client_auth_result result,
 		   const struct client_auth_reply *reply, const char *text)
 {
+	o_stream_cork(client->output);
 	client->v.auth_result(client, result, reply, text);
+	o_stream_uncork(client->output);
 }
 
 static bool
@@ -372,6 +397,12 @@ client_auth_handle_reply(struct client *client,
 			return FALSE;
 		if (proxy_start(client, reply) < 0)
 			client_auth_failed(client);
+		else {
+			/* this for plugins being able th hook into auth reply
+			   when proxying is used */
+			client_auth_result(client, CLIENT_AUTH_RESULT_SUCCESS,
+					   reply, NULL);
+		}
 		return TRUE;
 	}
 
@@ -527,17 +558,19 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 		 sasl_reply == SASL_SERVER_REPLY_AUTH_ABORTED ||
 		 sasl_reply == SASL_SERVER_REPLY_MASTER_FAILED);
 
+	memset(&reply, 0, sizeof(reply));
 	switch (sasl_reply) {
 	case SASL_SERVER_REPLY_SUCCESS:
 		if (client->to_auth_waiting != NULL)
 			timeout_remove(&client->to_auth_waiting);
 		if (args != NULL) {
 			client_auth_parse_args(client, args, &reply);
+			reply.all_fields = args;
 			if (client_auth_handle_reply(client, &reply, TRUE))
 				break;
 		}
 		client_auth_result(client, CLIENT_AUTH_RESULT_SUCCESS,
-				   NULL, NULL);
+				   &reply, NULL);
 		client_destroy_success(client, "Login");
 		break;
 	case SASL_SERVER_REPLY_AUTH_FAILED:
@@ -547,20 +580,21 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 		if (args != NULL) {
 			client_auth_parse_args(client, args, &reply);
 			reply.nologin = TRUE;
+			reply.all_fields = args;
 			if (client_auth_handle_reply(client, &reply, FALSE))
 				break;
 		}
 
 		if (sasl_reply == SASL_SERVER_REPLY_AUTH_ABORTED) {
 			client_auth_result(client, CLIENT_AUTH_RESULT_ABORTED,
-				NULL, "Authentication aborted by client.");
+				&reply, "Authentication aborted by client.");
 		} else if (data == NULL) {
 			client_auth_result(client,
-				CLIENT_AUTH_RESULT_AUTHFAILED, NULL,
+				CLIENT_AUTH_RESULT_AUTHFAILED, &reply,
 				AUTH_FAILED_MSG);
 		} else {
 			client_auth_result(client,
-				CLIENT_AUTH_RESULT_AUTHFAILED_REASON, NULL,
+				CLIENT_AUTH_RESULT_AUTHFAILED_REASON, &reply,
 				data);
 		}
 
@@ -572,7 +606,7 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 			/* authentication itself succeeded, we just hit some
 			   internal failure. */
 			client_auth_result(client, CLIENT_AUTH_RESULT_TEMPFAIL,
-					   NULL, data);
+					   &reply, data);
 		}
 
 		/* the fd may still be hanging somewhere in kernel or another

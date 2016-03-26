@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "ioloop.h"
@@ -51,13 +51,13 @@ postfix_input_auth_request(struct auth_postfix_connection *conn,
 	auth_request->context = conn;
 	auth_postfix_connection_ref(conn);
 
+	(void)auth_request_import_info(auth_request, "service", "postfix");
+	auth_request_init(auth_request);
+
 	if (!auth_request_set_username(auth_request, username, error_r)) {
 		*request_r = auth_request;
 		return FALSE;
 	}
-	(void)auth_request_import_info(auth_request, "service", "postfix");
-
-	auth_request_init(auth_request);
 	*request_r = auth_request;
 	return TRUE;
 }
@@ -69,13 +69,13 @@ user_callback(enum userdb_result result, struct auth_request *auth_request)
 	string_t *str;
 	const char *value;
 
-	if (auth_request->userdb_lookup_failed)
+	if (auth_request->userdb_lookup_tempfailed)
 		result = USERDB_RESULT_INTERNAL_FAILURE;
 
 	str = t_str_new(128);
 	switch (result) {
 	case USERDB_RESULT_INTERNAL_FAILURE:
-		if (auth_request->userdb_lookup_failed)
+		if (auth_request->userdb_lookup_tempfailed)
 			value = auth_fields_find(auth_request->userdb_reply, "reason");
 		else
 			value = NULL;

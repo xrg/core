@@ -29,6 +29,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-dns \
 	-I$(top_srcdir)/src/lib-sql \
 	-I$(top_srcdir)/src/lib-settings \
+	-I$(top_srcdir)/src/lib-stats \
 	-I$(top_srcdir)/src/lib-ntlm \
 	-I$(top_srcdir)/src/lib-otp \
 	-I$(top_srcdir)/src/lib-master \
@@ -70,13 +71,17 @@ auth_SOURCES = \
 	auth-penalty.c \
 	auth-request.c \
 	auth-request-handler.c \
+	auth-request-stats.c \
+	auth-request-var-expand.c \
 	auth-settings.c \
+	auth-stats.c \
 	auth-fields.c \
 	auth-token.c \
 	auth-worker-client.c \
 	auth-worker-server.c \
 	db-checkpassword.c \
 	db-dict.c \
+	db-dict-cache-key.c \
 	db-sql.c \
 	db-passwd-file.c \
 	main.c \
@@ -137,7 +142,10 @@ headers = \
 	auth-penalty.h \
 	auth-request.h \
 	auth-request-handler.h \
+	auth-request-stats.h \
+	auth-request-var-expand.h \
 	auth-settings.h \
+	auth-stats.h \
 	auth-fields.h \
 	auth-token.h \
 	auth-worker-client.h \
@@ -192,8 +200,18 @@ checkpassword_reply_DEPENDENCIES = $(LIBDOVECOT_DEPS)
 checkpassword_reply_sources = \
 	checkpassword-reply.c
 
+stats_moduledir = $(moduledir)/stats
+stats_module_LTLIBRARIES = libstats_auth.la
+
+libstats_auth_la_LDFLAGS = -module -avoid-version
+libstats_auth_la_LIBADD = auth-stats.lo $(LIBDOVECOT)
+libstats_auth_la_DEPENDENCIES = auth-stats.lo
+libstats_auth_la_SOURCES =
+
 test_programs = \
-	test-auth-cache
+	test-auth-cache \
+	test-auth-request-var-expand \
+	test-db-dict
 
 noinst_PROGRAMS = $(test_programs)
 
@@ -204,6 +222,14 @@ test_libs = \
 test_auth_cache_SOURCES = test-auth-cache.c
 test_auth_cache_LDADD = auth-cache.o $(test_libs)
 test_auth_cache_DEPENDENCIES = $(pkglibexec_PROGRAMS) $(test_libs)
+
+test_auth_request_var_expand_SOURCES = test-auth-request-var-expand.c
+test_auth_request_var_expand_LDADD = auth-request-var-expand.o auth-fields.o $(test_libs)
+test_auth_request_var_expand_DEPENDENCIES = $(pkglibexec_PROGRAMS) $(test_libs)
+
+test_db_dict_SOURCES = test-db-dict.c
+test_db_dict_LDADD = db-dict-cache-key.o $(test_libs)
+test_db_dict_DEPENDENCIES = $(pkglibexec_PROGRAMS) $(test_libs)
 
 check: check-am check-test
 check-test: all-am

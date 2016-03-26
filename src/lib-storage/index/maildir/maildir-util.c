@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -59,7 +59,7 @@ maildir_filename_guess(struct maildir_mailbox *mbox, uint32_t uid,
 		*uidlist_flags &= MAILDIR_UIDLIST_REC_FLAG_NEW_DIR;
 	} else if ((*uidlist_flags & MAILDIR_UIDLIST_REC_FLAG_MOVED) == 0 &&
 		   ((*uidlist_flags & MAILDIR_UIDLIST_REC_FLAG_NEW_DIR) != 0 ||
-		    index_mailbox_is_recent(&mbox->box, uid))) {
+		    mailbox_recent_flags_have_uid(&mbox->box, uid))) {
 		/* probably in new/ dir, drop ":2," from fname */
 		*uidlist_flags |= MAILDIR_UIDLIST_REC_FLAG_NEW_DIR;
 		p = strrchr(fname, MAILDIR_INFO_SEP);

@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -19,7 +19,7 @@ struct replicator_brain {
 	const struct replicator_settings *set;
 	struct timeout *to;
 
-	ARRAY(struct dsync_client *) dsync_clients;
+	ARRAY_TYPE(dsync_client) dsync_clients;
 
 	unsigned int deinitializing:1;
 };
@@ -67,6 +67,24 @@ void replicator_brain_deinit(struct replicator_brain **_brain)
 	pool_unref(&brain->pool);
 }
 
+struct replicator_queue *
+replicator_brain_get_queue(struct replicator_brain *brain)
+{
+	return brain->queue;
+}
+
+const struct replicator_settings *
+replicator_brain_get_settings(struct replicator_brain *brain)
+{
+	return brain->set;
+}
+
+const ARRAY_TYPE(dsync_client) *
+replicator_brain_get_dsync_clients(struct replicator_brain *brain)
+{
+	return &brain->dsync_clients;
+}
+
 static struct dsync_client *
 get_dsync_client(struct replicator_brain *brain)
 {
@@ -80,7 +98,8 @@ get_dsync_client(struct replicator_brain *brain)
 	    brain->set->replication_max_conns)
 		return NULL;
 
-	conn = dsync_client_init(brain->set->doveadm_socket_path);
+	conn = dsync_client_init(brain->set->doveadm_socket_path,
+				 brain->set->replication_dsync_parameters);
 	array_append(&brain->dsync_clients, &conn, 1);
 	return conn;
 }
@@ -97,6 +116,8 @@ static void dsync_callback(enum dsync_reply reply, const char *state,
 		i_free(ctx->user->state);
 		ctx->user->state = i_strdup_empty(state);
 		ctx->user->last_sync_failed = reply != DSYNC_REPLY_OK;
+		if (reply == DSYNC_REPLY_OK)
+			ctx->user->last_successful_sync = ioloop_time;
 		replicator_queue_push(ctx->brain->queue, ctx->user);
 	}
 	if (!ctx->brain->deinitializing)
@@ -122,8 +143,10 @@ dsync_replicate(struct replicator_brain *brain, struct replicator_user *user)
 	/* update the sync times immediately. if the replication fails we still
 	   wouldn't want it to be retried immediately. */
 	user->last_fast_sync = ioloop_time;
-	if (full)
+	if (full || user->force_full_sync) {
 		user->last_full_sync = ioloop_time;
+		user->force_full_sync = FALSE;
+	}
 	/* reset priority also. if more updates arrive during replication
 	   we'll do another replication to make sure nothing gets lost */
 	user->priority = REPLICATION_PRIORITY_NONE;

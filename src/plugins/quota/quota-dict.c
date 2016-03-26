@@ -1,13 +1,13 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "ioloop.h"
 #include "str.h"
 #include "dict.h"
 #include "mail-user.h"
 #include "mail-namespace.h"
 #include "quota-private.h"
 
-#include <stdlib.h>
 
 #define DICT_QUOTA_CURRENT_PATH DICT_PATH_PRIVATE"quota/"
 #define DICT_QUOTA_CURRENT_BYTES_PATH DICT_QUOTA_CURRENT_PATH"storage"
@@ -16,6 +16,8 @@
 struct dict_quota_root {
 	struct quota_root root;
 	struct dict *dict;
+	struct timeout *to_update;
+	bool disable_unset;
 };
 
 extern struct quota_backend quota_backend_dict;
@@ -32,6 +34,7 @@ static int dict_quota_init(struct quota_root *_root, const char *args,
 			   const char **error_r)
 {
 	struct dict_quota_root *root = (struct dict_quota_root *)_root;
+	struct dict_settings set;
 	const char *username, *p, *error;
 
 	p = args == NULL ? NULL : strchr(args, ':');
@@ -43,20 +46,22 @@ static int dict_quota_init(struct quota_root *_root, const char *args,
 	username = t_strdup_until(args, p);
 	args = p+1;
 
-	do {
+	for (;;) {
 		/* FIXME: pretty ugly in here. the parameters should have
 		   been designed to be extensible. do it in a future version */
 		if (strncmp(args, "noenforcing:", 12) == 0) {
 			_root->no_enforcing = TRUE;
 			args += 12;
-			continue;
-		}
-		if (strncmp(args, "ignoreunlimited:", 16) == 0) {
+		} else if (strncmp(args, "hidden:", 7) == 0) {
+			_root->hidden = TRUE;
+			args += 7;
+		} else if (strncmp(args, "ignoreunlimited:", 16) == 0) {
 			_root->disable_unlimited_tracking = TRUE;
 			args += 16;
-			continue;
-		}
-		if (strncmp(args, "ns=", 3) == 0) {
+		} else if (strncmp(args, "no-unset:", 9) == 0) {
+			root->disable_unset = TRUE;
+			args += 9;
+		} else if (strncmp(args, "ns=", 3) == 0) {
 			p = strchr(args, ':');
 			if (p == NULL)
 				break;
@@ -64,9 +69,10 @@ static int dict_quota_init(struct quota_root *_root, const char *args,
 			_root->ns_prefix = p_strdup_until(_root->pool,
 							  args + 3, p);
 			args = p + 1;
-			continue;
+		} else {
+			break;
 		}
-	} while (0);
+	}
 
 	if (*username == '\0')
 		username = _root->quota->user->username;
@@ -78,9 +84,12 @@ static int dict_quota_init(struct quota_root *_root, const char *args,
 
 	/* FIXME: we should use 64bit integer as datatype instead but before
 	   it can actually be used don't bother */
-	if (dict_init(args, DICT_DATA_TYPE_STRING, username,
-		      _root->quota->user->set->base_dir, &root->dict,
-		      &error) < 0) {
+	memset(&set, 0, sizeof(set));
+	set.username = username;
+	set.base_dir = _root->quota->user->set->base_dir;
+	if (mail_user_get_home(_root->quota->user, &set.home_dir) <= 0)
+		set.home_dir = NULL;
+	if (dict_init_full(args, &set, &root->dict, &error) < 0) {
 		*error_r = t_strdup_printf("dict_init(%s) failed: %s", args, error);
 		return -1;
 	}
@@ -90,6 +99,8 @@ static int dict_quota_init(struct quota_root *_root, const char *args,
 static void dict_quota_deinit(struct quota_root *_root)
 {
 	struct dict_quota_root *root = (struct dict_quota_root *)_root;
+
+	i_assert(root->to_update == NULL);
 
 	if (root->dict != NULL)
 		dict_deinit(&root->dict);
@@ -119,9 +130,14 @@ dict_quota_count(struct dict_quota_root *root,
 	T_BEGIN {
 		dt = dict_transaction_begin(root->dict);
 		/* these unsets are mainly necessary for pgsql, because its
-		   trigger otherwise increases quota without deleting it */
-		dict_unset(dt, DICT_QUOTA_CURRENT_BYTES_PATH);
-		dict_unset(dt, DICT_QUOTA_CURRENT_COUNT_PATH);
+		   trigger otherwise increases quota without deleting it.
+		   but some people with other databases want to store the
+		   quota usage among other data in the same row, which
+		   shouldn't be deleted. */
+		if (!root->disable_unset) {
+			dict_unset(dt, DICT_QUOTA_CURRENT_BYTES_PATH);
+			dict_unset(dt, DICT_QUOTA_CURRENT_COUNT_PATH);
+		}
 		dict_set(dt, DICT_QUOTA_CURRENT_BYTES_PATH, dec2str(bytes));
 		dict_set(dt, DICT_QUOTA_CURRENT_COUNT_PATH, dec2str(count));
 	} T_END;
@@ -155,11 +171,12 @@ dict_quota_get_resource(struct quota_root *_root,
 		if (ret < 0)
 			*value_r = 0;
 		else {
-			long long tmp;
+			intmax_t tmp;
 
 			/* recalculate quota if it's negative or if it
 			   wasn't found */
-			tmp = ret == 0 ? -1 : strtoll(value, NULL, 10);
+			if (ret == 0 || str_to_intmax(value, &tmp) < 0)
+				tmp = -1;
 			if (tmp >= 0)
 				*value_r = tmp;
 			else {
@@ -171,14 +188,22 @@ dict_quota_get_resource(struct quota_root *_root,
 	return ret;
 }
 
+static void dict_quota_recalc_timeout(struct dict_quota_root *root)
+{
+	uint64_t value;
+
+	timeout_remove(&root->to_update);
+	(void)dict_quota_count(root, TRUE, &value);
+}
+
 static void dict_quota_update_callback(int ret, void *context)
 {
 	struct dict_quota_root *root = context;
-	uint64_t value;
 
 	if (ret == 0) {
 		/* row doesn't exist, need to recalculate it */
-		(void)dict_quota_count(root, TRUE, &value);
+		if (root->to_update == NULL)
+			root->to_update = timeout_add_short(0, dict_quota_recalc_timeout, root);
 	} else if (ret < 0) {
 		i_error("dict quota: Quota update failed, it's now desynced");
 	}
@@ -216,6 +241,10 @@ static void dict_quota_flush(struct quota_root *_root)
 	struct dict_quota_root *root = (struct dict_quota_root *)_root;
 
 	(void)dict_wait(root->dict);
+	if (root->to_update != NULL) {
+		dict_quota_recalc_timeout(root);
+		(void)dict_wait(root->dict);
+	}
 }
 
 struct quota_backend quota_backend_dict = {

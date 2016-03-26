@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -12,7 +12,6 @@
 #include "config-parser.h"
 #include "config-connection.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 
 #define MAX_INBUF_SIZE 1024
@@ -32,7 +31,7 @@ struct config_connection {
 	unsigned int handshaked:1;
 };
 
-struct config_connection *config_connections = NULL;
+static struct config_connection *config_connections = NULL;
 
 static const char *const *
 config_connection_next_line(struct config_connection *conn)

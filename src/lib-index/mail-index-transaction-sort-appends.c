@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -6,7 +6,6 @@
 #include "mail-index-private.h"
 #include "mail-index-transaction-private.h"
 
-#include <stdlib.h>
 
 struct uid_map {
 	uint32_t idx;

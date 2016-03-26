@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -53,20 +53,6 @@ void charset_to_utf8_reset(struct charset_translation *t)
 		(void)iconv(t->cd, NULL, NULL, NULL, NULL);
 }
 
-static int
-charset_append_utf8(struct charset_translation *t,
-		    const void *src, size_t src_size, buffer_t *dest)
-{
-	if (t->normalizer != NULL)
-		return t->normalizer(src, src_size, dest);
-	else if (!uni_utf8_get_valid_data(src, src_size, dest))
-		return -1;
-	else {
-		buffer_append(dest, src, src_size);
-		return 0;
-	}
-}
-
 static bool
 charset_to_utf8_try(struct charset_translation *t,
 		    const unsigned char *src, size_t *src_size, buffer_t *dest,
@@ -74,15 +60,12 @@ charset_to_utf8_try(struct charset_translation *t,
 {
 	ICONV_CONST char *ic_srcbuf;
 	char tmpbuf[8192], *ic_destbuf;
-	size_t srcleft, destleft;
+	size_t srcleft, destleft, tmpbuf_used;
 	bool ret = TRUE;
 
 	if (t->cd == (iconv_t)-1) {
 		/* input is already supposed to be UTF-8 */
-		if (charset_append_utf8(t, src, *src_size, dest) < 0)
-			*result = CHARSET_RET_INVALID_INPUT;
-		else
-			*result = CHARSET_RET_OK;
+		*result = charset_utf8_to_utf8(t->normalizer, src, src_size, dest);
 		return TRUE;
 	}
 	destleft = sizeof(tmpbuf);
@@ -91,15 +74,17 @@ charset_to_utf8_try(struct charset_translation *t,
 	ic_srcbuf = (ICONV_CONST char *) src;
 
 	if (iconv(t->cd, &ic_srcbuf, &srcleft,
-		  &ic_destbuf, &destleft) != (size_t)-1)
+		  &ic_destbuf, &destleft) != (size_t)-1) {
+		i_assert(srcleft == 0);
 		*result = CHARSET_RET_OK;
-	else if (errno == E2BIG) {
+	} else if (errno == E2BIG) {
 		/* set result just to avoid compiler warning */
 		*result = CHARSET_RET_INCOMPLETE_INPUT;
 		ret = FALSE;
-	} else if (errno == EINVAL)
+	} else if (errno == EINVAL) {
+		i_assert(srcleft <= CHARSET_MAX_PENDING_BUF_SIZE);
 		*result = CHARSET_RET_INCOMPLETE_INPUT;
-	else {
+	} else {
 		/* should be EILSEQ */
 		*result = CHARSET_RET_INVALID_INPUT;
 		ret = FALSE;
@@ -109,8 +94,9 @@ charset_to_utf8_try(struct charset_translation *t,
 	/* we just converted data to UTF-8. it shouldn't be invalid, but
 	   Solaris iconv appears to pass invalid data through sometimes
 	   (e.g. 8 bit characters with UTF-7) */
-	if (charset_append_utf8(t, tmpbuf, sizeof(tmpbuf) - destleft,
-				dest) < 0)
+	tmpbuf_used = sizeof(tmpbuf) - destleft;
+	if (charset_utf8_to_utf8(t->normalizer, (void *)tmpbuf,
+				 &tmpbuf_used, dest) != CHARSET_RET_OK)
 		*result = CHARSET_RET_INVALID_INPUT;
 	return ret;
 }
@@ -125,6 +111,7 @@ charset_to_utf8(struct charset_translation *t,
 	bool ret;
 
 	for (pos = 0;;) {
+		i_assert(pos <= *src_size);
 		size = *src_size - pos;
 		ret = charset_to_utf8_try(t, src + pos, &size, dest, &result);
 		pos += size;
@@ -134,17 +121,19 @@ charset_to_utf8(struct charset_translation *t,
 
 		if (result == CHARSET_RET_INVALID_INPUT) {
 			if (prev_invalid_pos != dest->used) {
-				uni_ucs4_to_utf8_c(UNICODE_REPLACEMENT_CHAR,
-						   dest);
+				buffer_append(dest, UNICODE_REPLACEMENT_CHAR_UTF8,
+					      strlen(UNICODE_REPLACEMENT_CHAR_UTF8));
 				prev_invalid_pos = dest->used;
 			}
-			pos++;
+			if (pos < *src_size)
+				pos++;
 		}
 	}
 
 	if (prev_invalid_pos != (size_t)-1)
 		result = CHARSET_RET_INVALID_INPUT;
 
+	i_assert(*src_size - pos <= CHARSET_MAX_PENDING_BUF_SIZE);
 	*src_size = pos;
 	return result;
 }

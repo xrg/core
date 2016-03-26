@@ -33,16 +33,22 @@ enum mail_storage_service_flags {
 	/* When executing doveconf, tell it to use sysexits codes */
 	MAIL_STORAGE_SERVICE_FLAG_USE_SYSEXITS		= 0x400,
 	/* Don't create namespaces, only the user. */
-	MAIL_STORAGE_SERVICE_FLAG_NO_NAMESPACES		= 0x800
+	MAIL_STORAGE_SERVICE_FLAG_NO_NAMESPACES		= 0x800,
+	/* Enable autoexpunging at deinit. */
+	MAIL_STORAGE_SERVICE_FLAG_AUTOEXPUNGE		= 0x1000
 };
 
 struct mail_storage_service_input {
 	const char *module;
 	const char *service;
 	const char *username;
+	/* If set, use this string as the session ID */
 	const char *session_id;
+	/* If set, use this string as the session ID prefix, but also append
+	   a unique session ID suffix to it. */
+	const char *session_id_prefix;
 	struct ip_addr local_ip, remote_ip;
-	unsigned int local_port, remote_port;
+	in_port_t local_port, remote_port;
 
 	const char *const *userdb_fields;
 
@@ -62,6 +68,9 @@ mail_storage_service_init(struct master_service *service,
 			  enum mail_storage_service_flags flags) ATTR_NULL(2);
 struct auth_master_connection *
 mail_storage_service_get_auth_conn(struct mail_storage_service_ctx *ctx);
+/* Set auth connection (instead of creating a new one automatically). */
+void mail_storage_service_set_auth_conn(struct mail_storage_service_ctx *ctx,
+					struct auth_master_connection *conn);
 int mail_storage_service_read_settings(struct mail_storage_service_ctx *ctx,
 				       const struct mail_storage_service_input *input,
 				       pool_t pool,
@@ -106,6 +115,15 @@ int mail_storage_service_all_next(struct mail_storage_service_ctx *ctx,
 				  const char **username_r);
 void mail_storage_service_deinit(struct mail_storage_service_ctx **ctx);
 
+/* Activate user context. Normally this is called automatically by the ioloop,
+   but e.g. during loops at deinit where all users are being destroyed, it's
+   useful to call this to set the correct user-specific log prefix. */
+void mail_storage_service_io_activate_user(struct mail_storage_service_user *user);
+/* Deactivate user context. This only switches back to non-user-specific
+   log prefix. */
+void mail_storage_service_io_deactivate_user(struct mail_storage_service_user *user);
+void mail_storage_service_io_deactivate(struct mail_storage_service_ctx *ctx);
+
 /* Return the settings pointed to by set_root parameter in _init().
    The settings contain all the changes done by userdb lookups. */
 void **mail_storage_service_user_get_set(struct mail_storage_service_user *user);
@@ -115,10 +133,14 @@ const struct mail_storage_service_input *
 mail_storage_service_user_get_input(struct mail_storage_service_user *user);
 struct setting_parser_context *
 mail_storage_service_user_get_settings_parser(struct mail_storage_service_user *user);
+struct mail_storage_service_ctx *
+mail_storage_service_user_get_service_ctx(struct mail_storage_service_user *user);
 
 const struct var_expand_table *
 mail_storage_service_get_var_expand_table(struct mail_storage_service_ctx *ctx,
 					  struct mail_storage_service_input *input);
+const char *mail_storage_service_fields_var_expand(const char *data,
+						   const char *const *fields);
 /* Return the settings pointed to by set_root parameter in _init() */
 void *mail_storage_service_get_settings(struct master_service *service);
 

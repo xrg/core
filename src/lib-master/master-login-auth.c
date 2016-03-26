@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "net.h"
@@ -15,7 +15,6 @@
 #include "master-auth.h"
 #include "master-login-auth.h"
 
-#include <stdlib.h>
 
 #define AUTH_MAX_INBUF_SIZE 8192
 
@@ -440,8 +439,9 @@ master_login_auth_send_request(struct master_login_auth *auth,
 	str_printfa(str, "REQUEST\t%u\t%u\t%u\t", req->id,
 		    req->client_pid, req->auth_id);
 	binary_to_hex_append(str, req->cookie, sizeof(req->cookie));
+	str_printfa(str, "\tsession_pid=%s", my_pid);
 	if (auth->request_auth_token)
-		str_printfa(str, "\tsession_pid=%s", my_pid);
+		str_append(str, "\trequest_auth_token");
 	str_append_c(str, '\n');
 	o_stream_nsend(auth->output, str_data(str), str_len(str));
 }
@@ -482,6 +482,7 @@ void master_login_auth_request(struct master_login_auth *auth,
 	memcpy(login_req->cookie, req->cookie, sizeof(login_req->cookie));
 	login_req->callback = callback;
 	login_req->context = context;
+	i_assert(hash_table_lookup(auth->requests, POINTER_CAST(id)) == NULL);
 	hash_table_insert(auth->requests, POINTER_CAST(id), login_req);
 	DLLIST2_APPEND(&auth->request_head, &auth->request_tail, login_req);
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "net.h"
@@ -52,7 +52,7 @@ static void cmd_dump_imapzlib(int argc ATTR_UNUSED, char *argv[])
 	fd = open(argv[1], O_RDONLY);
 	if (fd < 0)
 		i_fatal("open(%s) failed: %m", argv[1]);
-	input = i_stream_create_fd(fd, 1024*32, TRUE);
+	input = i_stream_create_fd_autoclose(&fd, 1024*32);
 	while ((line = i_stream_read_next_line(input)) != NULL) {
 		/* skip tag */
 		printf("%s\r\n", line);
@@ -141,11 +141,12 @@ static void cmd_zlibconnect(int argc ATTR_UNUSED, char *argv[])
 {
 	struct client client;
 	struct ip_addr *ips;
-	unsigned int ips_count, port = 143;
+	unsigned int ips_count;
+	in_port_t port = 143;
 	int fd, ret;
 
 	if (argv[1] == NULL ||
-	    (argv[2] != NULL && str_to_uint(argv[2], &port) < 0))
+	    (argv[2] != NULL && net_str2port(argv[2], &port) < 0))
 		help(&doveadm_cmd_zlibconnect);
 
 	ret = net_gethostbyname(argv[1], &ips, &ips_count);

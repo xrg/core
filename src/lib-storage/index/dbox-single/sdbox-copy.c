@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "nfs-workarounds.h"
@@ -28,8 +28,12 @@ sdbox_file_copy_attachments(struct sdbox_file *src_file,
 	}
 	if (dest_storage->attachment_dir == NULL ||
 	    strcmp(src_storage->attachment_dir,
-		   dest_storage->attachment_dir) != 0) {
-		/* different attachment dirs between storages.
+		   dest_storage->attachment_dir) != 0 ||
+	    strcmp(src_storage->storage.set->mail_attachment_fs,
+		   dest_storage->storage.set->mail_attachment_fs) != 0 ||
+	    strcmp(src_storage->storage.set->mail_attachment_hash,
+		   dest_storage->storage.set->mail_attachment_hash) != 0) {
+		/* different attachment dirs/settings between storages.
 		   have to copy the slow way. */
 		return 0;
 	}
@@ -40,7 +44,7 @@ sdbox_file_copy_attachments(struct sdbox_file *src_file,
 
 	pool = pool_alloconly_create("sdbox attachments copy", 1024);
 	p_array_init(&extrefs, pool, 16);
-	if (!dbox_attachment_parse_extref(extrefs_line, pool, &extrefs)) {
+	if (!index_attachment_parse_extrefs(extrefs_line, pool, &extrefs)) {
 		mail_storage_set_critical(&dest_storage->storage,
 			"Can't copy %s with corrupted extref metadata: %s",
 			src_file->file.cur_path, extrefs_line);
@@ -62,7 +66,11 @@ sdbox_file_copy_attachments(struct sdbox_file *src_file,
 					   guid_generate(), NULL);
 		dest = t_strdup_printf("%s/%s", dest_storage->attachment_dir,
 				       dest_relpath);
-		src_fsfile = fs_file_init(src_storage->attachment_fs, src,
+		/* we verified above that attachment_fs is compatible for
+		   src and dest, so it doesn't matter which storage's
+		   attachment_fs we use. in any case we need to use the same
+		   one or fs_copy() will crash with assert. */
+		src_fsfile = fs_file_init(dest_storage->attachment_fs, src,
 					  FS_OPEN_MODE_READONLY);
 		dest_fsfile = fs_file_init(dest_storage->attachment_fs, dest,
 					   FS_OPEN_MODE_READONLY);
@@ -89,7 +97,7 @@ sdbox_copy_hardlink(struct mail_save_context *_ctx, struct mail *mail)
 		(struct sdbox_mailbox *)_ctx->transaction->box;
 	struct sdbox_mailbox *src_mbox;
 	struct dbox_file *src_file, *dest_file;
-	const char *src_path;
+	const char *src_path, *dest_path;
 	int ret;
 
 	if (strcmp(mail->box->storage->name, SDBOX_STORAGE_NAME) == 0)
@@ -102,11 +110,18 @@ sdbox_copy_hardlink(struct mail_save_context *_ctx, struct mail *mail)
 	src_file = sdbox_file_init(src_mbox, mail->uid);
 	dest_file = sdbox_file_init(dest_mbox, 0);
 
+	ctx->ctx.data.flags &= ~DBOX_INDEX_FLAG_ALT;
+
 	src_path = src_file->primary_path;
-	ret = nfs_safe_link(src_path, dest_file->cur_path, FALSE);
+	dest_path = dest_file->primary_path;
+	ret = nfs_safe_link(src_path, dest_path, FALSE);
 	if (ret < 0 && errno == ENOENT && src_file->alt_path != NULL) {
 		src_path = src_file->alt_path;
-		ret = nfs_safe_link(src_path, dest_file->cur_path, FALSE);
+		if (dest_file->alt_path != NULL) {
+			dest_path = dest_file->cur_path = dest_file->alt_path;
+			ctx->ctx.data.flags |= DBOX_INDEX_FLAG_ALT;
+		}
+		ret = nfs_safe_link(src_path, dest_path, FALSE);
 	}
 	if (ret < 0) {
 		if (ECANTLINK(errno))
@@ -119,8 +134,7 @@ sdbox_copy_hardlink(struct mail_save_context *_ctx, struct mail *mail)
 		} else {
 			mail_storage_set_critical(
 				_ctx->transaction->box->storage,
-				"link(%s, %s) failed: %m",
-				src_path, dest_file->cur_path);
+				"link(%s, %s) failed: %m", src_path, dest_path);
 		}
 		dbox_file_unref(&src_file);
 		dbox_file_unref(&dest_file);
@@ -135,6 +149,7 @@ sdbox_copy_hardlink(struct mail_save_context *_ctx, struct mail *mail)
 		dbox_file_unref(&dest_file);
 		return ret;
 	}
+	((struct sdbox_file *)dest_file)->written_to_disk = TRUE;
 
 	dbox_save_add_to_index(ctx);
 	index_copy_cache_fields(_ctx, mail, ctx->seq);

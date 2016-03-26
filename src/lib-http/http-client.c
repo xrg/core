@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "net.h"
@@ -19,28 +19,45 @@
 #define HTTP_DEFAULT_PORT 80
 #define HTTPS_DEFAULT_PORT 443
 
-/* FIXME: This implementation not yet finished. The essence works: it is
-   possible to submit requests through the client. Responses are dumped to
-   stdout
+/* Structure:
 
-    Structure so far:
-    Client - Acts much like a browser; it is not dedicated to a single host.
-             Client can accept requests to different hosts, which can be served
-             at different IPs. Redirects can be handled in the background by
-             making a new connection. Connections to new hosts are created once
-             needed for servicing a request.
-    Requests - Semantics are similar to imapc commands. Create a request, 
-               optionally modify some aspects of it and finally submit it.
-    Hosts - We maintain a 'cache' of hosts for which we have looked up IPs.
-            Requests are first queued in the host struct on a per-port basis.
-    Peers - Group connections to the same ip/port (== peer_addr).
-    Connections - Actual connections to a server. Once a connection is ready to
-                  handle requests, it claims a request from a host object. One
-                  connection hand service multiple hosts and one host can have
-                  multiple associated connections, possibly to different ips and
-                  ports.
+	 http-client:
 
-  TODO: lots of cleanup, authentication, ssl, timeouts,	 rawlog etc.
+	 Acts much like a browser; it is not dedicated to a single host. Client can
+   accept requests to different hosts, which can be served at different IPs.
+   Redirects are handled in the background by making a new connection.
+   Connections to new hosts are created once needed for servicing a request.
+
+	 http-client-request:
+
+	 The request semantics are similar to imapc commands. Create a request, 
+   optionally modify some aspects of it and finally submit it. Once finished,
+   a callback is called with the returned response.
+
+   http-client-host:
+
+   We maintain a 'cache' of hosts for which we have looked up IPs. One host
+   can have multiple IPs.
+
+   http-client-queue:
+
+   Requests are queued in a queue object. These queues are maintained for each
+   host:port target and listed in the host object. The queue object is
+   responsible for starting connection attempts to TCP port at the various IPs
+   known for the host.
+
+   http-client-peer:
+
+   The peer object groups multiple connections to the same ip/port
+   (== peer_addr).
+
+   http-client-connection:
+
+   This is an actual connection to a server. Once a connection is ready to
+   handle requests, it claims a request from a queue object. One connection can
+   service multiple hosts and one host can have multiple associated connections,
+   possibly to different ips and ports.
+
  */
 
 /*
@@ -75,12 +92,11 @@ struct http_client *http_client_init(const struct http_client_settings *set)
 	pool = pool_alloconly_create("http client", 1024);
 	client = p_new(pool, struct http_client, 1);
 	client->pool = pool;
-	if (set->dns_client_socket_path != NULL && *set->dns_client_socket_path != '\0') {
-		client->set.dns_client_socket_path =
-			p_strdup(pool, set->dns_client_socket_path);
-	}
-	if (set->rawlog_dir != NULL && *set->rawlog_dir != '\0')
-		client->set.rawlog_dir = p_strdup(pool, set->rawlog_dir);
+	client->set.dns_client = set->dns_client;
+	client->set.dns_client_socket_path =
+		p_strdup_empty(pool, set->dns_client_socket_path);
+	client->set.user_agent = p_strdup_empty(pool, set->user_agent);
+	client->set.rawlog_dir = p_strdup_empty(pool, set->rawlog_dir);
 	client->set.ssl_ca_dir = p_strdup(pool, set->ssl_ca_dir);
 	client->set.ssl_ca_file = p_strdup(pool, set->ssl_ca_file);
 	client->set.ssl_ca = p_strdup(pool, set->ssl_ca);
@@ -89,18 +105,53 @@ struct http_client *http_client_init(const struct http_client_settings *set)
 	client->set.ssl_cert = p_strdup(pool, set->ssl_cert);
 	client->set.ssl_key = p_strdup(pool, set->ssl_key);
 	client->set.ssl_key_password = p_strdup(pool, set->ssl_key_password);
+
+	if (set->proxy_socket_path != NULL && *set->proxy_socket_path != '\0') {
+		client->set.proxy_socket_path = p_strdup(pool, set->proxy_socket_path);
+	} else if (set->proxy_url != NULL) {
+		client->set.proxy_url = http_url_clone(pool, set->proxy_url);
+	}
+	if (set->proxy_username != NULL && *set->proxy_username != '\0') {
+		client->set.proxy_username = p_strdup_empty(pool, set->proxy_username);
+		client->set.proxy_password = p_strdup(pool, set->proxy_password);
+	} else if (set->proxy_url != NULL) {
+		client->set.proxy_username =
+			p_strdup_empty(pool, set->proxy_url->user);
+		client->set.proxy_password =
+			p_strdup(pool, set->proxy_url->password);
+	}
+
 	client->set.max_idle_time_msecs = set->max_idle_time_msecs;
 	client->set.max_parallel_connections =
 		(set->max_parallel_connections > 0 ? set->max_parallel_connections : 1);
 	client->set.max_pipelined_requests =
 		(set->max_pipelined_requests > 0 ? set->max_pipelined_requests : 1);
 	client->set.max_attempts = set->max_attempts;
+	client->set.max_connect_attempts = set->max_connect_attempts;
+	client->set.connect_backoff_time_msecs =
+		set->connect_backoff_time_msecs == 0 ?
+			HTTP_CLIENT_DEFAULT_BACKOFF_TIME_MSECS :
+			set->connect_backoff_time_msecs;
+	client->set.connect_backoff_max_time_msecs =
+		set->connect_backoff_max_time_msecs == 0 ?
+			HTTP_CLIENT_DEFAULT_BACKOFF_MAX_TIME_MSECS :
+			set->connect_backoff_max_time_msecs;
+	client->set.no_auto_redirect = set->no_auto_redirect;
+	client->set.no_ssl_tunnel = set->no_ssl_tunnel;
 	client->set.max_redirects = set->max_redirects;
 	client->set.response_hdr_limits = set->response_hdr_limits;
-	client->set.request_timeout_msecs = set->request_timeout_msecs;
+	client->set.request_absolute_timeout_msecs =
+		set->request_absolute_timeout_msecs;
+	client->set.request_timeout_msecs =
+		set->request_timeout_msecs == 0 ?
+			HTTP_CLIENT_DEFAULT_REQUEST_TIMEOUT_MSECS :
+			set->request_timeout_msecs;
 	client->set.connect_timeout_msecs = set->connect_timeout_msecs;
 	client->set.soft_connect_timeout_msecs = set->soft_connect_timeout_msecs;
+	client->set.max_auto_retry_delay = set->max_auto_retry_delay;
 	client->set.debug = set->debug;
+
+	i_array_init(&client->delayed_failing_requests, 1);
 
 	client->conn_list = http_client_connection_list_init();
 
@@ -114,8 +165,24 @@ struct http_client *http_client_init(const struct http_client_settings *set)
 void http_client_deinit(struct http_client **_client)
 {
 	struct http_client *client = *_client;
+	struct http_client_request *req, *const *req_idx;
 	struct http_client_host *host;
 	struct http_client_peer *peer;
+
+	*_client = NULL;
+
+	/* drop delayed failing requests */
+	while (array_count(&client->delayed_failing_requests) > 0) {
+		req_idx = array_idx(&client->delayed_failing_requests, 0);
+		req = *req_idx;
+
+		i_assert(req->refcount == 1);
+		http_client_request_error_delayed(&req);
+	}
+	array_free(&client->delayed_failing_requests);
+
+	if (client->to_failing_requests != NULL)
+		timeout_remove(&client->to_failing_requests);
 
 	/* free peers */
 	while (client->peers_list != NULL) {
@@ -136,7 +203,6 @@ void http_client_deinit(struct http_client **_client)
 	if (client->ssl_ctx != NULL)
 		ssl_iostream_context_deinit(&client->ssl_ctx);
 	pool_unref(&client->pool);
-	*_client = NULL;
 }
 
 void http_client_switch_ioloop(struct http_client *client)
@@ -163,6 +229,12 @@ void http_client_switch_ioloop(struct http_client *client)
 	/* move dns lookups and delayed requests */
 	for (host = client->hosts_list; host != NULL; host = host->next)
 		http_client_host_switch_ioloop(host);
+
+	/* move timeouts */
+	if (client->to_failing_requests != NULL) {
+		client->to_failing_requests =
+			io_loop_move_timeout(&client->to_failing_requests);
+	}
 }
 
 void http_client_wait(struct http_client *client)
@@ -171,11 +243,13 @@ void http_client_wait(struct http_client *client)
 
 	i_assert(client->ioloop == NULL);
 
-	if (client->pending_requests == 0)
+	if (client->requests_count == 0)
 		return;
 
 	client->ioloop = io_loop_create();
 	http_client_switch_ioloop(client);
+	if (client->set.dns_client != NULL)
+		dns_client_switch_ioloop(client->set.dns_client);
 	/* either we're waiting for network I/O or we're getting out of a
 	   callback using timeout_add_short(0) */
 	i_assert(io_loop_have_ios(client->ioloop) ||
@@ -183,21 +257,23 @@ void http_client_wait(struct http_client *client)
 
 	do {
 		http_client_debug(client,
-			"Waiting for %d requests to finish", client->pending_requests);
+			"Waiting for %d requests to finish", client->requests_count);
 		io_loop_run(client->ioloop);
-	} while (client->pending_requests > 0);
+	} while (client->requests_count > 0);
 
 	http_client_debug(client, "All requests finished");
 
-	current_ioloop = prev_ioloop;
+	io_loop_set_current(prev_ioloop);
 	http_client_switch_ioloop(client);
-	current_ioloop = client->ioloop;
+	if (client->set.dns_client != NULL)
+		dns_client_switch_ioloop(client->set.dns_client);
+	io_loop_set_current(client->ioloop);
 	io_loop_destroy(&client->ioloop);
 }
 
 unsigned int http_client_get_pending_request_count(struct http_client *client)
 {
-	return client->pending_requests;
+	return client->requests_count;
 }
 
 int http_client_init_ssl_ctx(struct http_client *client, const char **error_r)
@@ -226,4 +302,49 @@ int http_client_init_ssl_ctx(struct http_client *client, const char **error_r)
 		return -1;
 	}
 	return 0;
+}
+
+/*
+ * Delayed request errors
+ */
+
+static void
+http_client_handle_request_errors(struct http_client *client)
+{		
+	timeout_remove(&client->to_failing_requests);
+
+	while (array_count(&client->delayed_failing_requests) > 0) {
+		struct http_client_request *const *req_idx =
+			array_idx(&client->delayed_failing_requests, 0);
+		struct http_client_request *req = *req_idx;
+
+		i_assert(req->refcount == 1);
+		http_client_request_error_delayed(&req);
+	}
+	array_clear(&client->delayed_failing_requests);
+}
+
+void http_client_delay_request_error(struct http_client *client,
+	struct http_client_request *req)
+{
+	if (client->to_failing_requests == NULL) {
+		client->to_failing_requests = timeout_add_short(0,
+			http_client_handle_request_errors, client);
+	}
+	array_append(&client->delayed_failing_requests, &req, 1);
+}
+
+void http_client_remove_request_error(struct http_client *client,
+	struct http_client_request *req)
+{
+	struct http_client_request *const *reqs;
+	unsigned int i, count;
+
+	reqs = array_get(&client->delayed_failing_requests, &count);
+	for (i = 0; i < count; i++) {
+		if (reqs[i] == req) {
+			array_delete(&client->delayed_failing_requests, i, 1);
+			return;
+		}
+	}
 }

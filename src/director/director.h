@@ -6,14 +6,24 @@
 
 #define DIRECTOR_VERSION_NAME "director"
 #define DIRECTOR_VERSION_MAJOR 1
-#define DIRECTOR_VERSION_MINOR 3
+#define DIRECTOR_VERSION_MINOR 7
 
-/* weak users supported in protocol v1.1+ */
+/* weak users supported in protocol */
 #define DIRECTOR_VERSION_WEAK_USERS 1
-/* director removes supported in v1.2+ */
+/* director ring remove supported */
 #define DIRECTOR_VERSION_RING_REMOVE 2
-/* quit reason supported in v1.3+ */
+/* quit reason supported */
 #define DIRECTOR_VERSION_QUIT 3
+/* user-kick supported */
+#define DIRECTOR_VERSION_USER_KICK 4
+/* options supported in handshake */
+#define DIRECTOR_VERSION_OPTIONS 5
+/* user tags supported */
+#define DIRECTOR_VERSION_TAGS 5
+/* up/down state is tracked */
+#define DIRECTOR_VERSION_UPDOWN 6
+/* user tag version 2 supported */
+#define DIRECTOR_VERSION_TAGS_V2 7
 
 /* Minimum time between even attempting to communicate with a director that
    failed due to a protocol error. */
@@ -30,9 +40,9 @@ struct director {
 
 	/* IP and port of this director. self_host->ip/port must equal these. */
 	struct ip_addr self_ip;
-	unsigned int self_port;
+	in_port_t self_port;
 
-	unsigned int test_port;
+	in_port_t test_port;
 
 	struct director_host *self_host;
 	/* left and right connections are set only after they have finished
@@ -73,6 +83,9 @@ struct director {
 
 	time_t ring_first_alone;
 
+	uint64_t num_requests;
+	uint64_t ring_traffic_input, ring_traffic_output;
+
 	/* director ring handshaking is complete.
 	   director can start serving clients. */
 	unsigned int ring_handshaked:1;
@@ -90,7 +103,7 @@ extern bool director_debug;
    without specified port. */
 struct director *
 director_init(const struct director_settings *set,
-	      const struct ip_addr *listen_ip, unsigned int listen_port,
+	      const struct ip_addr *listen_ip, in_port_t listen_port,
 	      director_state_change_callback_t *callback);
 void director_deinit(struct director **dir);
 void director_find_self(struct director *dir);
@@ -104,7 +117,7 @@ void director_set_ring_unsynced(struct director *dir);
 void director_set_state_changed(struct director *dir);
 void director_sync_send(struct director *dir, struct director_host *host,
 			uint32_t seq, unsigned int minor_version,
-			unsigned int timestamp);
+			unsigned int timestamp, unsigned int hosts_hash);
 bool director_resend_sync(struct director *dir);
 
 void director_notify_ring_added(struct director_host *added_host,
@@ -115,6 +128,7 @@ void director_ring_remove(struct director_host *removed_host,
 void director_update_host(struct director *dir, struct director_host *src,
 			  struct director_host *orig_src,
 			  struct mail_host *host) ATTR_NULL(3);
+void director_resend_hosts(struct director *dir);
 void director_remove_host(struct director *dir, struct director_host *src,
 			  struct director_host *orig_src,
 			  struct mail_host *host) ATTR_NULL(2, 3);
@@ -124,11 +138,20 @@ void director_flush_host(struct director *dir, struct director_host *src,
 void director_update_user(struct director *dir, struct director_host *src,
 			  struct user *user);
 void director_update_user_weak(struct director *dir, struct director_host *src,
+			       struct director_connection *src_conn,
 			       struct director_host *orig_src,
 			       struct user *user) ATTR_NULL(3);
 void director_move_user(struct director *dir, struct director_host *src,
 			struct director_host *orig_src,
 			unsigned int username_hash, struct mail_host *host)
+	ATTR_NULL(3);
+void director_kick_user(struct director *dir, struct director_host *src,
+			struct director_host *orig_src, const char *username)
+	ATTR_NULL(3);
+void director_kick_user_hash(struct director *dir, struct director_host *src,
+			     struct director_host *orig_src,
+			     unsigned int username_hash,
+			     const struct ip_addr *except_ip)
 	ATTR_NULL(3);
 void director_user_killed(struct director *dir, unsigned int username_hash);
 void director_user_killed_everywhere(struct director *dir,

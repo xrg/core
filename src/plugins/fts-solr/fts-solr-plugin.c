@@ -1,16 +1,17 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
+#include "http-client.h"
 #include "mail-user.h"
 #include "mail-storage-hooks.h"
 #include "solr-connection.h"
+#include "fts-user.h"
 #include "fts-solr-plugin.h"
 
-#include <stdlib.h>
 
 const char *fts_solr_plugin_version = DOVECOT_ABI_VERSION;
-struct solr_connection *solr_conn = NULL;
+struct http_client *solr_http_client = NULL;
 
 struct fts_solr_user_module fts_solr_user_module =
 	MODULE_CONTEXT_INIT(&mail_user_module_register);
@@ -29,6 +30,8 @@ fts_solr_plugin_init_settings(struct mail_user *user,
 			set->url = p_strdup(user->pool, *tmp + 4);
 		} else if (strcmp(*tmp, "debug") == 0) {
 			set->debug = TRUE;
+		} else if (strcmp(*tmp, "use_libfts") == 0) {
+			set->use_libfts = TRUE;
 		} else if (strcmp(*tmp, "break-imap-search") == 0) {
 			/* for backwards compatibility */
 		} else if (strcmp(*tmp, "default_ns=") == 0) {
@@ -46,16 +49,36 @@ fts_solr_plugin_init_settings(struct mail_user *user,
 	return 0;
 }
 
+static void fts_solr_mail_user_deinit(struct mail_user *user)
+{
+	struct fts_solr_user *fuser = FTS_SOLR_USER_CONTEXT(user);
+
+	if (fuser->set.use_libfts)
+		fts_mail_user_deinit(user);
+	fuser->module_ctx.super.deinit(user);
+}
+
 static void fts_solr_mail_user_create(struct mail_user *user, const char *env)
 {
+	struct mail_user_vfuncs *v = user->vlast;
 	struct fts_solr_user *fuser;
+	const char *error;
 
 	fuser = p_new(user->pool, struct fts_solr_user, 1);
 	if (fts_solr_plugin_init_settings(user, &fuser->set, env) < 0) {
 		/* invalid settings, disabling */
 		return;
 	}
+	if (fuser->set.use_libfts) {
+		if (fts_mail_user_init(user, &error) < 0) {
+			i_error("fts-solr: %s", error);
+			return;
+		}
+	}
 
+	fuser->module_ctx.super = *v;
+	user->vlast = &fuser->module_ctx.super;
+	v->deinit = fts_solr_mail_user_deinit;
 	MODULE_CONTEXT_SET(user, fts_solr_user_module, fuser);
 }
 
@@ -84,8 +107,8 @@ void fts_solr_plugin_deinit(void)
 	fts_backend_unregister(fts_backend_solr.name);
 	fts_backend_unregister(fts_backend_solr_old.name);
 	mail_storage_hooks_remove(&fts_solr_mail_storage_hooks);
-	if (solr_conn != NULL)
-		solr_connection_deinit(solr_conn);
+	if (solr_http_client != NULL)
+		http_client_deinit(&solr_http_client);
 
 }
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "common.h"
 #include "array.h"
@@ -62,9 +62,10 @@ static const struct setting_parser_info file_listener_setting_parser_info = {
 static const struct setting_define inet_listener_setting_defines[] = {
 	DEF(SET_STR, name),
 	DEF(SET_STR, address),
-	DEF(SET_UINT, port),
+	DEF(SET_IN_PORT, port),
 	DEF(SET_BOOL, ssl),
 	DEF(SET_BOOL, reuse_port),
+	DEF(SET_BOOL, haproxy),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -74,7 +75,8 @@ static const struct inet_listener_settings inet_listener_default_settings = {
 	.address = "",
 	.port = 0,
 	.ssl = FALSE,
-	.reuse_port = FALSE
+	.reuse_port = FALSE,
+	.haproxy = FALSE
 };
 
 static const struct setting_parser_info inet_listener_setting_parser_info = {
@@ -217,7 +219,7 @@ static const struct master_settings master_default_settings = {
 	.state_dir = PKG_STATEDIR,
 	.libexec_dir = PKG_LIBEXECDIR,
 	.instance_name = PACKAGE,
-	.import_environment = "TZ" ENV_SYSTEMD ENV_GDB,
+	.import_environment = "TZ CORE_OUTOFMEM CORE_ERROR" ENV_SYSTEMD ENV_GDB,
 	.protocols = "imap pop3 lmtp",
 	.listen = "*, ::",
 	.ssl = "yes:no:required",
@@ -318,7 +320,7 @@ static void add_inet_listeners(ARRAY_TYPE(inet_listener_settings) *l,
 		struct inet_listener_settings *set = *sets;
 
 		if (set->port != 0) {
-			str = t_strdup_printf("%d:%s", set->port, set->address);
+			str = t_strdup_printf("%u:%s", set->port, set->address);
 			array_append(all_listeners, &str, 1);
 		}
 	}
@@ -644,6 +646,7 @@ settings_have_auth_unix_listeners_in(const struct master_settings *set,
 {
 	struct service_settings *const *services;
 	struct file_listener_settings *const *uls;
+	unsigned int dir_len = strlen(dir);
 
 	array_foreach(&set->services, services) {
 		struct service_settings *service = *services;
@@ -652,7 +655,8 @@ settings_have_auth_unix_listeners_in(const struct master_settings *set,
 			array_foreach(&service->unix_listeners, uls) {
 				struct file_listener_settings *u = *uls;
 
-				if (strncmp(u->path, dir, strlen(dir)) == 0)
+				if (strncmp(u->path, dir, dir_len) == 0 &&
+				    u->path[dir_len] == '/')
 					return TRUE;
 			}
 		}
@@ -707,8 +711,7 @@ static void unlink_sockets(const char *path, const char *prefix)
 			}
 		}
 
-		if (unlink(str_c(str)) < 0 && errno != ENOENT)
-			i_error("unlink(%s) failed: %m", str_c(str));
+		i_unlink_if_exists(str_c(str));
 	}
 	(void)closedir(dirp);
 }

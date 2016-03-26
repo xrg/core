@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -100,6 +100,11 @@ static int acl_attribute_get_acl(struct mailbox *box, const char *key,
 static int acl_have_attribute_rights(struct mailbox *box)
 {
 	int ret;
+
+	if (box->deleting) {
+		/* deleting attributes during mailbox deletion */
+		return 1;
+	}
 
 	/* RFC 5464:
 

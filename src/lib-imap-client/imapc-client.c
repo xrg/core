@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -24,6 +24,8 @@ const struct imapc_capability_name imapc_capability_names[] = {
 	{ "CONDSTORE", IMAPC_CAPABILITY_CONDSTORE },
 	{ "NAMESPACE", IMAPC_CAPABILITY_NAMESPACE },
 	{ "UNSELECT", IMAPC_CAPABILITY_UNSELECT },
+	{ "ESEARCH", IMAPC_CAPABILITY_ESEARCH },
+	{ "WITHIN", IMAPC_CAPABILITY_WITHIN },
 
 	{ "IMAP4REV1", IMAPC_CAPABILITY_IMAP4REV1 },
 	{ NULL, 0 }
@@ -54,6 +56,8 @@ imapc_client_init(const struct imapc_client_settings *set)
 	client->set.master_user = p_strdup_empty(pool, set->master_user);
 	client->set.username = p_strdup(pool, set->username);
 	client->set.password = p_strdup(pool, set->password);
+	client->set.sasl_mechanisms = p_strdup(pool, set->sasl_mechanisms);
+	client->set.use_proxyauth = set->use_proxyauth;
 	client->set.dns_client_socket_path =
 		p_strdup(pool, set->dns_client_socket_path);
 	client->set.temp_path_prefix =
@@ -65,6 +69,14 @@ imapc_client_init(const struct imapc_client_settings *set)
 		IMAPC_DEFAULT_CONNECT_TIMEOUT_MSECS;
 	client->set.cmd_timeout_msecs = set->cmd_timeout_msecs != 0 ?
 		set->cmd_timeout_msecs : IMAPC_DEFAULT_COMMAND_TIMEOUT_MSECS;
+	client->set.throttle_set = set->throttle_set;
+
+	if (client->set.throttle_set.init_msecs == 0)
+		client->set.throttle_set.init_msecs = IMAPC_THROTTLE_DEFAULT_INIT_MSECS;
+	if (client->set.throttle_set.max_msecs == 0)
+		client->set.throttle_set.max_msecs = IMAPC_THROTTLE_DEFAULT_MAX_MSECS;
+	if (client->set.throttle_set.shrink_min_msecs == 0)
+		client->set.throttle_set.shrink_min_msecs = IMAPC_THROTTLE_DEFAULT_SHRINK_MIN_MSECS;
 
 	if (set->ssl_mode != IMAPC_CLIENT_SSL_MODE_NONE) {
 		client->set.ssl_mode = set->ssl_mode;
@@ -159,7 +171,7 @@ static void imapc_client_run_pre(struct imapc_client *client)
 
 	if (io_loop_is_running(client->ioloop))
 		io_loop_run(client->ioloop);
-	current_ioloop = prev_ioloop;
+	io_loop_set_current(prev_ioloop);
 }
 
 static void imapc_client_run_post(struct imapc_client *client)
@@ -171,7 +183,7 @@ static void imapc_client_run_post(struct imapc_client *client)
 	array_foreach(&client->conns, connp)
 		imapc_connection_ioloop_changed((*connp)->conn);
 
-	current_ioloop = ioloop;
+	io_loop_set_current(ioloop);
 	io_loop_destroy(&ioloop);
 }
 
@@ -288,14 +300,23 @@ imapc_client_reconnect_cb(const struct imapc_command_reply *reply,
 	if (reply->state == IMAPC_COMMAND_STATE_OK) {
 		/* reopen the mailbox */
 		box->reopen_callback(box->reopen_context);
+		imapc_connection_set_reconnected(box->conn);
 	} else {
 		imapc_connection_abort_commands(box->conn, NULL, FALSE);
 	}
 }
 
+bool imapc_client_mailbox_can_reconnect(struct imapc_client_mailbox *box)
+{
+	/* the reconnect_ok flag attempts to avoid infinite reconnection loops
+	   to a server that keeps disconnecting us (e.g. some of the commands
+	   we send keeps crashing it always) */
+	return box->reopen_callback != NULL && box->reconnect_ok;
+}
+
 void imapc_client_mailbox_reconnect(struct imapc_client_mailbox *box)
 {
-	bool reconnect = box->reopen_callback != NULL && box->reconnect_ok;
+	bool reconnect = imapc_client_mailbox_can_reconnect(box);
 
 	if (reconnect) {
 		i_assert(!box->reconnecting);
@@ -306,6 +327,9 @@ void imapc_client_mailbox_reconnect(struct imapc_client_mailbox *box)
 		imapc_connection_connect(box->conn,
 					 imapc_client_reconnect_cb, box);
 	}
+	/* if we fail again, avoid reconnecting immediately. if the server is
+	   broken we could just get into an infinitely failing reconnection
+	   loop. */
 	box->reconnect_ok = FALSE;
 }
 
@@ -337,6 +361,8 @@ void imapc_client_mailbox_close(struct imapc_client_mailbox **_box)
 	}
 
 	imapc_msgmap_deinit(&box->msgmap);
+	if (box->to_send_idle != NULL)
+		timeout_remove(&box->to_send_idle);
 	i_free(box);
 }
 
@@ -359,10 +385,23 @@ imapc_client_mailbox_get_msgmap(struct imapc_client_mailbox *box)
 	return box->msgmap;
 }
 
-void imapc_client_mailbox_idle(struct imapc_client_mailbox *box)
+static void imapc_client_mailbox_idle_send(struct imapc_client_mailbox *box)
 {
+	timeout_remove(&box->to_send_idle);
 	if (imapc_client_mailbox_is_opened(box))
 		imapc_connection_idle(box->conn);
+}
+
+void imapc_client_mailbox_idle(struct imapc_client_mailbox *box)
+{
+	/* send the IDLE with a delay to avoid unnecessary IDLEs that are
+	   immediately aborted */
+	if (box->to_send_idle == NULL && imapc_client_mailbox_is_opened(box)) {
+		box->to_send_idle =
+			timeout_add_short(IMAPC_CLIENT_IDLE_SEND_DELAY_MSECS,
+					  imapc_client_mailbox_idle_send, box);
+	}
+	/* we're done with all work at this point. */
 	box->reconnect_ok = TRUE;
 }
 
@@ -397,6 +436,7 @@ imapc_client_get_capabilities(struct imapc_client *client)
 	}
 
 	/* fallback to whatever exists (there always exists one) */
+	i_assert(conn != NULL);
 	return imapc_connection_get_capabilities(conn);
 }
 
@@ -421,9 +461,8 @@ int imapc_client_create_temp_fd(struct imapc_client *client,
 	}
 
 	/* we just want the fd, unlink it */
-	if (unlink(str_c(path)) < 0) {
+	if (i_unlink(str_c(path)) < 0) {
 		/* shouldn't happen.. */
-		i_error("unlink(%s) failed: %m", str_c(path));
 		i_close_fd(&fd);
 		return -1;
 	}

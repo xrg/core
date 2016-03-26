@@ -20,6 +20,8 @@ struct mail_storage_settings {
 	const char *mail_cache_fields;
 	const char *mail_always_cache_fields;
 	const char *mail_never_cache_fields;
+	const char *mail_server_comment;
+	const char *mail_server_admin;
 	unsigned int mail_cache_min_mail_count;
 	unsigned int mailbox_idle_check_interval;
 	unsigned int mail_max_keyword_length;
@@ -32,6 +34,7 @@ struct mail_storage_settings {
 	bool mail_nfs_storage;
 	bool mail_nfs_index;
 	bool mailbox_list_index;
+	bool mailbox_list_index_very_dirty_syncs;
 	bool mail_debug;
 	bool mail_full_filesystem_access;
 	bool maildir_stat_dirs;
@@ -61,6 +64,7 @@ struct mail_namespace_settings {
 	bool subscriptions;
 	bool ignore_on_failure;
 	bool disabled;
+	unsigned int order;
 
 	ARRAY(struct mailbox_settings *) mailboxes;
 	struct mail_user_settings *user_set;
@@ -76,6 +80,8 @@ struct mailbox_settings {
 	const char *autocreate;
 	const char *special_use;
 	const char *driver;
+	const char *comment;
+	unsigned int autoexpunge;
 };
 
 struct mail_user_settings {

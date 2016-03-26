@@ -1,23 +1,9 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "imap-commands.h"
 #include "imap-search-args.h"
 #include "imap-expunge.h"
-
-static bool cmd_expunge_callback(struct client_command_context *cmd)
-{
-	if (cmd->client->sync_seen_deletes && !cmd->uid) {
-		/* Outlook workaround: session 1 set \Deleted flag and
-		   session 2 tried to expunge without having seen it yet.
-		   expunge again. MAILBOX_TRANSACTION_FLAG_REFRESH should
-		   have caught this already if index files are used. */
-		return cmd_expunge(cmd);
-	}
-
-	client_send_tagline(cmd, "OK Expunge completed.");
-	return TRUE;
-}
 
 static bool ATTR_NULL(2)
 cmd_expunge_finish(struct client_command_context *cmd,
@@ -29,14 +15,13 @@ cmd_expunge_finish(struct client_command_context *cmd,
 	int ret;
 
 	ret = imap_expunge(client->mailbox, search_args == NULL ? NULL :
-			   search_args->args);
+			   search_args->args, &client->expunged_count);
 	if (search_args != NULL)
 		mail_search_args_unref(&search_args);
 	if (ret < 0) {
 		errstr = mailbox_get_last_error(client->mailbox, &error);
 		if (error != MAIL_ERROR_PERM) {
-			client_send_storage_error(cmd,
-				mailbox_get_storage(client->mailbox));
+			client_send_box_error(cmd, client->mailbox);
 			return TRUE;
 		} else {
 			return cmd_sync(cmd, 0, IMAP_SYNC_FLAG_SAFE,
@@ -46,14 +31,8 @@ cmd_expunge_finish(struct client_command_context *cmd,
 	}
 
 	client->sync_seen_deletes = FALSE;
-	if ((client->enabled_features & MAILBOX_FEATURE_QRESYNC) != 0) {
-		return cmd_sync(cmd, MAILBOX_SYNC_FLAG_EXPUNGE,
-				IMAP_SYNC_FLAG_SAFE, "OK Expunge completed.");
-	} else {
-		return cmd_sync_callback(cmd, MAILBOX_SYNC_FLAG_EXPUNGE,
-					 IMAP_SYNC_FLAG_SAFE,
-					 cmd_expunge_callback);
-	}
+	return cmd_sync(cmd, MAILBOX_SYNC_FLAG_EXPUNGE,
+			IMAP_SYNC_FLAG_SAFE, "OK Expunge completed.");
 }
 
 bool cmd_uid_expunge(struct client_command_context *cmd)

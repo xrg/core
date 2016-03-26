@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -19,7 +19,7 @@ static struct file_listener_settings *director_unix_listeners[] = {
 };
 static buffer_t director_unix_listeners_buf = {
 	director_unix_listeners,
-	sizeof(director_unix_listeners), { 0, }
+	sizeof(director_unix_listeners), { NULL, }
 };
 static struct file_listener_settings director_fifo_listeners_array[] = {
 	{ "login/proxy-notify", 0, "", "" }
@@ -29,7 +29,7 @@ static struct file_listener_settings *director_fifo_listeners[] = {
 };
 static buffer_t director_fifo_listeners_buf = {
 	director_fifo_listeners,
-	sizeof(director_fifo_listeners), { 0, }
+	sizeof(director_fifo_listeners), { NULL, }
 };
 /* </settings checks> */
 
@@ -72,7 +72,9 @@ static const struct setting_define director_setting_defines[] = {
 	DEF(SET_STR, director_mail_servers),
 	DEF(SET_STR, director_username_hash),
 	DEF(SET_TIME, director_user_expire),
-	DEF(SET_UINT, director_doveadm_port),
+	DEF(SET_TIME, director_user_kick_delay),
+	DEF(SET_IN_PORT, director_doveadm_port),
+	DEF(SET_BOOL, director_consistent_hashing),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -84,6 +86,7 @@ const struct director_settings director_default_settings = {
 	.director_mail_servers = "",
 	.director_username_hash = "%Lu",
 	.director_user_expire = 60*15,
+	.director_user_kick_delay = 2,
 	.director_doveadm_port = 0
 };
 

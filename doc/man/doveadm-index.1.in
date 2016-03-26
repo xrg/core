@@ -1,21 +1,34 @@
-.\" Copyright (c) 2010-2011 Dovecot authors, see the included COPYING file
-.TH DOVEADM\-INDEX 1 "2011-05-11" "Dovecot v2.2" "Dovecot"
+.\" Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file
+.TH DOVEADM\-INDEX 1 "2015-05-09" "Dovecot v2.2" "Dovecot"
 .SH NAME
 doveadm\-index \- Index mailboxes
 .\"------------------------------------------------------------------------
 .SH SYNOPSIS
 .BR doveadm " [" \-Dv "] " index " [" \-S
-.IR socket_path "] " mailbox
+.IR socket_path ]
+.RB [ \-q "] [" \-n
+.IR max_recent "] " mailbox
 .\"-------------------------------------
 .br
 .BR doveadm " [" \-Dv "] " index " [" \-S
 .IR socket_path "] "
-.BI \-A \ mailbox
+.B \-A
+.RB [ \-q "] [" \-n
+.IR max_recent "] " mailbox
 .\"-------------------------------------
 .br
 .BR doveadm " [" \-Dv "] " index " [" \-S
 .IR socket_path "] "
-.BI \-u " user mailbox"
+.BI \-F " file"
+.RB [ \-q "] [" \-n
+.IR max_recent "] " mailbox
+.\"-------------------------------------
+.br
+.BR doveadm " [" \-Dv "] " index " [" \-S
+.IR socket_path "] "
+.BI \-u \ user
+.RB [ \-q "] [" \-n
+.IR max_recent "] " mailbox
 .\"------------------------------------------------------------------------
 .SH DESCRIPTION
 Add unindexed messages in a mailbox into index/cache file. If full text
@@ -26,6 +39,17 @@ mailbox\(aqs caching decisions, so it won\(aqt do anything useful for
 mailboxes that user\(aqs client hasn\(aqt accessed yet. You can use
 .B doveadm dump
 command to show a specific mailbox\(aqs current caching decisions.
+.PP
+Messages can also be added automatically to full text search index using:
+.sp
+.nf
+plugin {
+  ...
+  fts_autoindex = yes
+}
+.fi
+in
+.IR @pkgsysconfdir@/conf.d/90\-plugin.conf .
 .\"------------------------------------------------------------------------
 @INCLUDE:global-options@
 .\" --- command specific options --- "/.
@@ -34,6 +58,27 @@ Command specific
 .IR options :
 .\"-------------------------------------
 @INCLUDE:option-A@
+.\"-------------------------------------
+@INCLUDE:option-F-file@
+.\"-------------------------------------
+.TP
+.BI \-n \ max_recent
+An integer value, which specifies the maximum number of \(rsRecent
+messages in mailboxes.
+If the mailbox contains more than
+.I max_recent
+messages with \(rsRecent flag set, the mailbox will not be indexed.
+This may be useful to avoid unnecessary indexing for large mailboxes that
+are never opened.
+.\"-------------------------------------
+.TP
+.B \-q
+Queues the indexing to be run by indexer process.
+Without \-q the indexing is done directly by the
+.BR doveadm (1)
+process.
+Some backends like fts\-lucene can\(aqt handle multiple processes updating
+the indexes simultaneously, so \-q should usually be used on production.
 .\"-------------------------------------
 @INCLUDE:option-S-socket@
 .\"-------------------------------------

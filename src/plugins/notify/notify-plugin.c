@@ -1,11 +1,10 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "llist.h"
 #include "mail-storage.h"
 #include "notify-plugin-private.h"
 
-#include <stdlib.h>
 
 struct notify_mail_txn {
 	struct notify_mail_txn *prev, *next;

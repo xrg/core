@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -18,12 +18,12 @@
 #include "mdbox-file.h"
 #include "mdbox-sync.h"
 
-#include <stdlib.h>
 
 struct dbox_save_mail {
 	struct dbox_file_append_context *file_append;
 	uint32_t seq;
 	uint32_t append_offset;
+	bool written_to_disk;
 };
 
 struct mdbox_save_context {
@@ -85,6 +85,7 @@ mdbox_save_file_get_file(struct mailbox_transaction_context *t,
 	}
 
 	/* saved mail */
+	i_assert(mail->written_to_disk);
 	if (dbox_file_append_flush(mail->file_append) < 0)
 		ctx->ctx.failed = TRUE;
 
@@ -183,6 +184,7 @@ static int mdbox_save_mail_write_metadata(struct mdbox_save_context *ctx,
 		dbox_file_set_syscall_error(file, "pwrite()");
 		return -1;
 	}
+	mail->written_to_disk = TRUE;
 	return 0;
 }
 
@@ -288,7 +290,7 @@ int mdbox_transaction_save_commit_pre(struct mail_save_context *_ctx)
 	}
 
 	/* make sure the map gets locked */
-	if (mdbox_map_atomic_lock(ctx->atomic) < 0) {
+	if (mdbox_map_atomic_lock(ctx->atomic, "saving") < 0) {
 		mdbox_transaction_save_rollback(_ctx);
 		return -1;
 	}
@@ -335,6 +337,9 @@ int mdbox_transaction_save_commit_pre(struct mail_save_context *_ctx)
 			mdbox_transaction_save_rollback(_ctx);
 			return -1;
 		}
+		mail_index_sync_set_reason(ctx->sync_ctx->index_sync_ctx, "copying");
+	} else {
+		mail_index_sync_set_reason(ctx->sync_ctx->index_sync_ctx, "saving");
 	}
 
 	if (ctx->ctx.mail != NULL)
@@ -359,7 +364,7 @@ void mdbox_transaction_save_commit_post(struct mail_save_context *_ctx,
 	if (mdbox_sync_finish(&ctx->sync_ctx, TRUE) == 0) {
 		/* commit refcount increases for copied mails */
 		if (ctx->map_trans != NULL) {
-			if (mdbox_map_transaction_commit(ctx->map_trans) < 0)
+			if (mdbox_map_transaction_commit(ctx->map_trans, "copy refcount updates") < 0)
 				mdbox_map_atomic_set_failed(ctx->atomic);
 		}
 		/* flush file append writes */

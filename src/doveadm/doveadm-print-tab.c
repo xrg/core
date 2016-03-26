@@ -1,10 +1,9 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
+#include "ostream.h"
 #include "doveadm-print-private.h"
-
-#include <stdio.h>
 
 struct doveadm_print_tab_context {
 	unsigned int header_idx, header_count;
@@ -14,27 +13,36 @@ struct doveadm_print_tab_context {
 
 static struct doveadm_print_tab_context ctx;
 
+static void doveadm_print_tab_flush_header(void)
+{
+	if (!ctx.header_written) {
+		if (!doveadm_print_hide_titles)
+			o_stream_nsend(doveadm_print_ostream, "\n", 1);
+		ctx.header_written = TRUE;
+	}
+}
+
 static void
 doveadm_print_tab_header(const struct doveadm_print_header *hdr)
 {
-	if (ctx.header_count++ > 0)
-		printf("\t");
-	printf("%s", hdr->title);
+	ctx.header_count++;
+	if (!doveadm_print_hide_titles) {
+		if (ctx.header_count > 1)
+			o_stream_nsend(doveadm_print_ostream, "\t", 1);
+		o_stream_nsend_str(doveadm_print_ostream, hdr->title);
+	}
 }
 
 static void doveadm_print_tab_print(const char *value)
 {
-	if (!ctx.header_written) {
-		printf("\n");
-		ctx.header_written = TRUE;
-	}
+	doveadm_print_tab_flush_header();
 	if (ctx.header_idx > 0)
-		printf("\t");
-	printf("%s", value);
+		o_stream_nsend(doveadm_print_ostream, "\t", 1);
+	o_stream_nsend_str(doveadm_print_ostream, value);
 
 	if (++ctx.header_idx == ctx.header_count) {
 		ctx.header_idx = 0;
-		printf("\n");
+		o_stream_nsend(doveadm_print_ostream, "\n", 1);
 	}
 }
 
@@ -45,21 +53,15 @@ doveadm_print_tab_print_stream(const unsigned char *value, size_t size)
 		doveadm_print_tab_print("");
 		return;
 	}
-	if (!ctx.header_written) {
-		printf("\n");
-		ctx.header_written = TRUE;
-	}
+	doveadm_print_tab_flush_header();
 	if (ctx.header_idx > 0)
-		printf("\t");
-	fwrite(value, 1, size, stdout);
+		o_stream_nsend(doveadm_print_ostream, "\t", 1);
+	o_stream_nsend(doveadm_print_ostream, value, size);
 }
 
 static void doveadm_print_tab_flush(void)
 {
-	if (!ctx.header_written) {
-		printf("\n");
-		ctx.header_written = TRUE;
-	}
+	doveadm_print_tab_flush_header();
 }
 
 struct doveadm_print_vfuncs doveadm_print_tab_vfuncs = {

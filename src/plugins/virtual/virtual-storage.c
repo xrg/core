@@ -1,9 +1,10 @@
-/* Copyright (c) 2008-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2008-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "ioloop.h"
 #include "str.h"
+#include "llist.h"
 #include "mkdir-parents.h"
 #include "unlink-directory.h"
 #include "index-mail.h"
@@ -15,10 +16,18 @@
 #include "virtual-storage.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+
+#define VIRTUAL_DEFAULT_MAX_OPEN_MAILBOXES 64
+
+#define VIRTUAL_BACKEND_CONTEXT(obj) \
+	MODULE_CONTEXT(obj, virtual_backend_storage_module)
+
+struct virtual_backend_mailbox {
+	union mailbox_module_context module_ctx;
+};
 
 extern struct mail_storage virtual_storage;
 extern struct mailbox virtual_mailbox;
@@ -26,6 +35,8 @@ extern struct virtual_mailbox_vfuncs virtual_mailbox_vfuncs;
 
 struct virtual_storage_module virtual_storage_module =
 	MODULE_CONTEXT_INIT(&mail_storage_module_register);
+static MODULE_CONTEXT_DEFINE_INIT(virtual_backend_storage_module,
+				  &mail_storage_module_register);
 
 static bool ns_is_visible(struct mail_namespace *ns)
 {
@@ -68,6 +79,24 @@ static struct mail_storage *virtual_storage_alloc(void)
 	storage->storage.pool = pool;
 	p_array_init(&storage->open_stack, pool, 8);
 	return &storage->storage;
+}
+
+static int
+virtual_storage_create(struct mail_storage *_storage,
+		       struct mail_namespace *ns ATTR_UNUSED,
+		       const char **error_r)
+{
+	struct virtual_storage *storage = (struct virtual_storage *)_storage;
+	const char *value;
+
+	value = mail_user_plugin_getenv(_storage->user, "virtual_max_open_mailboxes");
+	if (value == NULL)
+		storage->max_open_mailboxes = VIRTUAL_DEFAULT_MAX_OPEN_MAILBOXES;
+	else if (str_to_uint(value, &storage->max_open_mailboxes) < 0) {
+		*error_r = "Invalid virtual_max_open_mailboxes setting";
+		return -1;
+	}
+	return 0;
 }
 
 static void
@@ -129,61 +158,59 @@ static int virtual_backend_box_open_failed(struct virtual_mailbox *mbox,
 					   struct virtual_backend_box *bbox)
 {
 	enum mail_error error;
-	const char *str, *name;
+	const char *str;
 
-	str = mailbox_get_last_error(bbox->box, &error);
-	name = t_strdup(get_user_visible_mailbox_name(bbox->box));
+	str = t_strdup_printf(
+		"Virtual mailbox open failed because of mailbox %s: %s",
+		get_user_visible_mailbox_name(bbox->box),
+		mailbox_get_last_error(bbox->box, &error));
+	mail_storage_set_error(mbox->box.storage, error, str);
 	mailbox_free(&bbox->box);
-	if (error == MAIL_ERROR_NOTFOUND) {
-		/* ignore this. it could be intentional. */
-		if (mbox->storage->storage.user->mail_debug) {
-			i_debug("virtual mailbox %s: "
-				"Skipping non-existing mailbox %s",
-				mbox->box.vname, name);
-		}
-		return 0;
-	}
 
 	if (error == MAIL_ERROR_PERM && bbox->wildcard) {
 		/* this mailbox wasn't explicitly specified. just skip it. */
 		return 0;
 	}
-	str = t_strdup_printf(
-		"Virtual mailbox open failed because of mailbox %s: %s",
-		name, str);
-	mail_storage_set_error(mbox->box.storage, error, str);
 	return -1;
 }
 
-static int virtual_backend_box_open(struct virtual_mailbox *mbox,
-				    struct virtual_backend_box *bbox,
-				    enum mailbox_flags flags)
+static int virtual_backend_box_alloc(struct virtual_mailbox *mbox,
+				     struct virtual_backend_box *bbox,
+				     enum mailbox_flags flags)
 {
 	struct mail_user *user = mbox->storage->storage.user;
 	struct mail_namespace *ns;
-	struct mailbox_status status;
 	const char *mailbox;
+	enum mailbox_existence existence;
 
 	i_assert(bbox->box == NULL);
 
-	if (bbox->clear_recent)
-		flags |= MAILBOX_FLAG_DROP_RECENT;
+	if (!bbox->clear_recent)
+		flags &= ~MAILBOX_FLAG_DROP_RECENT;
 
 	mailbox = bbox->name;
 	ns = mail_namespace_find(user->namespaces, mailbox);
 	bbox->box = mailbox_alloc(ns->list, mailbox, flags);
+	MODULE_CONTEXT_SET(bbox->box, virtual_storage_module, bbox);
 
-	if (mailbox_open(bbox->box) < 0)
+	if (mailbox_exists(bbox->box, TRUE, &existence) < 0)
 		return virtual_backend_box_open_failed(mbox, bbox);
+	if (existence != MAILBOX_EXISTENCE_SELECT) {
+		/* ignore this. it could be intentional. */
+		if (mbox->storage->storage.user->mail_debug) {
+			i_debug("virtual mailbox %s: "
+				"Skipping non-existing mailbox %s",
+				mbox->box.vname, bbox->box->vname);
+		}
+		mailbox_free(&bbox->box);
+		return 0;
+	}
+
 	i_array_init(&bbox->uids, 64);
 	i_array_init(&bbox->sync_pending_removes, 64);
-	mail_search_args_init(bbox->search_args, bbox->box, FALSE, NULL);
-
-	mailbox_get_open_status(bbox->box, 0, &status);
-	if (!status.have_guids)
-		mbox->have_guids = FALSE;
-	if (!status.have_save_guids)
-		mbox->have_save_guids = FALSE;
+	/* we use modseqs for being able to check quickly if backend mailboxes
+	   have changed. make sure the backend has them enabled. */
+	mailbox_enable(bbox->box, MAILBOX_FEATURE_CONDSTORE);
 	return 1;
 }
 
@@ -194,16 +221,12 @@ static int virtual_mailboxes_open(struct virtual_mailbox *mbox,
 	unsigned int i, count;
 	int ret;
 
-	mbox->have_guids = TRUE;
-	mbox->have_save_guids = TRUE;
-
 	bboxes = array_get(&mbox->backend_boxes, &count);
 	for (i = 0; i < count; ) {
-		ret = virtual_backend_box_open(mbox, bboxes[i], flags);
+		ret = virtual_backend_box_alloc(mbox, bboxes[i], flags);
 		if (ret <= 0) {
 			if (ret < 0)
 				break;
-			mail_search_args_unref(&bboxes[i]->search_args);
 			array_delete(&mbox->backend_boxes, i, 1);
 			bboxes = array_get(&mbox->backend_boxes, &count);
 		} else {
@@ -246,6 +269,168 @@ virtual_mailbox_alloc(struct mail_storage *_storage, struct mailbox_list *list,
 	return &mbox->box;
 }
 
+void virtual_backend_box_sync_mail_unset(struct virtual_backend_box *bbox)
+{
+	struct mailbox_transaction_context *trans;
+
+	if (bbox->sync_mail != NULL) {
+		trans = bbox->sync_mail->transaction;
+		mail_free(&bbox->sync_mail);
+		(void)mailbox_transaction_commit(&trans);
+	}
+}
+
+static bool virtual_backend_box_can_close(struct virtual_backend_box *bbox)
+{
+	if (bbox->box->notify_callback != NULL) {
+		/* FIXME: IMAP IDLE running - we should support closing this
+		   also if mailbox_list_index=yes */
+		return FALSE;
+	}
+	if (array_count(&bbox->sync_pending_removes) > 0) {
+		/* FIXME: we could probably close this by making
+		   syncing support it? */
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static bool
+virtual_backend_box_close_any_except(struct virtual_mailbox *mbox,
+				     struct virtual_backend_box *except_bbox)
+{
+	struct virtual_backend_box *bbox;
+
+	/* first try to close a mailbox without any transactions.
+	   we'll also skip any mailbox that has notifications enabled (ideally
+	   these would be handled by mailbox list index) */
+	for (bbox = mbox->open_backend_boxes_head; bbox != NULL; bbox = bbox->next_open) {
+		i_assert(bbox->box->opened);
+
+		if (bbox != except_bbox &&
+		    bbox->box->transaction_count == 0 &&
+		    virtual_backend_box_can_close(bbox)) {
+			i_assert(bbox->sync_mail == NULL);
+			virtual_backend_box_close(mbox, bbox);
+			return TRUE;
+		}
+	}
+
+	/* next try to close a mailbox that has sync_mail, but no
+	   other transactions */
+	for (bbox = mbox->open_backend_boxes_head; bbox != NULL; bbox = bbox->next_open) {
+		if (bbox != except_bbox &&
+		    bbox->sync_mail != NULL &&
+		    bbox->box->transaction_count == 1 &&
+		    virtual_backend_box_can_close(bbox)) {
+			virtual_backend_box_sync_mail_unset(bbox);
+			i_assert(bbox->box->transaction_count == 0);
+			virtual_backend_box_close(mbox, bbox);
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+static void virtual_backend_mailbox_close(struct mailbox *box)
+{
+	struct virtual_backend_box *bbox = VIRTUAL_CONTEXT(box);
+	struct virtual_backend_mailbox *vbox = VIRTUAL_BACKEND_CONTEXT(box);
+
+	if (bbox != NULL && bbox->open_tracked) {
+		/* we could have gotten here from e.g. mailbox_autocreate()
+		   without going through virtual_mailbox_close() */
+		virtual_backend_box_close(bbox->virtual_mbox, bbox);
+	}
+	vbox->module_ctx.super.close(box);
+}
+
+void virtual_backend_mailbox_allocated(struct mailbox *box)
+{
+	struct mailbox_vfuncs *v = box->vlast;
+	struct virtual_backend_mailbox *vbox;
+
+	vbox = p_new(box->pool, struct virtual_backend_mailbox, 1);
+	vbox->module_ctx.super = *v;
+	box->vlast = &vbox->module_ctx.super;
+	v->close = virtual_backend_mailbox_close;
+	MODULE_CONTEXT_SET(box, virtual_backend_storage_module, vbox);
+}
+
+void virtual_backend_mailbox_opened(struct mailbox *box)
+{
+	struct virtual_backend_box *bbox = VIRTUAL_CONTEXT(box);
+	struct virtual_mailbox *mbox;
+
+	if (bbox == NULL) {
+		/* not a backend for a virtual mailbox */
+		return;
+	}
+	i_assert(!bbox->open_tracked);
+	mbox = bbox->virtual_mbox;
+
+	/* the backend mailbox was already opened. if we didn't get here
+	   from virtual_backend_box_open() we may need to close a mailbox */
+	while (mbox->backends_open_count >= mbox->storage->max_open_mailboxes &&
+	       virtual_backend_box_close_any_except(mbox, bbox))
+		;
+
+	bbox->open_tracked = TRUE;
+	mbox->backends_open_count++;
+	DLLIST2_APPEND_FULL(&mbox->open_backend_boxes_head,
+			    &mbox->open_backend_boxes_tail, bbox,
+			    prev_open, next_open);
+}
+
+int virtual_backend_box_open(struct virtual_mailbox *mbox,
+			     struct virtual_backend_box *bbox)
+{
+	i_assert(!bbox->box->opened);
+
+	/* try to keep the number of open mailboxes below the threshold
+	   before opening the mailbox */
+	while (mbox->backends_open_count >= mbox->storage->max_open_mailboxes &&
+	       virtual_backend_box_close_any_except(mbox, bbox))
+		;
+
+	return mailbox_open(bbox->box);
+}
+
+void virtual_backend_box_close(struct virtual_mailbox *mbox,
+			       struct virtual_backend_box *bbox)
+{
+	i_assert(bbox->box->opened);
+	i_assert(bbox->open_tracked);
+
+	if (bbox->search_result != NULL)
+		mailbox_search_result_free(&bbox->search_result);
+
+	if (bbox->search_args != NULL &&
+	    bbox->search_args_initialized) {
+		mail_search_args_deinit(bbox->search_args);
+		bbox->search_args_initialized = FALSE;
+	}
+	i_assert(mbox->backends_open_count > 0);
+	mbox->backends_open_count--;
+	bbox->open_tracked = FALSE;
+
+	DLLIST2_REMOVE_FULL(&mbox->open_backend_boxes_head,
+			    &mbox->open_backend_boxes_tail, bbox,
+			    prev_open, next_open);
+	mailbox_close(bbox->box);
+}
+
+void virtual_backend_box_accessed(struct virtual_mailbox *mbox,
+				  struct virtual_backend_box *bbox)
+{
+	DLLIST2_REMOVE_FULL(&mbox->open_backend_boxes_head,
+			    &mbox->open_backend_boxes_tail, bbox,
+			    prev_open, next_open);
+	DLLIST2_APPEND_FULL(&mbox->open_backend_boxes_head,
+			    &mbox->open_backend_boxes_tail, bbox,
+			    prev_open, next_open);
+}
+
 static void virtual_mailbox_close_internal(struct virtual_mailbox *mbox)
 {
 	struct virtual_backend_box **bboxes;
@@ -253,19 +438,18 @@ static void virtual_mailbox_close_internal(struct virtual_mailbox *mbox)
 
 	bboxes = array_get_modifiable(&mbox->backend_boxes, &count);
 	for (i = 0; i < count; i++) {
-		if (bboxes[i]->search_result != NULL)
-			mailbox_search_result_free(&bboxes[i]->search_result);
-
 		if (bboxes[i]->box == NULL)
 			continue;
 
-		mail_search_args_deinit(bboxes[i]->search_args);
+		if (bboxes[i]->box->opened)
+			virtual_backend_box_close(mbox, bboxes[i]);
 		mailbox_free(&bboxes[i]->box);
 		if (array_is_created(&bboxes[i]->sync_outside_expunges))
 			array_free(&bboxes[i]->sync_outside_expunges);
 		array_free(&bboxes[i]->sync_pending_removes);
 		array_free(&bboxes[i]->uids);
 	}
+	i_assert(mbox->backends_open_count == 0);
 }
 
 static int
@@ -279,6 +463,7 @@ virtual_mailbox_exists(struct mailbox *box, bool auto_boxes ATTR_UNUSED,
 static int virtual_mailbox_open(struct mailbox *box)
 {
 	struct virtual_mailbox *mbox = (struct virtual_mailbox *)box;
+	bool broken;
 	int ret = 0;
 
 	if (virtual_mailbox_is_in_open_stack(mbox->storage, box->name)) {
@@ -306,6 +491,12 @@ static int virtual_mailbox_open(struct mailbox *box)
 		mail_index_ext_register(mbox->box.index, "virtual", 0,
 			sizeof(struct virtual_mail_index_record),
 			sizeof(uint32_t));
+
+	if (virtual_mailbox_ext_header_read(mbox, box->view, &broken) < 0) {
+		virtual_mailbox_close_internal(mbox);
+		index_storage_mailbox_close(box);
+		return -1;
+	}
 	return 0;
 }
 
@@ -344,6 +535,34 @@ virtual_mailbox_update(struct mailbox *box,
 	return -1;
 }
 
+static int virtual_storage_set_have_guid_flags(struct virtual_mailbox *mbox)
+{
+	struct virtual_backend_box *const *bboxes;
+	unsigned int i, count;
+	struct mailbox_status status;
+
+	if (!mbox->box.opened) {
+		if (mailbox_open(&mbox->box) < 0)
+			return -1;
+	}
+
+	mbox->have_guids = TRUE;
+	mbox->have_save_guids = TRUE;
+
+	bboxes = array_get(&mbox->backend_boxes, &count);
+	for (i = 0; i < count; i++) {
+		if (mailbox_get_status(bboxes[i]->box, 0, &status) < 0) {
+			virtual_box_copy_error(&mbox->box, bboxes[i]->box);
+			return -1;
+		}
+		if (!status.have_guids)
+			mbox->have_guids = FALSE;
+		if (!status.have_save_guids)
+			mbox->have_save_guids = FALSE;
+	}
+	return 0;
+}
+
 static int
 virtual_storage_get_status(struct mailbox *box,
 			   enum mailbox_status_items items,
@@ -366,6 +585,12 @@ virtual_storage_get_status(struct mailbox *box,
 		   indexed. */
 		status_r->last_cached_seq = status_r->messages;
 	}
+	if (!mbox->have_guid_flags_set) {
+		if (virtual_storage_set_have_guid_flags(mbox) < 0)
+			return -1;
+		mbox->have_guid_flags_set = TRUE;
+	}
+
 	if (mbox->have_guids)
 		status_r->have_guids = TRUE;
 	if (mbox->have_save_guids)
@@ -397,17 +622,26 @@ virtual_notify_callback(struct mailbox *bbox ATTR_UNUSED, struct mailbox *box)
 static void virtual_notify_changes(struct mailbox *box)
 {
 	struct virtual_mailbox *mbox = (struct virtual_mailbox *)box;
-	struct virtual_backend_box *const *bboxes;
-	unsigned int i, count;
+	struct virtual_backend_box *const *bboxp;
 
-	bboxes = array_get(&mbox->backend_boxes, &count);
-	for (i = 0; i < count; i++) {
-		struct mailbox *bbox = bboxes[i]->box;
+	if (box->notify_callback == NULL) {
+		array_foreach(&mbox->backend_boxes, bboxp)
+			mailbox_notify_changes_stop((*bboxp)->box);
+		return;
+	}
 
-		if (box->notify_callback == NULL)
-			mailbox_notify_changes_stop(bbox);
-		else
-			mailbox_notify_changes(bbox, virtual_notify_callback, box);
+	/* FIXME: if mailbox_list_index=yes, use mailbox-list-notify.h API
+	   to wait for changes and avoid opening all mailboxes here. */
+
+	array_foreach(&mbox->backend_boxes, bboxp) {
+		if (!(*bboxp)->box->opened &&
+		    virtual_backend_box_open(mbox, *bboxp) < 0) {
+			/* we can't report error in here, so do it later */
+			(*bboxp)->open_failed = TRUE;
+			continue;
+		}
+		mailbox_notify_changes((*bboxp)->box,
+				       virtual_notify_callback, box);
 	}
 }
 
@@ -439,6 +673,7 @@ virtual_get_virtual_uids(struct mailbox *box,
 	while (seq_range_array_iter_nth(&iter, n++, &uid)) {
 		while (i < count && uids[i].real_uid < uid) i++;
 		if (i < count && uids[i].real_uid == uid) {
+			i_assert(uids[i].virtual_uid > 0);
 			seq_range_array_add(virtual_uids_r, 
 					    uids[i].virtual_uid);
 			i++;
@@ -478,6 +713,7 @@ virtual_get_virtual_uid_map(struct mailbox *box,
 
 			array_append(virtual_uids_r, &zero, 1);
 		} else {
+			i_assert(uids[i].virtual_uid > 0);
 			array_append(virtual_uids_r, &uids[i].virtual_uid, 1);
 			i++;
 		}
@@ -510,6 +746,24 @@ static bool virtual_is_inconsistent(struct mailbox *box)
 	return index_storage_is_inconsistent(box);
 }
 
+static int
+virtual_list_index_has_changed(struct mailbox *box ATTR_UNUSED,
+			       struct mail_index_view *list_view ATTR_UNUSED,
+			       uint32_t seq ATTR_UNUSED)
+{
+	/* we don't have any quick and easy optimizations for tracking
+	   virtual folders. ideally we'd completely disable mailbox list
+	   indexes for them, but this is the easiest way to do it for now. */
+	return 1;
+}
+
+static void
+virtual_list_index_update_sync(struct mailbox *box ATTR_UNUSED,
+			       struct mail_index_transaction *trans ATTR_UNUSED,
+			       uint32_t seq ATTR_UNUSED)
+{
+}
+
 struct mail_storage virtual_storage = {
 	.name = VIRTUAL_STORAGE_NAME,
 	.class_flags = MAIL_STORAGE_CLASS_FLAG_NOQUOTA,
@@ -517,7 +771,7 @@ struct mail_storage virtual_storage = {
 	.v = {
 		NULL,
 		virtual_storage_alloc,
-		NULL,
+		virtual_storage_create,
 		index_storage_destroy,
 		NULL,
 		virtual_storage_get_list_settings,
@@ -547,8 +801,8 @@ struct mailbox virtual_mailbox = {
 		index_storage_attribute_iter_init,
 		index_storage_attribute_iter_next,
 		index_storage_attribute_iter_deinit,
-		NULL,
-		NULL,
+		virtual_list_index_has_changed,
+		virtual_list_index_update_sync,
 		virtual_storage_sync_init,
 		index_mailbox_sync_next,
 		index_mailbox_sync_deinit,

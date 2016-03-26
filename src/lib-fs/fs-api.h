@@ -7,6 +7,13 @@ struct fs_file;
 struct fs_lock;
 struct hash_method;
 
+/* Metadata with this prefix shouldn't actually be sent to storage. */
+#define FS_METADATA_INTERNAL_PREFIX ":/X-Dovecot-fs-api-"
+/* fs_write*() may return a hex-encoded object ID after write is finished.
+   This can be later on used to optimize reads by setting it before reading
+   the file. */
+#define FS_METADATA_OBJECTID FS_METADATA_INTERNAL_PREFIX"ObjectID"
+
 enum fs_properties {
 	FS_PROPERTY_METADATA	= 0x01,
 	FS_PROPERTY_LOCKS	= 0x02,
@@ -22,7 +29,14 @@ enum fs_properties {
 	   when its children are deleted. */
 	FS_PROPERTY_DIRECTORIES	= 0x80,
 	FS_PROPERTY_WRITE_HASH_MD5	= 0x100,
-	FS_PROPERTY_WRITE_HASH_SHA256	= 0x200
+	FS_PROPERTY_WRITE_HASH_SHA256	= 0x200,
+	/* fs_copy() will copy the metadata if fs_set_metadata() hasn't
+	   been explicitly called. */
+	FS_PROPERTY_COPY_METADATA	= 0x400,
+	/* Backend support asynchronous file operations. */
+	FS_PROPERTY_ASYNC		= 0x800,
+	/* Backend supports FS_ITER_FLAG_OBJECTIDS. */
+	FS_PROPERTY_OBJECTIDS		= 0x1000
 };
 
 enum fs_open_mode {
@@ -54,17 +68,55 @@ enum fs_open_flags {
 	   finished and fs_read_stream() returns a nonblocking stream. */
 	FS_OPEN_FLAG_ASYNC		= 0x20,
 	/* fs_read_stream() must return a seekable input stream */
-	FS_OPEN_FLAG_SEEKABLE		= 0x40
+	FS_OPEN_FLAG_SEEKABLE		= 0x40,
+	/* Backend should handle this file's operations immediately without
+	   any additional command queueing. The caller is assumed to be the one
+	   doing any rate limiting if needed. This flag can only be used with
+	   ASYNC flag, synchronous requests are never queued. */
+	FS_OPEN_FLAG_ASYNC_NOQUEUE	= 0x80
 };
 
 enum fs_iter_flags {
 	/* Iterate only directories, not files */
 	FS_ITER_FLAG_DIRS	= 0x01,
 	/* Request asynchronous iteration. */
-	FS_ITER_FLAG_ASYNC	= 0x02
+	FS_ITER_FLAG_ASYNC	= 0x02,
+	/* Instead of returning object names, return <objectid>/<object name>.
+	   If this isn't supported, the <objectid> is returned empty. The
+	   object IDs are always hex-encoded data. This flag can be used only
+	   if FS_PROPERTY_OBJECTIDS is enabled. */
+	FS_ITER_FLAG_OBJECTIDS	= 0x04,
+	/* Explicitly disable all caching for this iteration (if anything
+	   happens to be enabled). This should be used only in situations where
+	   the iteration is used to fix something that is broken, e.g. doveadm
+	   force-resync. */
+	FS_ITER_FLAG_NOCACHE	= 0x08
+};
+
+enum fs_op {
+	FS_OP_WAIT,
+	FS_OP_METADATA,
+	FS_OP_PREFETCH,
+	FS_OP_READ,
+	FS_OP_WRITE,
+	FS_OP_LOCK,
+	FS_OP_EXISTS,
+	FS_OP_STAT,
+	FS_OP_COPY,
+	FS_OP_RENAME,
+	FS_OP_DELETE,
+	FS_OP_ITER,
+
+	FS_OP_COUNT
 };
 
 struct fs_settings {
+	/* Username and session ID are mainly used for debugging/logging,
+	   but may also be useful for other purposes if they exist (they
+	   may be NULL). */
+	const char *username;
+	const char *session_id;
+
 	/* Dovecot instance's base_dir */
 	const char *base_dir;
 	/* Directory where temporary files can be created at any time
@@ -79,9 +131,51 @@ struct fs_settings {
 	/* When creating temporary files, use this prefix
 	   (to avoid conflicts with existing files). */
 	const char *temp_file_prefix;
+	/* If the backend needs to do DNS lookups, use this dns_client for
+	   them. */
+	struct dns_client *dns_client;
 
 	/* Enable debugging */
 	bool debug;
+	/* Enable timing statistics */
+	bool enable_timing;
+};
+
+struct fs_stats {
+	/* Number of fs_prefetch() calls. Counted only if fs_read*() hasn't
+	   already been called for the file (which would be pretty pointless
+	   to do). */
+	unsigned int prefetch_count;
+	/* Number of fs_read*() calls. Counted only if fs_prefetch() hasn't
+	   already been called for the file. */
+	unsigned int read_count;
+	/* Number of fs_lookup_metadata() calls. Counted only if neither
+	   fs_read*() nor fs_prefetch() has been called for the file. */
+	unsigned int lookup_metadata_count;
+	/* Number of fs_stat() calls. Counted only if none of the above
+	   has been called (because the stat result should be cached). */
+	unsigned int stat_count;
+
+	/* Number of fs_write*() calls. */
+	unsigned int write_count;
+	/* Number of fs_exists() calls, which actually went to the backend
+	   instead of being handled by fs_stat() call due to fs_exists() not
+	   being implemented. */
+	unsigned int exists_count;
+	/* Number of fs_delete() calls. */
+	unsigned int delete_count;
+	/* Number of fs_copy() calls. If backend doesn't implement copying
+	   operation but falls back to regular read+write instead, this count
+	   isn't increased but the read+write counters are. */
+	unsigned int copy_count;
+	/* Number of fs_rename() calls. */
+	unsigned int rename_count;
+	/* Number of fs_iter_init() calls. */
+	unsigned int iter_count;
+
+	/* Cumulative sum of usecs spent on calls - set only if
+	   fs_settings.enable_timing=TRUE */
+	struct timing *timings[FS_OP_COUNT];
 };
 
 struct fs_metadata {
@@ -95,8 +189,17 @@ typedef void fs_file_async_callback_t(void *context);
 int fs_init(const char *driver, const char *args,
 	    const struct fs_settings *set,
 	    struct fs **fs_r, const char **error_r);
+/* same as fs_unref() */
 void fs_deinit(struct fs **fs);
 
+void fs_ref(struct fs *fs);
+void fs_unref(struct fs **fs);
+
+/* Returns the parent filesystem (if this is a wrapper fs) or NULL if
+   there's no parent. */
+struct fs *fs_get_parent(struct fs *fs);
+/* Returns the filesystem's driver name. */
+const char *fs_get_driver(struct fs *fs);
 /* Returns the root fs's driver name (bypassing all wrapper fses) */
 const char *fs_get_root_driver(struct fs *fs);
 
@@ -115,6 +218,10 @@ void fs_set_metadata(struct fs_file *file, const char *key, const char *value);
 /* Return file's all metadata. */
 int fs_get_metadata(struct fs_file *file,
 		    const ARRAY_TYPE(fs_metadata) **metadata_r);
+/* Wrapper to fs_get_metadata() to lookup a specific key. Returns 1 if value_r
+   is set, 0 if key wasn't found, -1 if error. */
+int fs_lookup_metadata(struct fs_file *file, const char *key,
+		       const char **value_r);
 
 /* Returns the path given to fs_open(). If file was opened with
    FS_OPEN_MODE_CREATE_UNIQUE_128 and the write has already finished,
@@ -147,15 +254,19 @@ struct istream *fs_read_stream(struct fs_file *file, size_t max_buffer_size);
 int fs_write(struct fs_file *file, const void *data, size_t size);
 
 /* Write to file via output stream. The stream will be destroyed by
-   fs_write_stream_finish/abort. */
+   fs_write_stream_finish/abort. The returned ostream is already corked and
+   it doesn't need to be uncorked. */
 struct ostream *fs_write_stream(struct fs_file *file);
-/* Finish writing via stream. The file will be created/replaced/appended only
+/* Finish writing via stream, calling also o_stream_nfinish() on the stream and
+   handling any pending errors. The file will be created/replaced/appended only
    after this call, same as with fs_write(). Anything written to the stream
    won't be visible earlier. Returns 1 if ok, 0 if async write isn't finished
    yet (retry calling fs_write_stream_finish_async()), -1 if error */
 int fs_write_stream_finish(struct fs_file *file, struct ostream **output);
 int fs_write_stream_finish_async(struct fs_file *file);
-/* Abort writing via stream. Anything written to the stream is discarded. */
+/* Abort writing via stream. Anything written to the stream is discarded.
+   o_stream_ignore_last_errors() is called on the output stream so the caller
+   doesn't need to do it. */
 void fs_write_stream_abort(struct fs_file *file, struct ostream **output);
 
 /* Set a hash to the following write. The storage can then verify that the
@@ -216,5 +327,14 @@ void fs_iter_set_async_callback(struct fs_iter *iter,
 /* For asynchronous iterations: If fs_iter_next() returns NULL, use this
    function to determine if you should wait for more data or finish up. */
 bool fs_iter_have_more(struct fs_iter *iter);
+
+/* Return the filesystem's fs_stats. Note that each wrapper filesystem keeps
+   track of its own fs_stats calls. You can use fs_get_parent() to get to the
+   filesystem whose stats you want to see. */
+const struct fs_stats *fs_get_stats(struct fs *fs);
+
+/* Helper functions to count number of usecs for read/write operations. */
+uint64_t fs_stats_get_read_usecs(const struct fs_stats *stats);
+uint64_t fs_stats_get_write_usecs(const struct fs_stats *stats);
 
 #endif

@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "base64.h"
@@ -14,8 +14,8 @@
 #include "auth-request.h"
 #include "auth-worker-client.h"
 
-#include <stdlib.h>
 
+#define AUTH_WORKER_WARN_DISCONNECTED_LONG_CMD_SECS 30
 #define OUTBUF_THROTTLE_SIZE (1024*10)
 
 #define CLIENT_STATE_HANDSHAKE "handshaking"
@@ -32,6 +32,7 @@ struct auth_worker_client {
 	struct istream *input;
 	struct ostream *output;
 	struct timeout *to_idle;
+	time_t cmd_start;
 
 	unsigned int version_received:1;
 	unsigned int dbhash_received:1;
@@ -103,11 +104,24 @@ worker_auth_request_new(struct auth_worker_client *client, unsigned int id,
 }
 
 static void auth_worker_send_reply(struct auth_worker_client *client,
+				   struct auth_request *request,
 				   string_t *str)
 {
+	time_t cmd_duration = time(NULL) - client->cmd_start;
+	const char *p;
+
 	if (worker_restart_request)
 		o_stream_nsend_str(client->output, "RESTART\n");
 	o_stream_nsend(client->output, str_data(str), str_len(str));
+	if (o_stream_nfinish(client->output) < 0 && request != NULL &&
+	    cmd_duration > AUTH_WORKER_WARN_DISCONNECTED_LONG_CMD_SECS) {
+		p = strchr(str_c(str), '\t');
+		p = p == NULL ? "BUG" : t_strcut(p+1, '\t');
+
+		i_warning("Auth master disconnected us while handling "
+			  "request for %s for %ld secs (result=%s)",
+			  request->user, (long)cmd_duration, p);
+	}
 }
 
 static void
@@ -150,7 +164,7 @@ static void verify_plain_callback(enum passdb_result result,
 		reply_append_extra_fields(str, request);
 	}
 	str_append_c(str, '\n');
-	auth_worker_send_reply(client, str);
+	auth_worker_send_reply(client, request, str);
 
 	auth_request_unref(&request);
 	auth_worker_client_check_throttle(client);
@@ -226,12 +240,17 @@ lookup_credentials_callback(enum passdb_result result,
 	else {
 		str_append(str, "OK\t");
 		str_append_tabescaped(str, request->user);
-		str_printfa(str, "\t{%s.b64}", request->credentials_scheme);
-		base64_encode(credentials, size, str);
+		str_append_c(str, '\t');
+		if (request->credentials_scheme[0] != '\0') {
+			str_printfa(str, "{%s.b64}", request->credentials_scheme);
+			base64_encode(credentials, size, str);
+		} else {
+			i_assert(size == 0);
+		}
 		reply_append_extra_fields(str, request);
 	}
 	str_append_c(str, '\n');
-	auth_worker_send_reply(client, str);
+	auth_worker_send_reply(client, request, str);
 
 	auth_request_unref(&request);
 	auth_worker_client_check_throttle(client);
@@ -293,7 +312,7 @@ set_credentials_callback(bool success, struct auth_request *request)
 
 	str = t_str_new(64);
 	str_printfa(str, "%u\t%s\n", request->id, success ? "OK" : "FAIL");
-	auth_worker_send_reply(client, str);
+	auth_worker_send_reply(client, request, str);
 
 	auth_request_unref(&request);
 	auth_worker_client_check_throttle(client);
@@ -354,14 +373,16 @@ lookup_user_callback(enum userdb_result result,
 		break;
 	case USERDB_RESULT_OK:
 		str_append(str, "OK\t");
+		str_append_tabescaped(str, auth_request->user);
+		str_append_c(str, '\t');
 		auth_fields_append(auth_request->userdb_reply, str, 0, 0);
-		if (auth_request->userdb_lookup_failed)
+		if (auth_request->userdb_lookup_tempfailed)
 			str_append(str, "\ttempfail");
 		break;
 	}
 	str_append_c(str, '\n');
 
-	auth_worker_send_reply(client, str);
+	auth_worker_send_reply(client, auth_request, str);
 
 	auth_request_unref(&auth_request);
 	auth_worker_client_check_throttle(client);
@@ -409,6 +430,7 @@ auth_worker_handle_user(struct auth_worker_client *client,
 		return FALSE;
 	}
 
+	auth_request_init_userdb_reply(auth_request);
 	auth_request->userdb->userdb->iface->
 		lookup(auth_request, lookup_user_callback);
 	return TRUE;
@@ -448,7 +470,7 @@ static void list_iter_deinit(struct auth_worker_list_context *ctx)
 		str_printfa(str, "%u\tFAIL\n", ctx->auth_request->id);
 	else
 		str_printfa(str, "%u\tOK\n", ctx->auth_request->id);
-	auth_worker_send_reply(client, str);
+	auth_worker_send_reply(client, NULL, str);
 
 	client->io = io_add(client->fd, IO_READ, auth_worker_input, client);
 	auth_worker_client_set_idle_timeout(client);
@@ -582,6 +604,9 @@ auth_worker_handle_line(struct auth_worker_client *client, const char *line)
 		i_error("BUG: Invalid input: %s", line);
 		return FALSE;
 	}
+
+	io_loop_time_refresh();
+	client->cmd_start = ioloop_time;
 
 	auth_worker_refresh_proctitle(args[1]);
 	if (strcmp(args[1], "PASSV") == 0)
@@ -782,8 +807,9 @@ void auth_worker_client_send_error(void)
 void auth_worker_client_send_success(void)
 {
 	auth_worker_client_error = FALSE;
-	if (auth_worker_client != NULL &&
-	    auth_worker_client->error_sent) {
+	if (auth_worker_client == NULL)
+		return;
+	if (auth_worker_client->error_sent) {
 		o_stream_nsend_str(auth_worker_client->output, "SUCCESS\n");
 		auth_worker_client->error_sent = FALSE;
 	}

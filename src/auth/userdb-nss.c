@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 /* Currently supports only GLIBC-compatible NSS modules */
 
@@ -38,28 +38,28 @@ userdb_nss_lookup(struct auth_request *auth_request,
 	enum userdb_result result = USERDB_RESULT_INTERNAL_FAILURE;
 	int err;
 
-	auth_request_log_debug(auth_request, "nss", "lookup");
+	auth_request_log_debug(auth_request, AUTH_SUBSYS_DB, "lookup");
 
 	status = module->getpwnam_r(auth_request->user, &pw,
 				    module->buf, module->bufsize, &err);
 	switch (status) {
 	case NSS_STATUS_TRYAGAIN:
-		auth_request_log_error(auth_request, "nss",
+		auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 				       "returned tryagain (err=%d)", err);
 		break;
 	case NSS_STATUS_UNAVAIL:
-		auth_request_log_error(auth_request, "nss",
+		auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 				       "unavailable (err=%d)", err);
 		break;
 	case NSS_STATUS_NOTFOUND:
-		auth_request_log_unknown_user(auth_request, "nss");
+		auth_request_log_unknown_user(auth_request, AUTH_SUBSYS_DB);
 		result = USERDB_RESULT_USER_UNKNOWN;
 		break;
 	case NSS_STATUS_SUCCESS:
 		result = USERDB_RESULT_OK;
 		break;
 	default:
-		auth_request_log_info(auth_request, "nss",
+		auth_request_log_info(auth_request, AUTH_SUBSYS_DB,
 				      "returned %d (err=%d)", status, err);
 		break;
 	}
@@ -71,7 +71,6 @@ userdb_nss_lookup(struct auth_request *auth_request,
 
 	auth_request_set_field(auth_request, "user", pw.pw_name, NULL);
 
-	auth_request_init_userdb_reply(auth_request);
 	auth_request_set_userdb_field(auth_request, "system_groups_user",
 				      pw.pw_name);
 	auth_request_set_userdb_field(auth_request, "uid", dec2str(pw.pw_uid));
@@ -105,9 +104,13 @@ userdb_nss_preinit(pool_t pool, const char *args)
 {
 	struct nss_userdb_module *module;
 	const char *const *tmp;
+	long bufsize;
+
+	bufsize = sysconf(_SC_GETPW_R_SIZE_MAX);
+	i_assert(bufsize > 0);
 
 	module = p_new(pool, struct nss_userdb_module, 1);
-	module->bufsize = sysconf(_SC_GETPW_R_SIZE_MAX);
+	module->bufsize = bufsize;
 	module->buf = p_malloc(pool, module->bufsize);
 	module->module.blocking = TRUE;
 
@@ -124,7 +127,7 @@ userdb_nss_preinit(pool_t pool, const char *args)
 		i_fatal("userdb nss: Missing service");
 	userdb_nss_load_module(module, pool);
 
-	module->module.cache_key = USER_CACHE_KEY;
+	module->module.default_cache_key = USER_CACHE_KEY;
 	return &module->module;
 }
 

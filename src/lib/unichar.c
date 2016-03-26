@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -79,7 +79,7 @@ int uni_utf8_get_char_n(const void *_input, size_t max_len, unichar_t *chr_r)
 
 	if (len <= max_len) {
 		lowest_valid_chr = lowest_valid_chr_table[len];
-		ret = 1;
+		ret = len;
 	} else {
 		/* check first if the input is invalid before returning 0 */
 		lowest_valid_chr = 0;
@@ -109,11 +109,12 @@ int uni_utf8_to_ucs4(const char *input, ARRAY_TYPE(unichars) *output)
 	unichar_t chr;
 
 	while (*input != '\0') {
-		if (uni_utf8_get_char(input, &chr) <= 0) {
+		int len = uni_utf8_get_char(input, &chr);
+		if (len <= 0) {
 			/* invalid input */
 			return -1;
 		}
-                input += uni_utf8_char_bytes(*input);
+                input += len;
 
 		array_append(output, &chr, 1);
 	}
@@ -124,15 +125,11 @@ int uni_utf8_to_ucs4_n(const unsigned char *input, size_t size,
 		       ARRAY_TYPE(unichars) *output)
 {
 	unichar_t chr;
-	unsigned int len;
 
 	while (size > 0) {
-		if (uni_utf8_get_char_n(input, size, &chr) <= 0) {
-			/* invalid input */
-			return -1;
-		}
-		len = uni_utf8_char_bytes(*input);
-		i_assert(len <= size);
+		int len = uni_utf8_get_char_n(input, size, &chr);
+		if (len <= 0)
+			return -1; /* invalid input */
 		input += len; size -= len;
 
 		array_append(output, &chr, 1);
@@ -189,21 +186,31 @@ void uni_ucs4_to_utf8_c(unichar_t chr, buffer_t *output)
 
 unsigned int uni_utf8_strlen(const char *input)
 {
-	return uni_utf8_strlen_n(input, (size_t)-1);
+	return uni_utf8_strlen_n(input, strlen(input));
 }
 
-unsigned int uni_utf8_strlen_n(const void *_input, size_t size)
+unsigned int uni_utf8_strlen_n(const void *input, size_t size)
+{
+	size_t partial_pos;
+
+	return uni_utf8_partial_strlen_n(input, size, &partial_pos);
+}
+
+unsigned int uni_utf8_partial_strlen_n(const void *_input, size_t size,
+				       size_t *partial_pos_r)
 {
 	const unsigned char *input = _input;
-	unsigned int len = 0;
+	unsigned int count, len = 0;
 	size_t i;
 
-	for (i = 0; i < size && input[i] != '\0'; ) {
-		i += uni_utf8_char_bytes(input[i]);
-		if (i > size)
+	for (i = 0; i < size; ) {
+		count = uni_utf8_char_bytes(input[i]);
+		if (i + count > size)
 			break;
+		i += count;
 		len++;
 	}
+	*partial_pos_r = i;
 	return len;
 }
 
@@ -319,19 +326,18 @@ int uni_utf8_to_decomposed_titlecase(const void *_input, size_t size,
 				     buffer_t *output)
 {
 	const unsigned char *input = _input;
-	unsigned int bytes;
 	unichar_t chr;
 	int ret = 0;
 
 	while (size > 0) {
-		if (uni_utf8_get_char_n(input, size, &chr) <= 0) {
+		int bytes = uni_utf8_get_char_n(input, size, &chr);
+		if (bytes <= 0) {
 			/* invalid input. try the next byte. */
 			ret = -1;
 			input++; size--;
 			output_add_replacement_char(output);
 			continue;
 		}
-		bytes = uni_utf8_char_bytes(*input);
 		input += bytes;
 		size -= bytes;
 
@@ -349,10 +355,8 @@ static inline unsigned int
 is_valid_utf8_seq(const unsigned char *input, unsigned int size)
 {
 	unichar_t chr;
-
-	if (uni_utf8_get_char_n(input, size, &chr) <= 0)
-		return 0;
-	return uni_utf8_char_bytes(input[0]);
+	int len = uni_utf8_get_char_n(input, size, &chr);
+	return len <= 0 ? 0 : len;
 }
 
 static int uni_utf8_find_invalid_pos(const unsigned char *input, size_t size,

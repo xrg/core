@@ -1,10 +1,11 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 /* @UNSAFE: whole file */
 
 #include "lib.h"
 #include "printf-format-fix.h"
 #include "strfuncs.h"
+#include "array.h"
 
 #include <stdio.h>
 #include <limits.h>
@@ -41,6 +42,15 @@ char *p_strdup(pool_t pool, const char *str)
 	len = strlen(str) + 1;
 	mem = p_malloc(pool, len);
 	memcpy(mem, str, len);
+	return mem;
+}
+
+void *p_memdup(pool_t pool, const void *data, size_t size)
+{
+	void *mem;
+
+	mem = p_malloc(pool, size);
+	memcpy(mem, data, size);
 	return mem;
 }
 
@@ -106,6 +116,9 @@ char *t_noalloc_strdup_vprintf(const char *format, va_list args,
 	char *tmp;
 	unsigned int init_size;
 	int ret;
+#ifdef DEBUG
+	int old_errno = errno;
+#endif
 
 	VA_COPY(args2, args);
 
@@ -127,6 +140,11 @@ char *t_noalloc_strdup_vprintf(const char *format, va_list args,
 		ret = vsnprintf(tmp, *size_r, format, args2);
 		i_assert((unsigned int)ret == *size_r-1);
 	}
+#ifdef DEBUG
+	/* we rely on errno not changing. it shouldn't. */
+	i_assert(errno == old_errno);
+#endif
+	va_end(args2);
 	return tmp;
 }
 
@@ -281,6 +299,26 @@ const char *t_strcut(const char *str, char cutchar)
         return str;
 }
 
+const char *t_str_replace(const char *str, char from, char to)
+{
+	char *out;
+	unsigned int i, len;
+
+	if (strchr(str, from) == NULL)
+		return str;
+
+	len = strlen(str);
+	out = t_malloc(len + 1);
+	for (i = 0; i < len; i++) {
+		if (str[i] == from)
+			out[i] = to;
+		else
+			out[i] = str[i];
+	}
+	out[i] = '\0';
+	return out;
+}
+
 int i_strocpy(char *dest, const char *src, size_t dstsize)
 {
 	if (dstsize == 0)
@@ -327,6 +365,65 @@ const char *t_str_ucase(const char *str)
 	return str_ucase(t_strdup_noconst(str));
 }
 
+#if 0 /* FIXME: wait for v2.3 due to a collision with pigeonhole */
+const char *t_str_trim(const char *str, const char *chars)
+{
+	const char *p, *pend, *begin;
+
+	pend = str + strlen(str);
+	if (pend == str)
+		return "";
+
+	p = str;
+	while (p < pend && strchr(chars, *p) != NULL)
+		p++;
+	begin = p;
+
+	p = pend - 1;
+	while (p > begin && strchr(chars, *p) != NULL)
+		p--;
+
+	if (p <= begin)
+		return "";
+	return t_strdup_until(begin, p+1);
+}
+#endif
+
+const char *str_ltrim(const char *str, const char *chars)
+{
+	const char *p;
+
+	if (*str == '\0')
+		return "";
+
+	p = str;
+	while (*p != '\0' && strchr(chars, *p) != NULL)
+		p++;
+
+	return p;
+}
+
+const char *t_str_ltrim(const char *str, const char *chars)
+{
+	return t_strdup(str_ltrim(str, chars));
+}
+
+const char *t_str_rtrim(const char *str, const char *chars)
+{
+	const char *p, *pend;
+
+	pend = str + strlen(str);
+	if (pend == str)
+		return "";
+
+	p = pend - 1;
+	while (p > str && strchr(chars, *p) != NULL)
+		p--;
+	if (p <= str)
+		return "";
+	return t_strdup_until(str, p+1);
+}
+
 int null_strcmp(const char *s1, const char *s2)
 {
 	if (s1 == NULL)
@@ -359,9 +456,9 @@ int bsearch_strcmp(const char *key, const char *const *member)
 	return strcmp(key, *member);
 }
 
-int i_strcmp_p(const char *const *s1, const char *const *s2)
+int i_strcmp_p(const char *const *p1, const char *const *p2)
 {
-	return strcmp(*s1, *s2);
+	return strcmp(*p1, *p2);
 }
 
 int bsearch_strcasecmp(const char *key, const char *const *member)
@@ -369,9 +466,9 @@ int bsearch_strcasecmp(const char *key, const char *const *member)
 	return strcasecmp(key, *member);
 }
 
-int i_strcasecmp_p(const char *const *s1, const char *const *s2)
+int i_strcasecmp_p(const char *const *p1, const char *const *p2)
 {
-	return strcasecmp(*s1, *s2);
+	return strcasecmp(*p1, *p2);
 }
 
 static char **
@@ -515,17 +612,21 @@ unsigned int str_array_length(const char *const *arr)
 	return count;
 }
 
-const char *t_strarray_join(const char *const *arr, const char *separator)
+static char *
+p_strarray_join_n(pool_t pool, const char *const *arr, unsigned int arr_len,
+		  const char *separator)
 {
 	size_t alloc_len, sep_len, len, pos, needed_space;
+	unsigned int i;
 	char *str;
 
 	sep_len = strlen(separator);
         alloc_len = 64;
-        str = t_buffer_get(alloc_len);
+	str = t_buffer_get(alloc_len);
+	pos = 0;
 
-	for (pos = 0; *arr != NULL; arr++) {
-		len = strlen(*arr);
+	for (i = 0; i < arr_len; i++) {
+		len = strlen(arr[i]);
 		needed_space = pos + len + sep_len + 1;
 		if (needed_space > alloc_len) {
 			alloc_len = nearest_power(needed_space);
@@ -537,12 +638,20 @@ const char *t_strarray_join(const char *const *arr, const char *separator)
 			pos += sep_len;
 		}
 
-		memcpy(str + pos, *arr, len);
+		memcpy(str + pos, arr[i], len);
 		pos += len;
 	}
 	str[pos] = '\0';
+	if (!pool->datastack_pool)
+		return p_memdup(pool, str, pos + 1);
 	t_buffer_alloc(pos + 1);
 	return str;
+}
+
+const char *t_strarray_join(const char *const *arr, const char *separator)
+{
+	return p_strarray_join_n(unsafe_data_stack_pool, arr,
+				 str_array_length(arr), separator);
 }
 
 bool str_array_remove(const char **arr, const char *value)
@@ -617,4 +726,12 @@ const char *dec2str(uintmax_t number)
 
 	i_assert(pos >= 0);
 	return buffer + pos;
+}
+
+char *p_array_const_string_join(pool_t pool, const ARRAY_TYPE(const_string) *arr,
+				const char *separator)
+{
+	if (array_count(arr) == 0)
+		return "";
+	return p_strarray_join_n(pool, array_idx(arr, 0), array_count(arr), separator);
 }

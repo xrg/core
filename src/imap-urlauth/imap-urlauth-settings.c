@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -7,7 +7,6 @@
 #include "imap-urlauth-settings.h"
 
 #include <stddef.h>
-#include <stdlib.h>
 #include <unistd.h>
 
 /* <settings checks> */
@@ -18,7 +17,7 @@ static struct file_listener_settings *imap_urlauth_unix_listeners[] = {
 	&imap_urlauth_unix_listeners_array[0]
 };
 static buffer_t imap_urlauth_unix_listeners_buf = {
-	imap_urlauth_unix_listeners, sizeof(imap_urlauth_unix_listeners), { 0, }
+	imap_urlauth_unix_listeners, sizeof(imap_urlauth_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 

@@ -16,7 +16,9 @@ liblib_la_SOURCES = \
 	aqueue.c \
 	askpass.c \
 	backtrace-string.c \
+	base32.c \
 	base64.c \
+	bits.c \
 	bsearch-insert-pos.c \
 	buffer.c \
 	child-wait.c \
@@ -33,6 +35,7 @@ liblib_la_SOURCES = \
 	fdatasync-path.c \
 	fdpass.c \
 	file-cache.c \
+	file-create-locked.c \
 	file-copy.c \
 	file-dotlock.c \
 	file-lock.c \
@@ -57,10 +60,12 @@ liblib_la_SOURCES = \
 	istream.c \
 	istream-base64-decoder.c \
 	istream-base64-encoder.c \
+	istream-callback.c \
 	istream-chain.c \
 	istream-concat.c \
 	istream-crlf.c \
 	istream-data.c \
+	istream-failure-at.c \
 	istream-file.c \
 	istream-hash.c \
 	istream-jsonstr.c \
@@ -70,11 +75,12 @@ liblib_la_SOURCES = \
 	istream-seekable.c \
 	istream-sized.c \
 	istream-tee.c \
+	istream-timeout.c \
+	istream-unix.c \
 	ioloop.c \
 	ioloop-iolist.c \
 	ioloop-notify-none.c \
 	ioloop-notify-fd.c \
-	ioloop-notify-dn.c \
 	ioloop-notify-inotify.c \
 	ioloop-notify-kqueue.c \
 	ioloop-poll.c \
@@ -82,6 +88,7 @@ liblib_la_SOURCES = \
 	ioloop-epoll.c \
 	ioloop-kqueue.c \
 	json-parser.c \
+	json-tree.c \
 	lib.c \
 	lib-signals.c \
 	md4.c \
@@ -101,6 +108,8 @@ liblib_la_SOURCES = \
 	numpack.c \
 	ostream.c \
 	ostream-buffer.c \
+	ostream-escaped.c \
+	ostream-failure-at.c \
 	ostream-file.c \
 	ostream-hash.c \
 	ostream-rawlog.c \
@@ -109,6 +118,7 @@ liblib_la_SOURCES = \
 	process-title.c \
 	priorityq.c \
 	randgen.c \
+	rand.c \
 	read-full.c \
 	restrict-access.c \
 	restrict-process-size.c \
@@ -122,10 +132,12 @@ liblib_la_SOURCES = \
 	str.c \
 	str-find.c \
 	str-sanitize.c \
+	str-table.c \
 	strescape.c \
 	strfuncs.c \
 	strnum.c \
 	time-util.c \
+	timing.c \
 	unix-socket-create.c \
 	unlink-directory.c \
 	unlink-old-files.c \
@@ -144,7 +156,9 @@ headers = \
 	array-decl.h \
 	askpass.h \
 	backtrace-string.h \
+	base32.h \
 	base64.h \
+	bits.h \
 	bsearch-insert-pos.h \
 	buffer.h \
 	child-wait.h \
@@ -161,6 +175,7 @@ headers = \
 	fdatasync-path.h \
 	fdpass.h \
 	file-cache.h \
+	file-create-locked.h \
 	file-copy.h \
 	file-dotlock.h \
 	file-lock.h \
@@ -180,6 +195,7 @@ headers = \
 	hostpid.h \
 	imem.h \
 	ipwd.h \
+	iostream.h \
 	iostream-private.h \
 	iostream-rawlog.h \
 	iostream-rawlog-private.h \
@@ -187,9 +203,12 @@ headers = \
 	iso8601-date.h \
 	istream.h \
 	istream-base64.h \
+	istream-callback.h \
 	istream-chain.h \
 	istream-concat.h \
 	istream-crlf.h \
+	istream-failure-at.h \
+	istream-file-private.h \
 	istream-hash.h \
 	istream-jsonstr.h \
 	istream-private.h \
@@ -197,11 +216,14 @@ headers = \
 	istream-seekable.h \
 	istream-sized.h \
 	istream-tee.h \
+	istream-timeout.h \
+	istream-unix.h \
 	ioloop.h \
 	ioloop-iolist.h \
 	ioloop-private.h \
 	ioloop-notify-fd.h \
 	json-parser.h \
+	json-tree.h \
 	lib.h \
 	lib-signals.h \
 	llist.h \
@@ -218,6 +240,8 @@ headers = \
 	nfs-workarounds.h \
 	numpack.h \
 	ostream.h \
+	ostream-escaped.h \
+	ostream-failure-at.h \
 	ostream-hash.h \
 	ostream-private.h \
 	ostream-rawlog.h \
@@ -225,6 +249,7 @@ headers = \
 	printf-format-fix.h \
 	process-title.h \
 	priorityq.h \
+	rand.h \
 	randgen.h \
 	read-full.h \
 	restrict-access.h \
@@ -236,13 +261,16 @@ headers = \
 	seq-range-array.h \
 	sha1.h \
 	sha2.h \
+	sort.h \
 	str.h \
 	str-find.h \
 	str-sanitize.h \
+	str-table.h \
 	strescape.h \
 	strfuncs.h \
 	strnum.h \
 	time-util.h \
+	timing.h \
 	unix-socket-create.h \
 	unlink-directory.h \
 	unlink-old-files.h \
@@ -268,37 +296,58 @@ test_lib_SOURCES = \
 	test-lib.c \
 	test-array.c \
 	test-aqueue.c \
+	test-base32.c \
 	test-base64.c \
+	test-bits.c \
 	test-bsearch-insert-pos.c \
 	test-buffer.c \
 	test-crc32.c \
+	test-data-stack.c \
+	test-failures.c \
+	test-guid.c \
+	test-hash.c \
 	test-hash-format.c \
+	test-hash-method.c \
 	test-hex-binary.c \
+	test-ioloop.c \
 	test-iso8601-date.c \
+	test-iostream-temp.c \
+	test-istream.c \
 	test-istream-base64-decoder.c \
 	test-istream-base64-encoder.c \
+	test-istream-chain.c \
 	test-istream-concat.c \
 	test-istream-crlf.c \
+	test-istream-failure-at.c \
 	test-istream-seekable.c \
 	test-istream-tee.c \
+	test-istream-unix.c \
 	test-json-parser.c \
+	test-json-tree.c \
 	test-llist.c \
 	test-mempool-alloconly.c \
-	test-network.c \
+	test-net.c \
 	test-numpack.c \
+	test-ostream-escaped.c \
+	test-ostream-failure-at.c \
 	test-ostream-file.c \
 	test-primes.c \
+	test-printf-format-fix.c \
 	test-priorityq.c \
 	test-seq-range-array.c \
 	test-str.c \
 	test-strescape.c \
 	test-strfuncs.c \
+	test-strnum.c \
 	test-str-find.c \
 	test-str-sanitize.c \
+	test-str-table.c \
 	test-time-util.c \
+	test-timing.c \
 	test-unichar.c \
 	test-utc-mktime.c \
-	test-var-expand.c
+	test-var-expand.c \
+	test-wildcard-match.c
 
 test_headers = \
 	test-lib.h

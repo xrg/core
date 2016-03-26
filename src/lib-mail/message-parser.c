@@ -1,6 +1,7 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "buffer.h"
 #include "str.h"
 #include "istream.h"
 #include "rfc822-parser.h"
@@ -25,6 +26,7 @@ struct message_parser_ctx {
 	pool_t parser_pool, part_pool;
 	struct istream *input;
 	struct message_part *parts, *part;
+	const char *broken_reason;
 
 	enum message_header_parser_flags hdr_flags;
 	enum message_parser_flags flags;
@@ -37,12 +39,12 @@ struct message_parser_ctx {
 	unsigned int want_count;
 
 	struct message_header_parser_ctx *hdr_parser_ctx;
+	unsigned int prev_hdr_newline_size;
 
 	int (*parse_next_block)(struct message_parser_ctx *ctx,
 				struct message_block *block_r);
 
 	unsigned int part_seen_content_type:1;
-	unsigned int broken:1;
 	unsigned int eof:1;
 };
 
@@ -163,10 +165,14 @@ static int message_parser_read_more(struct message_parser_ctx *ctx,
 static struct message_part *
 message_part_append(pool_t pool, struct message_part *parent)
 {
-	struct message_part *part, **list;
+	struct message_part *p, *part, **list;
+
+	i_assert(parent != NULL);
 
 	part = p_new(pool, struct message_part, 1);
 	part->parent = parent;
+	for (p = parent; p != NULL; p = p->parent)
+		p->children_count++;
 
 	/* set child position */
 	part->physical_pos =
@@ -308,6 +314,7 @@ static int parse_part_finish(struct message_parser_ctx *ctx,
 		message_size_add(&part->parent->body_size, &part->body_size);
 		message_size_add(&part->parent->body_size, &part->header_size);
 	}
+	i_assert(part != NULL);
 	ctx->part = part;
 
 	if (boundary->epilogue_found) {
@@ -403,7 +410,7 @@ static int parse_next_body_to_boundary(struct message_parser_ctx *ctx,
 	} else if (boundary_start == 0) {
 		/* no linefeeds in this block. we can just skip it. */
 		ret = 0;
-		if (block_r->data[block_r->size-1] == '\r') {
+		if (block_r->data[block_r->size-1] == '\r' && !ctx->eof) {
 			/* this may be the beginning of the \r\n--boundary */
 			block_r->size--;
 		}
@@ -505,17 +512,47 @@ static int parse_next_header(struct message_parser_ctx *ctx,
 {
 	struct message_part *part = ctx->part;
 	struct message_header_line *hdr;
+	struct message_boundary *boundary;
+	bool full;
 	int ret;
 
-	if (ctx->skip > 0) {
-		i_stream_skip(ctx->input, ctx->skip);
-		ctx->skip = 0;
-	}
-
-	ret = message_parse_header_next(ctx->hdr_parser_ctx, &hdr);
-	if (ret == 0 || (ret < 0 && ctx->input->stream_errno != 0)) {
-		ctx->want_count = i_stream_get_data_size(ctx->input) + 1;
+	if ((ret = message_parser_read_more(ctx, block_r, &full)) == 0)
 		return ret;
+
+	/* before parsing the header see if we can find a --boundary from here.
+	   we're guaranteed to be at the beginning of the line here. */
+	if (ret > 0) {
+		ret = ctx->boundaries == NULL ? -1 :
+			boundary_line_find(ctx, block_r->data,
+					   block_r->size, full, &boundary);
+	}
+	if (ret < 0) {
+		/* no boundary */
+		ret = message_parse_header_next(ctx->hdr_parser_ctx, &hdr);
+		if (ret == 0 || (ret < 0 && ctx->input->stream_errno != 0)) {
+			ctx->want_count = i_stream_get_data_size(ctx->input) + 1;
+			return ret;
+		}
+	} else if (ret == 0) {
+		/* need more data */
+		return 0;
+	} else {
+		/* boundary found. stop parsing headers here. The previous
+		   [CR]LF belongs to the MIME boundary though. */
+		if (ctx->prev_hdr_newline_size > 0) {
+			i_assert(ctx->part->header_size.lines > 0);
+			/* remove the newline size from the MIME header */
+			ctx->part->header_size.lines--;
+			ctx->part->header_size.physical_size -=
+				ctx->prev_hdr_newline_size;
+			ctx->part->header_size.virtual_size -= 2;
+			/* add the newline size to the parent's body */
+			ctx->part->parent->body_size.lines++;
+			ctx->part->parent->body_size.physical_size +=
+				ctx->prev_hdr_newline_size;
+			ctx->part->parent->body_size.virtual_size += 2;
+		}
+		hdr = NULL;
 	}
 
 	if (hdr != NULL) {
@@ -538,6 +575,8 @@ static int parse_next_header(struct message_parser_ctx *ctx,
 
 		block_r->hdr = hdr;
 		block_r->size = 0;
+		ctx->prev_hdr_newline_size = hdr->no_newline ? 0 :
+			(hdr->crlf_newline ? 2 : 1);
 		return 1;
 	}
 
@@ -603,6 +642,7 @@ static int parse_next_header_init(struct message_parser_ctx *ctx,
 		message_parse_header_init(ctx->input, &ctx->part->header_size,
 					  ctx->hdr_flags);
 	ctx->part_seen_content_type = FALSE;
+	ctx->prev_hdr_newline_size = 0;
 
 	ctx->parse_next_block = parse_next_header;
 	return parse_next_header(ctx, block_r);
@@ -708,7 +748,7 @@ static int preparsed_parse_prologue_more(struct message_parser_ctx *ctx,
 
 		/* [\r]\n--boundary[\r]\n */ 
 		if (block_r->size < 5 || *cur != '\n') {
-			ctx->broken = TRUE;
+			ctx->broken_reason = "Prologue boundary end not at expected position";
 			return -1;
 		}
 		
@@ -721,7 +761,7 @@ static int preparsed_parse_prologue_more(struct message_parser_ctx *ctx,
 		}
 
 		if (cur[0] != '\n' || cur[1] != '-' || cur[2] != '-') {
-			ctx->broken = TRUE;
+			ctx->broken_reason = "Prologue boundary beginning not at expected position";
 			return -1;
 		}
 
@@ -782,7 +822,7 @@ static int preparsed_parse_epilogue_boundary(struct message_parser_ctx *ctx,
 	int ret;
 
 	if (end_offset - ctx->input->v_offset < 7) {
-		ctx->broken = TRUE;
+		ctx->broken_reason = "Epilogue position is wrong";
 		return -1;
 	}
 
@@ -802,7 +842,7 @@ static int preparsed_parse_epilogue_boundary(struct message_parser_ctx *ctx,
 	if (*cur == '\r') cur++;
 
 	if (cur[0] != '\n' || cur[1] != '-' || data[2] != '-') {
-		ctx->broken = TRUE;
+		ctx->broken_reason = "Epilogue boundary start not at expected position";
 		return -1;
 	}
 
@@ -810,7 +850,7 @@ static int preparsed_parse_epilogue_boundary(struct message_parser_ctx *ctx,
 	cur += 3;
 	if ((cur = memchr(cur, '\n', size - (cur-data))) == NULL) {
 		if (end_offset < ctx->input->v_offset + size) {
-			ctx->broken = TRUE;
+			ctx->broken_reason = "Epilogue boundary end not at expected position";
 			return -1;
 		} else if (ctx->input->v_offset + size < end_offset &&
 			   size < BOUNDARY_END_MAX_LEN &&
@@ -834,7 +874,7 @@ static int preparsed_parse_body_init(struct message_parser_ctx *ctx,
 
 	if (offset < ctx->input->v_offset) {
 		/* header was actually larger than the cached size suggested */
-		ctx->broken = TRUE;
+		ctx->broken_reason = "Header larger than its cached size";
 		return -1;
 	}
 	i_stream_skip(ctx->input, offset - ctx->input->v_offset);
@@ -861,7 +901,7 @@ static int preparsed_parse_epilogue_init(struct message_parser_ctx *ctx,
 	if (offset < ctx->input->v_offset) {
 		/* last child was actually larger than the cached size
 		   suggested */
-		ctx->broken = TRUE;
+		ctx->broken_reason = "Part larger than its cached size";
 		return -1;
 	}
 	i_stream_skip(ctx->input, offset - ctx->input->v_offset);
@@ -917,7 +957,7 @@ static int preparsed_parse_next_header(struct message_parser_ctx *ctx,
 	i_assert(ctx->skip == 0);
 	if (ctx->input->v_offset != ctx->part->physical_pos +
 	    ctx->part->header_size.physical_size) {
-		ctx->broken = TRUE;
+		ctx->broken_reason = "Cached header size mismatch";
 		return -1;
 	}
 	return 1;
@@ -979,6 +1019,8 @@ message_parser_init_from_parts(struct message_part *parts,
 {
 	struct message_parser_ctx *ctx;
 
+	i_assert(parts != NULL);
+
 	ctx = message_parser_init_int(input, hdr_flags, flags);
 	ctx->parts = ctx->part = parts;
 	ctx->parse_next_block = preparsed_parse_next_header_init;
@@ -988,16 +1030,27 @@ message_parser_init_from_parts(struct message_part *parts,
 int message_parser_deinit(struct message_parser_ctx **_ctx,
 			  struct message_part **parts_r)
 {
+	const char *error;
+
+	return message_parser_deinit_from_parts(_ctx, parts_r, &error);
+}
+
+int message_parser_deinit_from_parts(struct message_parser_ctx **_ctx,
+				     struct message_part **parts_r,
+				     const char **error_r)
+{
         struct message_parser_ctx *ctx = *_ctx;
-	int ret = ctx->broken ? -1 : 0;
+	int ret = ctx->broken_reason != NULL ? -1 : 0;
 
 	*_ctx = NULL;
 	*parts_r = ctx->parts;
+	*error_r = ctx->broken_reason;
 
 	if (ctx->hdr_parser_ctx != NULL)
 		message_parse_header_deinit(&ctx->hdr_parser_ctx);
 	i_stream_unref(&ctx->input);
 	pool_unref(&ctx->parser_pool);
+	i_assert(ret < 0 || *parts_r != NULL);
 	return ret;
 }
 
@@ -1006,6 +1059,8 @@ int message_parser_parse_next_block(struct message_parser_ctx *ctx,
 {
 	int ret;
 	bool eof = FALSE, full;
+
+	memset(block_r, 0, sizeof(*block_r));
 
 	while ((ret = ctx->parse_next_block(ctx, block_r)) == 0) {
 		ret = message_parser_read_more(ctx, block_r, &full);
@@ -1024,7 +1079,8 @@ int message_parser_parse_next_block(struct message_parser_ctx *ctx,
 	if (ret < 0 && ctx->part != NULL) {
 		/* Successful EOF or unexpected failure */
 		i_assert(ctx->input->eof || ctx->input->closed ||
-			 ctx->input->stream_errno != 0 || ctx->broken);
+			 ctx->input->stream_errno != 0 ||
+			 ctx->broken_reason != NULL);
 		while (ctx->part->parent != NULL) {
 			message_size_add(&ctx->part->parent->body_size,
 					 &ctx->part->body_size);
@@ -1034,6 +1090,10 @@ int message_parser_parse_next_block(struct message_parser_ctx *ctx,
 		}
 	}
 
+	if (block_r->size == 0) {
+		/* data isn't supposed to be read, so make sure it's NULL */
+		block_r->data = NULL;
+	}
 	return ret;
 }
 

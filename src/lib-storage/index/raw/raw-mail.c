@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -105,7 +105,7 @@ raw_mail_get_special(struct mail *_mail, enum mail_fetch_field field,
 		*value_r = mbox->envelope_sender != NULL ?
 			mbox->envelope_sender : "";
 		return 0;
-	case MAIL_FETCH_UIDL_FILE_NAME:
+	case MAIL_FETCH_STORAGE_ID:
 		*value_r = mbox->have_filename ?
 			mailbox_get_path(_mail->box) : "";
 		return 0;
@@ -149,5 +149,6 @@ struct mail_vfuncs raw_mail_vfuncs = {
 	NULL,
 	index_mail_expunge,
 	index_mail_set_cache_corrupted,
-	index_mail_opened
+	index_mail_opened,
+	index_mail_set_cache_corrupted_reason
 };

@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -8,7 +8,6 @@
 #include "sdbox-file.h"
 #include "sdbox-sync.h"
 
-#include <stdlib.h>
 #include <dirent.h>
 
 static void sdbox_sync_set_uidvalidity(struct index_rebuild_context *ctx)

@@ -39,6 +39,7 @@ cmds = \
 	cmd-expunge.c \
 	cmd-fetch.c \
 	cmd-genurlauth.c \
+	cmd-getmetadata.c \
 	cmd-id.c \
 	cmd-idle.c \
 	cmd-list.c \
@@ -51,6 +52,7 @@ cmds = \
 	cmd-resetkey.c \
 	cmd-search.c \
 	cmd-select.c \
+	cmd-setmetadata.c \
 	cmd-sort.c \
 	cmd-status.c \
 	cmd-store.c \
@@ -59,22 +61,26 @@ cmds = \
 	cmd-unselect.c \
 	cmd-unsubscribe.c \
 	cmd-urlfetch.c \
-	cmd-x-cancel.c
+	cmd-x-cancel.c \
+	cmd-x-state.c
 
 imap_SOURCES = \
 	$(cmds) \
 	imap-client.c \
+	imap-client-hibernate.c \
 	imap-commands.c \
 	imap-commands-util.c \
 	imap-expunge.c \
 	imap-fetch.c \
 	imap-fetch-body.c \
 	imap-list.c \
+	imap-master-client.c \
 	imap-notify.c \
 	imap-search.c \
 	imap-search-args.c \
 	imap-settings.c \
 	imap-status.c \
+	imap-state.c \
 	imap-sync.c \
 	mail-storage-callbacks.c \
 	main.c
@@ -87,11 +93,13 @@ headers = \
 	imap-expunge.h \
 	imap-fetch.h \
 	imap-list.h \
+	imap-master-client.h \
 	imap-notify.h \
 	imap-search.h \
 	imap-search-args.h \
 	imap-settings.h \
 	imap-status.h \
+	imap-state.h \
 	imap-sync.h
 
 pkginc_libdir=$(pkgincludedir)

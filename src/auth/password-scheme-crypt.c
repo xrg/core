@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "mycrypt.h"
@@ -14,13 +14,26 @@
 #define CRYPT_SHA2_ROUNDS_MAX 999999999
 #define CRYPT_SHA2_SALT_LEN 16
 
-static unsigned int encryption_rounds = 0;
+unsigned int password_scheme_encryption_rounds = 0;
 
 void password_set_encryption_rounds(unsigned int rounds)
 {
 	/* just take the new value. crypt_generate_*() will enforce their
 	   limits. */
-	encryption_rounds = rounds;
+	password_scheme_encryption_rounds = rounds;
+}
+
+static void
+crypt_generate_des(const char *plaintext, const char *user ATTR_UNUSED,
+		   const unsigned char **raw_password_r, size_t *size_r)
+{
+#define CRYPT_SALT_LEN 2
+	const char *password, *salt;
+
+	salt = password_generate_salt(CRYPT_SALT_LEN);
+	password = t_strdup(mycrypt(plaintext, salt));
+	*raw_password_r = (const unsigned char *)password;
+	*size_r = strlen(password);
 }
 
 static void
@@ -28,7 +41,7 @@ crypt_generate_blowfisch(const char *plaintext, const char *user ATTR_UNUSED,
 			 const unsigned char **raw_password_r, size_t *size_r)
 {
 	const char *password, *salt, *magic_salt;
-	unsigned int rounds = encryption_rounds;
+	unsigned int rounds = password_scheme_encryption_rounds;
 
 	if (rounds == 0)
 		rounds = CRYPT_BLF_ROUNDS_DEFAULT;
@@ -49,7 +62,7 @@ crypt_generate_sha256(const char *plaintext, const char *user ATTR_UNUSED,
 		      const unsigned char **raw_password_r, size_t *size_r)
 {
 	const char *password, *salt, *magic_salt;
-	unsigned int rounds = encryption_rounds;
+	unsigned int rounds = password_scheme_encryption_rounds;
 
 	if (rounds == 0)
 		rounds = CRYPT_SHA2_ROUNDS_DEFAULT;
@@ -73,7 +86,7 @@ crypt_generate_sha512(const char *plaintext, const char *user ATTR_UNUSED,
 		      const unsigned char **raw_password_r, size_t *size_r)
 {
 	const char *password, *salt, *magic_salt;
-	unsigned int rounds = encryption_rounds;
+	unsigned int rounds = password_scheme_encryption_rounds;
 
 	if (rounds == 0)
 		rounds = CRYPT_SHA2_ROUNDS_DEFAULT;
@@ -98,6 +111,7 @@ static const struct {
 	const char *salt;
 	const char *expected;
 } sample[] = {
+	{ "08/15!test~4711", "JB", "JBOZ0DgmtucwE" },
 	{ "08/15!test~4711", "$2a$04$0123456789abcdefABCDEF",
 	  "$2a$04$0123456789abcdefABCDE.N.drYX5yIAL1LkTaaZotW3yI0hQhZru" },
 	{ "08/15!test~4711", "$5$rounds=1000$0123456789abcdef",
@@ -110,6 +124,8 @@ static const struct {
 
 /* keep in sync with the sample struct above */
 static const struct password_scheme crypt_schemes[] = {
+	{ "CRYPT", PW_ENCODING_NONE, 0, crypt_verify,
+	  crypt_generate_des },
 	{ "BLF-CRYPT", PW_ENCODING_NONE, 0, crypt_verify,
 	  crypt_generate_blowfisch },
 	{ "SHA256-CRYPT", PW_ENCODING_NONE, 0, crypt_verify,

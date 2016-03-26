@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "common.h"
 #include "array.h"
@@ -28,7 +28,6 @@
 #include "service-process-notify.h"
 #include "service-process.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <syslog.h>
@@ -58,9 +57,9 @@ service_dup_fds(struct service *service)
 {
 	struct service_listener *const *listeners;
 	ARRAY_TYPE(dup2) dups;
-	string_t *listener_names;
+	string_t *listener_settings;
 	int fd = MASTER_LISTEN_FD_FIRST;
-	unsigned int i, count, socket_listener_count, ssl_socket_count;
+	unsigned int i, count, socket_listener_count;
 
 	/* stdin/stdout is already redirected to /dev/null. Other master fds
 	   should have been opened with fd_close_on_exec() so we don't have to
@@ -72,7 +71,6 @@ service_dup_fds(struct service *service)
         socket_listener_count = 0;
 	listeners = array_get(&service->listeners, &count);
 	t_array_init(&dups, count + 10);
-	listener_names = t_str_new(256);
 
 	switch (service->type) {
 	case SERVICE_TYPE_LOG:
@@ -94,32 +92,25 @@ service_dup_fds(struct service *service)
 		break;
 	}
 
-	/* anvil/log fds have no names */
-	for (i = MASTER_LISTEN_FD_FIRST; i < (unsigned int)fd; i++)
-		str_append_c(listener_names, '\t');
+	/* add listeners */
+	listener_settings = t_str_new(256);
+	for (i = 0; i < count; i++) {
+		if (listeners[i]->fd != -1) {
+			str_truncate(listener_settings, 0);
+			str_append_tabescaped(listener_settings, listeners[i]->name);
 
-	/* first add non-ssl listeners */
-	for (i = 0; i < count; i++) {
-		if (listeners[i]->fd != -1 &&
-		    (listeners[i]->type != SERVICE_LISTENER_INET ||
-		     !listeners[i]->set.inetset.set->ssl)) {
-			str_append_tabescaped(listener_names, listeners[i]->name);
-			str_append_c(listener_names, '\t');
+			if (listeners[i]->type == SERVICE_LISTENER_INET) {
+				if (listeners[i]->set.inetset.set->ssl)
+					str_append(listener_settings, "\tssl");
+				if (listeners[i]->set.inetset.set->haproxy)
+					str_append(listener_settings, "\thaproxy");
+			}
+			
 			dup2_append(&dups, listeners[i]->fd, fd++);
+
+			env_put(t_strdup_printf("SOCKET%d_SETTINGS=%s",
+				socket_listener_count, str_c(listener_settings)));
 			socket_listener_count++;
-		}
-	}
-	/* then ssl-listeners */
-	ssl_socket_count = 0;
-	for (i = 0; i < count; i++) {
-		if (listeners[i]->fd != -1 &&
-		    listeners[i]->type == SERVICE_LISTENER_INET &&
-		    listeners[i]->set.inetset.set->ssl) {
-			str_append_tabescaped(listener_names, listeners[i]->name);
-			str_append_c(listener_names, '\t');
-			dup2_append(&dups, listeners[i]->fd, fd++);
-			socket_listener_count++;
-			ssl_socket_count++;
 		}
 	}
 
@@ -174,8 +165,6 @@ service_dup_fds(struct service *service)
 
 	i_assert(fd == MASTER_LISTEN_FD_FIRST + (int)socket_listener_count);
 	env_put(t_strdup_printf("SOCKET_COUNT=%d", socket_listener_count));
-	env_put(t_strdup_printf("SSL_SOCKET_COUNT=%d", ssl_socket_count));
-	env_put(t_strdup_printf("SOCKET_NAMES=%s", str_c(listener_names)));
 }
 
 static void
@@ -227,6 +216,8 @@ static void service_process_setup_config_environment(struct service *service)
 		env_put(t_strconcat("DEBUG_LOG_PATH=", set->debug_log_path, NULL));
 		env_put(t_strconcat("LOG_TIMESTAMP=", set->log_timestamp, NULL));
 		env_put(t_strconcat("SYSLOG_FACILITY=", set->syslog_facility, NULL));
+		if (set->verbose_proctitle)
+			env_put("VERBOSE_PROCTITLE=1");
 		env_put("SSL=no");
 		break;
 	default:
@@ -237,7 +228,8 @@ static void service_process_setup_config_environment(struct service *service)
 }
 
 static void
-service_process_setup_environment(struct service *service, unsigned int uid)
+service_process_setup_environment(struct service *service, unsigned int uid,
+				  const char *hostdomain)
 {
 	master_service_env_clean();
 
@@ -257,7 +249,7 @@ service_process_setup_environment(struct service *service, unsigned int uid)
 	}
 	env_put(t_strdup_printf(MASTER_UID_ENV"=%u", uid));
 	env_put(t_strdup_printf(MY_HOSTNAME_ENV"=%s", my_hostname));
-	env_put(t_strdup_printf(MY_HOSTDOMAIN_ENV"=%s", my_hostdomain()));
+	env_put(t_strdup_printf(MY_HOSTDOMAIN_ENV"=%s", hostdomain));
 
 	if (!service->set->master_set->version_ignore)
 		env_put(MASTER_DOVECOT_VERSION_ENV"="PACKAGE_VERSION);
@@ -291,6 +283,7 @@ struct service_process *service_process_create(struct service *service)
 	static unsigned int uid_counter = 0;
 	struct service_process *process;
 	unsigned int uid = ++uid_counter;
+	const char *hostdomain;
 	pid_t pid;
 	bool process_forked;
 
@@ -305,6 +298,9 @@ struct service_process *service_process_create(struct service *service)
 		   new processes now */
 		return NULL;
 	}
+	/* look this up before fork()ing so that it gets cached for all the
+	   future lookups. */
+	hostdomain = my_hostdomain();
 
 	if (service->type == SERVICE_TYPE_ANVIL &&
 	    service_anvil_global->pid != 0) {
@@ -323,12 +319,13 @@ struct service_process *service_process_create(struct service *service)
 	}
 	if (pid == 0) {
 		/* child */
-		service_process_setup_environment(service, uid);
+		service_process_setup_environment(service, uid, hostdomain);
 		service_reopen_inet_listeners(service);
 		service_dup_fds(service);
 		drop_privileges(service);
 		process_exec(service->executable, NULL);
 	}
+	i_assert(hash_table_lookup(service_pids, POINTER_CAST(pid)) == NULL);
 
 	process = i_new(struct service_process, 1);
 	process->service = service;
@@ -405,6 +402,8 @@ void service_process_unref(struct service_process *process)
 static const char *
 get_exit_status_message(struct service *service, enum fatal_exit_status status)
 {
+	string_t *str;
+
 	switch (status) {
 	case FATAL_LOGOPEN:
 		return "Can't open log file";
@@ -413,12 +412,17 @@ get_exit_status_message(struct service *service, enum fatal_exit_status status)
 	case FATAL_LOGERROR:
 		return "Internal logging error";
 	case FATAL_OUTOFMEM:
-		if (service->vsz_limit == 0)
-			return "Out of memory";
-		return t_strdup_printf("Out of memory (service %s { vsz_limit=%u MB }, "
-				"you may need to increase it)",
-				service->set->name,
-				(unsigned int)(service->vsz_limit/1024/1024));
+		str = t_str_new(128);
+		str_append(str, "Out of memory");
+		if (service->vsz_limit != 0) {
+			str_printfa(str, " (service %s { vsz_limit=%u MB }, "
+				    "you may need to increase it)",
+				    service->set->name,
+				    (unsigned int)(service->vsz_limit/1024/1024));
+		}
+		if (getenv("CORE_OUTOFMEM") == NULL)
+			str_append(str, " - set CORE_OUTOFMEM=1 environment to get core dump");
+		return str_c(str);
 	case FATAL_EXEC:
 		return "exec() failed";
 

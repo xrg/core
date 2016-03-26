@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2008-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -11,7 +11,6 @@
 #include "acl-plugin.h"
 #include "acl-lookup-dict.h"
 
-#include <stdlib.h>
 
 #define DICT_SHARED_BOXES_PATH "shared-boxes/"
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -41,6 +41,9 @@ cmd_expunge_box(struct doveadm_mail_cmd_context *_ctx,
 	if (doveadm_mail_iter_deinit_keep_box(&iter, &box) < 0)
 		ret = -1;
 	else if (mailbox_sync(box, 0) < 0) {
+		i_error("Syncing mailbox '%s' failed: %s",
+			mailbox_get_vname(box),
+			mailbox_get_last_error(box, NULL));
 		doveadm_mail_failed_mailbox(_ctx, box);
 		ret = -1;
 	}
@@ -49,11 +52,17 @@ cmd_expunge_box(struct doveadm_mail_cmd_context *_ctx,
 		if (mailbox_delete_empty(box) < 0) {
 			error = mailbox_get_last_mail_error(box);
 			if (error != MAIL_ERROR_EXISTS) {
+				i_error("Deleting mailbox '%s' failed: %s",
+					mailbox_get_vname(box),
+					mailbox_get_last_error(box, NULL));
 				doveadm_mail_failed_mailbox(_ctx, box);
 				ret = -1;
 			}
 		} else {
 			if (mailbox_set_subscribed(box, FALSE) < 0) {
+				i_error("Unsubscribing mailbox '%s' failed: %s",
+					mailbox_get_vname(box),
+					mailbox_get_last_error(box, NULL));
 				doveadm_mail_failed_mailbox(_ctx, box);
 				ret = -1;
 			}
@@ -215,7 +224,6 @@ cmd_expunge_run(struct doveadm_mail_cmd_context *ctx, struct mail_user *user)
 
 void expunge_search_args_check(struct mail_search_args *args, const char *cmd)
 {
-	mail_search_args_simplify(args);
 	if (!expunge_search_args_is_mailbox_ok(args->args)) {
 		i_fatal_status(EX_USAGE,
 			"%s: To avoid accidents, search query "
@@ -224,8 +232,10 @@ void expunge_search_args_check(struct mail_search_args *args, const char *cmd)
 	if (!expunge_search_args_is_msgset_ok(args->args)) {
 		i_fatal_status(EX_USAGE,
 			"%s: To avoid accidents, each branch in search query "
-			"must contain something else besides MAILBOX", cmd);
+			"must contain something else besides MAILBOX "
+			"(e.g. just add \"all\" if you want everything)", cmd);
 	}
+	mail_search_args_simplify(args);
 }
 
 static void cmd_expunge_init(struct doveadm_mail_cmd_context *ctx,
@@ -264,6 +274,13 @@ static struct doveadm_mail_cmd_context *cmd_expunge_alloc(void)
 	return &ctx->ctx;
 }
 
-struct doveadm_mail_cmd cmd_expunge = {
-	cmd_expunge_alloc, "expunge", "[-d] <search query>"
+struct doveadm_cmd_ver2 doveadm_cmd_expunge_ver2 = {
+	.name = "expunge",
+	.mail_cmd = cmd_expunge_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "[-m] <search query>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('d', "delete-empty-mailbox", CMD_PARAM_BOOL, 0)
+DOVEADM_CMD_PARAM('\0', "query", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };

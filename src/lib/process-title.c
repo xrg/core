@@ -1,10 +1,9 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "env-util.h"
 #include "process-title.h"
 
-#include <stdlib.h> /* NetBSD, OpenBSD */
 #include <unistd.h> /* FreeBSD */
 
 static char *process_name = NULL;
@@ -148,7 +147,19 @@ void process_title_set(const char *title ATTR_UNUSED)
 void process_title_deinit(void)
 {
 #ifdef PROCTITLE_HACK
+	char ***environ_p = env_get_environ_p();
+
 	free(argv_memblock);
 	free(environ_memblock);
+
+	/* Environment is no longer usable. Make sure we won't crash in case
+	   some library's deinit function still calls getenv(). This code was
+	   mainly added because of GNUTLS where we don't really care about the
+	   getenv() call.
+
+	   Alternatively we could remove the free() calls above, but that would
+	   annoy memory leak checking tools. Also we could attempt to restore
+	   the environ_p to its original state, but that's a bit complicated. */
+	*environ_p = NULL;
 #endif
 }

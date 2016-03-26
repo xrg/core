@@ -59,10 +59,12 @@ struct imap_fetch_state {
 	struct istream *cur_input;
 	bool skip_cr;
 	int (*cont_handler)(struct imap_fetch_context *ctx);
+	uint64_t *cur_stats_sizep;
 
 	unsigned int fetching:1;
 	unsigned int seen_flags_changed:1;
 	unsigned int cur_first:1;
+	unsigned int cur_flushed:1;
 	unsigned int line_partial:1;
 	unsigned int line_finished:1;
 	unsigned int skipped_expunged_msgs:1;

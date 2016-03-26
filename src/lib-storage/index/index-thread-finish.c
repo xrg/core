@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,7 +7,6 @@
 #include "mail-storage-private.h"
 #include "index-thread-private.h"
 
-#include <stdlib.h>
 
 struct mail_thread_shadow_node {
 	uint32_t first_child_idx, next_sibling_idx;

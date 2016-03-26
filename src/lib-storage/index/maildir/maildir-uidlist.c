@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 /*
    Version 1 format has been used for most versions of Dovecot up to v1.0.x.
@@ -38,7 +38,6 @@
 #include "maildir-uidlist.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <sys/stat.h>
 
 /* NFS: How many times to retry reading dovecot-uidlist file if ESTALE
@@ -591,10 +590,18 @@ maildir_uidlist_read_v3_header(struct maildir_uidlist *uidlist,
 
 		switch (key) {
 		case MAILDIR_UIDLIST_HDR_EXT_UID_VALIDITY:
-			*uid_validity_r = strtoul(value, NULL, 10);
+			if (str_to_uint(value, uid_validity_r) < 0) {
+				maildir_uidlist_set_corrupted(uidlist,
+					"Invalid mailbox UID_VALIDITY: %s", value);
+				return -1;
+			}
 			break;
 		case MAILDIR_UIDLIST_HDR_EXT_NEXT_UID:
-			*next_uid_r = strtoul(value, NULL, 10);
+			if (str_to_uint(value, next_uid_r) < 0) {
+				maildir_uidlist_set_corrupted(uidlist,
+					"Invalid mailbox NEXT_UID: %s", value);
+				return -1;
+			}
 			break;
 		case MAILDIR_UIDLIST_HDR_EXT_GUID:
 			if (guid_128_from_string(value,
@@ -758,7 +765,7 @@ maildir_uidlist_update_read(struct maildir_uidlist *uidlist,
 							    st.st_size/8));
 	}
 
-	input = i_stream_create_fd(fd, 4096, FALSE);
+	input = i_stream_create_fd(fd, (size_t)-1, FALSE);
 	i_stream_seek(input, last_read_offset);
 
 	orig_uid_validity = uidlist->uid_validity;
@@ -809,7 +816,7 @@ maildir_uidlist_update_read(struct maildir_uidlist *uidlist,
 
         if (ret == 0) {
                 /* file is broken */
-                (void)unlink(uidlist->path);
+                i_unlink(uidlist->path);
         } else if (ret > 0) {
                 /* success */
 		if (readonly)
@@ -1445,12 +1452,9 @@ static int maildir_uidlist_recreate(struct maildir_uidlist *uidlist)
 		}
 	}
 
-	if (ret < 0) {
-		if (unlink(temp_path) < 0) {
-			mail_storage_set_critical(box->storage,
-				"unlink(%s) failed: %m", temp_path);
-		}
-	} else if (fstat(fd, &st) < 0) {
+	if (ret < 0)
+		i_unlink(temp_path);
+	else if (fstat(fd, &st) < 0) {
 		mail_storage_set_critical(box->storage,
 			"fstat(%s) failed: %m", temp_path);
 		ret = -1;
@@ -1976,6 +1980,7 @@ static void maildir_uidlist_swap(struct maildir_uidlist_sync_ctx *ctx)
 	array_free(&uidlist->records);
 	uidlist->records = ctx->records;
 	ctx->records.arr.buffer = NULL;
+	i_assert(array_is_created(&uidlist->records));
 
 	hash_table_destroy(&uidlist->files);
 	uidlist->files = ctx->files;

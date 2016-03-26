@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -361,8 +361,8 @@ static int maildir_mailbox_open(struct mailbox *box)
 	}
 	root_dir = mailbox_list_get_root_forced(box->list,
 						MAILBOX_LIST_PATH_TYPE_MAILBOX);
-	if (strcmp(box_path, root_dir) == 0) {
-		/* root directory. either INBOX or some other namespace root */
+	if (strcmp(box_path, root_dir) == 0 && !box->inbox_any) {
+		/* root directory for some namespace. */
 		errno = ENOENT;
 	} else if (stat(box_path, &st) == 0) {
 		/* yes, we'll need to create the missing dirs */
@@ -579,11 +579,11 @@ static void maildir_notify_changes(struct mailbox *box)
 	const char *box_path = mailbox_get_path(box);
 
 	if (box->notify_callback == NULL)
-		index_mailbox_check_remove_all(&mbox->box);
+		mailbox_watch_remove_all(&mbox->box);
 	else {
-		index_mailbox_check_add(&mbox->box,
+		mailbox_watch_add(&mbox->box,
 			t_strconcat(box_path, "/new", NULL));
-		index_mailbox_check_add(&mbox->box,
+		mailbox_watch_add(&mbox->box,
 			t_strconcat(box_path, "/cur", NULL));
 	}
 }

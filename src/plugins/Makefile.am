@@ -17,12 +17,16 @@ SUBDIRS = \
 	expire \
 	fts \
 	fts-squat \
+	last-login \
 	lazy-expunge \
 	listescape \
 	notify \
+	push-notification \
+	mail-filter \
 	mail-log \
 	mailbox-alias \
 	quota \
+	quota-clone \
 	imap-quota \
 	pop3-migration \
 	replication \
@@ -33,4 +37,5 @@ SUBDIRS = \
 	virtual \
 	$(ZLIB) \
 	$(FTS_LUCENE) \
-	$(FTS_SOLR)
+	$(FTS_SOLR) \
+	fs-compress

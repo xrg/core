@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "login-common.h"
 #include "hostpid.h"
@@ -21,10 +21,14 @@ static bool login_settings_check(void *_set, pool_t pool, const char **error_r);
 
 static const struct setting_define login_setting_defines[] = {
 	DEF(SET_STR, login_trusted_networks),
+	DEF(SET_STR, login_source_ips),
 	DEF(SET_STR_VARS, login_greeting),
 	DEF(SET_STR, login_log_format_elements),
 	DEF(SET_STR, login_log_format),
 	DEF(SET_STR, login_access_sockets),
+	DEF(SET_STR, login_plugin_dir),
+	DEF(SET_STR, login_plugins),
+	DEF(SET_TIME, login_proxy_max_disconnect_delay),
 	DEF(SET_STR, director_username_hash),
 
 	DEF(SET_STR, ssl_client_cert),
@@ -45,10 +49,14 @@ static const struct setting_define login_setting_defines[] = {
 
 static const struct login_settings login_default_settings = {
 	.login_trusted_networks = "",
+	.login_source_ips = "",
 	.login_greeting = PACKAGE_NAME" ready.",
 	.login_log_format_elements = "user=<%u> method=%m rip=%r lip=%l mpid=%e %c session=<%{session}>",
 	.login_log_format = "%$: %s",
 	.login_access_sockets = "",
+	.login_plugin_dir = MODULEDIR"/login",
+	.login_plugins = "",
+	.login_proxy_max_disconnect_delay = 0,
 	.director_username_hash = "%u",
 
 	.ssl_client_cert = "",

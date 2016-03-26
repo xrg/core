@@ -3,6 +3,11 @@
 
 #include "imapc-client.h"
 
+/* [THROTTLED] handling behavior */
+#define IMAPC_THROTTLE_DEFAULT_INIT_MSECS 50
+#define IMAPC_THROTTLE_DEFAULT_MAX_MSECS (16*1000)
+#define IMAPC_THROTTLE_DEFAULT_SHRINK_MIN_MSECS 500
+
 struct imapc_client;
 struct imapc_connection;
 
@@ -47,5 +52,6 @@ struct imapc_client_mailbox *
 imapc_connection_get_mailbox(struct imapc_connection *conn);
 
 void imapc_connection_idle(struct imapc_connection *conn);
+void imapc_connection_set_reconnected(struct imapc_connection *conn);
 
 #endif

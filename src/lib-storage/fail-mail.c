@@ -1,11 +1,9 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "mail-storage-private.h"
 #include "fail-mail-storage.h"
-
-extern struct mail_vfuncs fail_mail_vfuncs;
 
 struct mail *
 fail_mailbox_mail_alloc(struct mailbox_transaction_context *t,
@@ -196,7 +194,7 @@ fail_mail_get_special(struct mail *mail ATTR_UNUSED,
 	return -1;
 }
 
-static struct mail *fail_mail_get_real_mail(struct mail *mail)
+static struct mail * fail_mail_get_real_mail(struct mail *mail)
 {
 	return mail;
 }
@@ -227,6 +225,13 @@ static void fail_mail_expunge(struct mail *mail ATTR_UNUSED)
 static void
 fail_mail_set_cache_corrupted(struct mail *mail ATTR_UNUSED,
 			      enum mail_fetch_field field ATTR_UNUSED)
+{
+}
+
+static void
+fail_mail_set_cache_corrupted_reason(struct mail *mail ATTR_UNUSED,
+				     enum mail_fetch_field field ATTR_UNUSED,
+				     const char *reason ATTR_UNUSED)
 {
 }
 
@@ -265,5 +270,6 @@ struct mail_vfuncs fail_mail_vfuncs = {
 	NULL,
 	fail_mail_expunge,
 	fail_mail_set_cache_corrupted,
-	NULL
+	NULL,
+	fail_mail_set_cache_corrupted_reason
 };

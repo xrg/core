@@ -5,8 +5,7 @@
 
 struct dict_vfuncs {
 	int (*init)(struct dict *dict_driver, const char *uri,
-		    enum dict_data_type value_type,
-		    const char *username, const char *base_dir,
+		    const struct dict_settings *set,
 		    struct dict **dict_r, const char **error_r);
 	void (*deinit)(struct dict *dict);
 	int (*wait)(struct dict *dict);
@@ -36,6 +35,9 @@ struct dict_vfuncs {
 		       const char *key, const char *value);
 	void (*atomic_inc)(struct dict_transaction_context *ctx,
 			   const char *key, long long diff);
+
+	void (*lookup_async)(struct dict *dict, const char *key,
+			     dict_lookup_callback_t *callback, void *context);
 };
 
 struct dict {
@@ -46,6 +48,11 @@ struct dict {
 
 struct dict_iterate_context {
 	struct dict *dict;
+
+	dict_iterate_callback_t *async_callback;
+	void *async_context;
+
+	unsigned int has_more:1;
 };
 
 struct dict_transaction_context {
@@ -56,6 +63,7 @@ struct dict_transaction_context {
 
 extern struct dict dict_driver_client;
 extern struct dict dict_driver_file;
+extern struct dict dict_driver_fs;
 extern struct dict dict_driver_memcached;
 extern struct dict dict_driver_memcached_ascii;
 extern struct dict dict_driver_redis;

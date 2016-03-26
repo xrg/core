@@ -22,6 +22,7 @@
 
 struct stat;
 struct dirent;
+struct fs;
 struct imap_match_glob;
 struct mailbox_tree_context;
 struct mailbox_list_notify;
@@ -132,6 +133,8 @@ struct mailbox_list {
 	ARRAY(union mailbox_list_module_context *) module_contexts;
 
 	unsigned int index_root_dir_created:1;
+	unsigned int guid_cache_updated:1;
+	unsigned int guid_cache_invalidated:1;
 };
 
 union mailbox_list_iterate_module_context {
@@ -172,6 +175,18 @@ void mailbox_lists_deinit(void);
 int mailbox_list_settings_parse(struct mail_user *user, const char *data,
 				struct mailbox_list_settings *set_r,
 				const char **error_r);
+const char *
+mailbox_list_escape_name(struct mailbox_list *list, const char *vname);
+const char *
+mailbox_list_escape_name_params(const char *vname, const char *ns_prefix,
+				char ns_sep, char list_sep, char escape_char,
+				const char *maildir_name);
+const char *
+mailbox_list_unescape_name(struct mailbox_list *list, const char *src);
+const char *
+mailbox_list_unescape_name_params(const char *src, const char *ns_prefix,
+				  char ns_sep, char list_sep, char escape_char);
+
 const char *mailbox_list_default_get_storage_name(struct mailbox_list *list,
 						  const char *vname);
 const char *mailbox_list_default_get_vname(struct mailbox_list *list,

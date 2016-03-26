@@ -1,9 +1,8 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "passdb.h"
 #include "str.h"
-#include "var-expand.h"
 #include "imap-resp-code.h"
 #include "imapc-client.h"
 
@@ -53,17 +52,18 @@ passdb_imap_login_callback(const struct imapc_command_reply *reply,
 		break;
 	case IMAPC_COMMAND_STATE_NO:
 		result = passdb_imap_get_failure_result(reply);
-		auth_request_log_info(request->auth_request, "imap",
+		auth_request_log_info(request->auth_request, AUTH_SUBSYS_DB,
 				      "%s", reply->text_full);
 		break;
 	case IMAPC_COMMAND_STATE_BAD:
 	case IMAPC_COMMAND_STATE_DISCONNECTED:
-		auth_request_log_error(request->auth_request, "imap",
+		auth_request_log_error(request->auth_request, AUTH_SUBSYS_DB,
 				       "%s", reply->text_full);
 		break;
 	}
 	request->verify_callback(result, request->auth_request);
 	imapc_client_deinit(&client);
+	auth_request_unref(&request->auth_request);
 }
 
 static void
@@ -76,7 +76,6 @@ passdb_imap_verify_plain(struct auth_request *auth_request,
 		(struct imap_passdb_module *)_module;
 	struct imap_auth_request *request;
 	struct imapc_client_settings set;
-	const struct var_expand_table *table;
 	string_t *str;
 
 	set = module->set;
@@ -89,22 +88,22 @@ passdb_imap_verify_plain(struct auth_request *auth_request,
 
 	if (module->set_have_vars) {
 		str = t_str_new(128);
-		table = auth_request_get_var_expand_table(auth_request, NULL);
-		var_expand(str, set.username, table);
+		auth_request_var_expand(str, set.username, auth_request, NULL);
 		set.username = t_strdup(str_c(str));
 
 		str_truncate(str, 0);
-		var_expand(str, set.host, table);
+		auth_request_var_expand(str, set.host, auth_request, NULL);
 		set.host = t_strdup(str_c(str));
 	}
-	auth_request_log_debug(auth_request, "imap", "lookup host=%s port=%d",
-			       set.host, set.port);
+	auth_request_log_debug(auth_request, AUTH_SUBSYS_DB,
+			       "lookup host=%s port=%d", set.host, set.port);
 
 	request = p_new(auth_request->pool, struct imap_auth_request, 1);
 	request->client = imapc_client_init(&set);
 	request->auth_request = auth_request;
 	request->verify_callback = callback;
 
+	auth_request_ref(auth_request);
 	imapc_client_login(request->client, passdb_imap_login_callback,
 			   request);
 }
@@ -134,8 +133,7 @@ passdb_imap_preinit(pool_t pool, const char *args)
 		if (strcmp(key, "host") == 0)
 			module->set.host = value;
 		else if (strcmp(key, "port") == 0) {
-			if (str_to_uint(value, &module->set.port) < 0 ||
-			    module->set.port == 0 || module->set.port > 65535)
+			if (net_str2port(value, &module->set.port) < 0)
 				i_fatal("passdb imap: Invalid port: %s", value);
 			port_set = TRUE;
 		} else if (strcmp(key, "username") == 0)

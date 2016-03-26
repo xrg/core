@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "str.h"
@@ -8,7 +8,6 @@
 #include "passdb.h"
 #include "passdb-blocking.h"
 
-#include <stdlib.h>
 
 static void
 auth_worker_reply_parse_args(struct auth_request *request,
@@ -38,24 +37,29 @@ auth_worker_reply_parse(struct auth_request *request, const char *reply)
 	}
 
 	if (strcmp(*args, "FAIL") == 0 && args[1] != NULL) {
+		int result;
 		/* FAIL \t result [\t user \t password [\t extra]] */
-		ret = atoi(args[1]);
-		if (ret == PASSDB_RESULT_OK) {
+		if (str_to_int(args[1], &result) < 0) {
 			/* shouldn't happen */
-		} else if (args[2] == NULL) {
-			/* internal failure most likely */
-			return ret;
-		} else if (args[3] != NULL) {
-			if (*args[2] != '\0') {
-				auth_request_set_field(request, "user",
-						       args[2], NULL);
+		} else {
+			ret = (enum passdb_result)result;
+			if (ret == PASSDB_RESULT_OK) {
+				/* shouldn't happen */
+			} else if (args[2] == NULL) {
+				/* internal failure most likely */
+				return ret;
+			} else if (args[3] != NULL) {
+				if (*args[2] != '\0') {
+					auth_request_set_field(request, "user",
+							       args[2], NULL);
+				}
+				auth_worker_reply_parse_args(request, args + 3);
+				return ret;
 			}
-			auth_worker_reply_parse_args(request, args + 3);
-			return ret;
 		}
 	}
 
-	auth_request_log_error(request, "blocking",
+	auth_request_log_error(request, AUTH_SUBSYS_DB,
 		"Received invalid reply from worker: %s", reply);
 	return PASSDB_RESULT_INTERNAL_FAILURE;
 }
@@ -83,7 +87,7 @@ void passdb_blocking_verify_plain(struct auth_request *request)
 	auth_request_export(request, str);
 
 	auth_request_ref(request);
-	auth_worker_call(request->pool, str_c(str),
+	auth_worker_call(request->pool, request->user, str_c(str),
 			 verify_plain_callback, request);
 }
 
@@ -98,7 +102,7 @@ static bool lookup_credentials_callback(const char *reply, void *context)
 		password = request->passdb_password;
 		scheme = password_get_scheme(&password);
 		if (scheme == NULL) {
-			auth_request_log_error(request, "blocking",
+			auth_request_log_error(request, AUTH_SUBSYS_DB,
 				"Received reply from worker without "
 				"password scheme");
 			result = PASSDB_RESULT_INTERNAL_FAILURE;
@@ -123,7 +127,7 @@ void passdb_blocking_lookup_credentials(struct auth_request *request)
 	auth_request_export(request, str);
 
 	auth_request_ref(request);
-	auth_worker_call(request->pool, str_c(str),
+	auth_worker_call(request->pool, request->user, str_c(str),
 			 lookup_credentials_callback, request);
 }
 
@@ -151,6 +155,6 @@ void passdb_blocking_set_credentials(struct auth_request *request,
 	auth_request_export(request, str);
 
 	auth_request_ref(request);
-	auth_worker_call(request->pool, str_c(str),
+	auth_worker_call(request->pool, request->user, str_c(str),
 			 set_credentials_callback, request);
 }

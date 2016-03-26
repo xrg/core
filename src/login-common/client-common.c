@@ -1,6 +1,7 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "login-common.h"
+#include "array.h"
 #include "hostpid.h"
 #include "llist.h"
 #include "istream.h"
@@ -23,10 +24,25 @@
 #include "ssl-proxy.h"
 #include "client-common.h"
 
-#include <stdlib.h>
 
-struct client *clients = NULL, *last_client = NULL;
+struct client *clients = NULL;
+static struct client *last_client = NULL;
 static unsigned int clients_count = 0;
+
+static void empty_login_client_allocated_hook(struct client *client ATTR_UNUSED)
+{
+}
+static login_client_allocated_func_t *hook_client_allocated =
+	empty_login_client_allocated_hook;
+
+login_client_allocated_func_t *
+login_client_allocated_hook_set(login_client_allocated_func_t *new_hook)
+{
+	login_client_allocated_func_t *old_hook = hook_client_allocated;
+
+	hook_client_allocated = new_hook;
+	return old_hook;
+}
 
 static void client_idle_disconnect_timeout(struct client *client)
 {
@@ -102,10 +118,10 @@ static bool client_is_trusted(struct client *client)
 
 struct client *
 client_create(int fd, bool ssl, pool_t pool,
+	      const struct master_service_connection *conn,
 	      const struct login_settings *set,
 	      const struct master_service_ssl_settings *ssl_set,
-	      void **other_sets,
-	      const struct ip_addr *local_ip, const struct ip_addr *remote_ip)
+	      void **other_sets)
 {
 	struct client *client;
 
@@ -124,13 +140,24 @@ client_create(int fd, bool ssl, pool_t pool,
 	client->pool = pool;
 	client->set = set;
 	client->ssl_set = ssl_set;
-	client->real_local_ip = client->local_ip = *local_ip;
-	client->real_remote_ip = client->ip = *remote_ip;
+	p_array_init(&client->module_contexts, client->pool, 5);
+
 	client->fd = fd;
 	client->tls = ssl;
+
+	client->local_ip = conn->local_ip;
+	client->local_port = conn->local_port;
+	client->ip = conn->remote_ip;
+	client->remote_port = conn->remote_port;
+	client->real_local_ip = conn->real_local_ip;
+	client->real_local_port = conn->real_local_port;
+	client->real_remote_ip = conn->real_remote_ip;
+	client->real_remote_port = conn->real_remote_port;
+	client->listener_name = p_strdup(client->pool, conn->name);
+
 	client->trusted = client_is_trusted(client);
 	client->secured = ssl || client->trusted ||
-		net_ip_compare(remote_ip, local_ip);
+		net_ip_compare(&conn->real_remote_ip, &conn->real_local_ip);
 	client->proxy_ttl = LOGIN_PROXY_TTL;
 
 	if (last_client == NULL)
@@ -143,6 +170,7 @@ client_create(int fd, bool ssl, pool_t pool,
 			    client_idle_disconnect_timeout, client);
 	client_open_streams(client);
 
+	hook_client_allocated(client);
 	client->v.create(client, other_sets);
 
 	if (auth_client_is_connected(auth_client))
@@ -171,6 +199,8 @@ void client_destroy(struct client *client, const char *reason)
 		last_client = client->prev;
 	DLLIST_REMOVE(&clients, client);
 
+	if (client->output != NULL)
+		o_stream_uncork(client->output);
 	if (!client->login_success && client->ssl_proxy != NULL)
 		ssl_proxy_destroy(client->ssl_proxy);
 	if (client->input != NULL)
@@ -275,6 +305,7 @@ bool client_unref(struct client **_client)
 	i_free(client->proxy_master_user);
 	i_free(client->virtual_user);
 	i_free(client->virtual_user_orig);
+	i_free(client->virtual_auth_user);
 	i_free(client->auth_mech_name);
 	i_free(client->master_data_prefix);
 	pool_unref(&client->pool);
@@ -440,7 +471,7 @@ const char *client_get_session_id(struct client *client)
 		buffer_append_c(buf, (timestamp >> i) & 0xff);
 
 	buffer_append_c(buf, client->remote_port & 0xff);
-	buffer_append_c(buf, (client->remote_port >> 16) & 0xff);
+	buffer_append_c(buf, (client->remote_port >> 8) & 0xff);
 #ifdef HAVE_IPV6
 	if (IPADDR_IS_V6(&client->ip))
 		buffer_append(buf, &client->ip.u.ip6, sizeof(client->ip.u.ip6));
@@ -476,28 +507,38 @@ static struct var_expand_table login_var_expand_empty_tab[] = {
 	{ '\0', NULL, "orig_user" },
 	{ '\0', NULL, "orig_username" },
 	{ '\0', NULL, "orig_domain" },
+	{ '\0', NULL, "auth_user" },
+	{ '\0', NULL, "auth_username" },
+	{ '\0', NULL, "auth_domain" },
+	{ '\0', NULL, "listener" },
 	{ '\0', NULL, NULL }
 };
+
+static void
+get_var_expand_users(struct var_expand_table *tab, const char *user)
+{
+	unsigned int i;
+
+	tab[0].value = user;
+	tab[1].value = t_strcut(user, '@');
+	tab[2].value = strchr(user, '@');
+	if (tab[2].value != NULL) tab[2].value++;
+
+	for (i = 0; i < 3; i++)
+		tab[i].value = str_sanitize(tab[i].value, 80);
+}
 
 static const struct var_expand_table *
 get_var_expand_table(struct client *client)
 {
 	struct var_expand_table *tab;
-	unsigned int i;
 
 	tab = t_malloc(sizeof(login_var_expand_empty_tab));
 	memcpy(tab, login_var_expand_empty_tab,
 	       sizeof(login_var_expand_empty_tab));
 
-	if (client->virtual_user != NULL) {
-		tab[0].value = client->virtual_user;
-		tab[1].value = t_strcut(client->virtual_user, '@');
-		tab[2].value = strchr(client->virtual_user, '@');
-		if (tab[2].value != NULL) tab[2].value++;
-
-		for (i = 0; i < 3; i++)
-			tab[i].value = str_sanitize(tab[i].value, 80);
-	}
+	if (client->virtual_user != NULL)
+		get_var_expand_users(tab, client->virtual_user);
 	tab[3].value = login_binary->protocol;
 	tab[4].value = getenv("HOME");
 	tab[5].value = net_ip2addr(&client->local_ip);
@@ -529,19 +570,21 @@ get_var_expand_table(struct client *client)
 	tab[16].value = net_ip2addr(&client->real_remote_ip);
 	tab[17].value = dec2str(client->real_local_port);
 	tab[18].value = dec2str(client->real_remote_port);
-	if (client->virtual_user_orig == NULL) {
+	if (client->virtual_user_orig != NULL)
+		get_var_expand_users(tab+19, client->virtual_user_orig);
+	else {
 		tab[19].value = tab[0].value;
 		tab[20].value = tab[1].value;
 		tab[21].value = tab[2].value;
-	} else {
-		tab[19].value = client->virtual_user_orig;
-		tab[20].value = t_strcut(client->virtual_user_orig, '@');
-		tab[21].value = strchr(client->virtual_user_orig, '@');
-		if (tab[21].value != NULL) tab[21].value++;
-
-		for (i = 0; i < 3; i++)
-			tab[i].value = str_sanitize(tab[i].value, 80);
 	}
+	if (client->virtual_auth_user != NULL)
+		get_var_expand_users(tab+22, client->virtual_auth_user);
+	else {
+		tab[22].value = tab[19].value;
+		tab[23].value = tab[20].value;
+		tab[24].value = tab[21].value;
+	}
+	tab[25].value = client->listener_name;
 	return tab;
 }
 
@@ -561,12 +604,36 @@ static bool have_username_key(const char *str)
 }
 
 static const char *
+client_var_expand_func_passdb(const char *data, void *context)
+{
+	struct client *client = context;
+	const char *field_name = data;
+	unsigned int i, field_name_len;
+
+	if (client->auth_passdb_args == NULL)
+		return NULL;
+
+	field_name_len = strlen(field_name);
+	for (i = 0; client->auth_passdb_args[i] != NULL; i++) {
+		if (strncmp(client->auth_passdb_args[i], field_name,
+			    field_name_len) == 0 &&
+		    client->auth_passdb_args[i][field_name_len] == '=')
+			return client->auth_passdb_args[i] + field_name_len+1;
+	}
+	return NULL;
+}
+
+static const char *
 client_get_log_str(struct client *client, const char *msg)
 {
-	static struct var_expand_table static_tab[3] = {
+	static const struct var_expand_table static_tab[3] = {
 		{ 's', NULL, NULL },
 		{ '$', NULL, NULL },
 		{ '\0', NULL, NULL }
+	};
+	static const struct var_expand_func_table func_table[] = {
+		{ "passdb", client_var_expand_func_passdb },
+		{ NULL, NULL }
 	};
 	const struct var_expand_table *var_expand_table;
 	struct var_expand_table *tab;
@@ -583,7 +650,8 @@ client_get_log_str(struct client *client, const char *msg)
 	str2 = t_str_new(128);
 	for (e = client->set->log_format_elements_split; *e != NULL; e++) {
 		pos = str_len(str);
-		var_expand(str, *e, var_expand_table);
+		var_expand_with_funcs(str, *e, var_expand_table,
+				      func_table, client);
 		if (have_username_key(*e)) {
 			/* username is added even if it's empty */
 		} else {

@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -8,11 +8,14 @@
 #include "hex-binary.h"
 #include "aqueue.h"
 #include "hash.h"
+#include "dsync-brain-private.h"
 #include "dsync-mailbox-tree-private.h"
 
 #define TEMP_MAX_NAME_LEN 100
 #define TEMP_SUFFIX_MAX_LEN (sizeof("temp-")-1 + 8)
 #define TEMP_SUFFIX_FORMAT "temp-%x"
+
+#define MAX_RENAMES 100
 
 struct dsync_mailbox_tree_bfs_iter {
 	struct dsync_mailbox_tree *tree;
@@ -24,8 +27,10 @@ struct dsync_mailbox_tree_bfs_iter {
 
 struct dsync_mailbox_tree_sync_ctx {
 	pool_t pool;
+	struct dsync_brain *brain;
 	struct dsync_mailbox_tree *local_tree, *remote_tree;
 	enum dsync_mailbox_trees_sync_type sync_type;
+	enum dsync_mailbox_trees_sync_flags sync_flags;
 
 	ARRAY(struct dsync_mailbox_tree_sync_change) changes;
 	unsigned int change_idx;
@@ -85,6 +90,8 @@ sync_add_dir_change(struct dsync_mailbox_tree_sync_ctx *ctx,
 	struct dsync_mailbox_tree_sync_change *change;
 	const char *name;
 
+	i_assert(ctx->sync_type != DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_LOCAL);
+
 	name = dsync_mailbox_node_get_full_name(ctx->local_tree, node);
 
 	change = array_append_space(&ctx->changes);
@@ -98,6 +105,8 @@ sync_add_create_change(struct dsync_mailbox_tree_sync_ctx *ctx,
 		       const struct dsync_mailbox_node *node, const char *name)
 {
 	struct dsync_mailbox_tree_sync_change *change;
+
+	i_assert(ctx->sync_type != DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_LOCAL);
 
 	change = array_append_space(&ctx->changes);
 	change->type = DSYNC_MAILBOX_TREE_SYNC_TYPE_CREATE_BOX;
@@ -144,13 +153,23 @@ sync_set_node_deleted(struct dsync_mailbox_tree *tree,
 static void
 sync_delete_mailbox_node(struct dsync_mailbox_tree_sync_ctx *ctx,
 			 struct dsync_mailbox_tree *tree,
-			 struct dsync_mailbox_node *node)
+			 struct dsync_mailbox_node *node, const char *reason)
 {
 	struct dsync_mailbox_tree_sync_change *change;
 	const char *name;
 
-	if (tree == ctx->local_tree) {
+	if ((ctx->sync_flags & DSYNC_MAILBOX_TREES_SYNC_FLAG_DEBUG) != 0 &&
+	    tree == ctx->local_tree) {
+		i_debug("brain %c: Deleting mailbox '%s' (GUID %s): %s",
+			(ctx->sync_flags & DSYNC_MAILBOX_TREES_SYNC_FLAG_MASTER_BRAIN) != 0 ? 'M' : 'S',
+			dsync_mailbox_node_get_full_name(tree, node),
+			guid_128_to_string(node->mailbox_guid), reason);
+	}
+
+	if (tree == ctx->local_tree &&
+	    node->existence != DSYNC_MAILBOX_NODE_DELETED) {
 		/* delete this mailbox locally */
+		i_assert(ctx->sync_type != DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_LOCAL);
 		change = array_append_space(&ctx->changes);
 		change->type = DSYNC_MAILBOX_TREE_SYNC_TYPE_DELETE_BOX;
 		change->ns = node->ns;
@@ -165,7 +184,7 @@ sync_delete_mailbox_node(struct dsync_mailbox_tree_sync_ctx *ctx,
 static void
 sync_delete_mailbox(struct dsync_mailbox_tree_sync_ctx *ctx,
 		    struct dsync_mailbox_tree *tree,
-		    struct dsync_mailbox_node *node)
+		    struct dsync_mailbox_node *node, const char *reason)
 {
 	struct dsync_mailbox_tree *other_tree;
 	struct dsync_mailbox_node *other_node;
@@ -178,15 +197,15 @@ sync_delete_mailbox(struct dsync_mailbox_tree_sync_ctx *ctx,
 	if (other_node == NULL) {
 		/* doesn't exist / already deleted */
 	} else {
-		sync_delete_mailbox_node(ctx, other_tree, other_node);
+		sync_delete_mailbox_node(ctx, other_tree, other_node, reason);
 	}
-	sync_delete_mailbox_node(ctx, tree, node);
+	sync_delete_mailbox_node(ctx, tree, node, reason);
 }
 
 static void
 sync_tree_sort_and_delete_mailboxes(struct dsync_mailbox_tree_sync_ctx *ctx,
 				    struct dsync_mailbox_tree *tree,
-				    bool ignore_deletes)
+				    bool twoway_sync)
 {
 	struct dsync_mailbox_tree_bfs_iter *iter;
 	struct dsync_mailbox_node *node, *parent = NULL;
@@ -203,13 +222,18 @@ sync_tree_sort_and_delete_mailboxes(struct dsync_mailbox_tree_sync_ctx *ctx,
 		}
 		if (node->existence == DSYNC_MAILBOX_NODE_DELETED &&
 		    !dsync_mailbox_node_is_dir(node)) {
-			if (!ignore_deletes) {
+			if (twoway_sync) {
 				/* this mailbox was deleted. delete it from the
 				   other side as well */
-				sync_delete_mailbox(ctx, tree, node);
+				sync_delete_mailbox(ctx, tree, node,
+						    "Mailbox has been deleted");
 			} else {
-				/* we want to restore the mailbox back.
-				   just treat it as if it didn't exist */
+				/* treat the node as if it didn't exist. it'll
+				   get either recreated or deleted later. in
+				   any case this function must handle all
+				   existence=DELETED mailbox nodes by changing
+				   them into directories (setting GUID=0) or
+				   we'll assert-crash later */
 				sync_set_node_deleted(tree, node);
 			}
 		}
@@ -336,17 +360,39 @@ static bool node_is_existent(struct dsync_mailbox_node *node)
 	return node_has_existent_children(node, TRUE);
 }
 
+static bool sync_node_is_namespace_prefix(struct dsync_mailbox_tree *tree,
+					  struct dsync_mailbox_node *node)
+{
+	const char *full_name;
+	unsigned int prefix_len = node->ns == NULL ? 0 : node->ns->prefix_len;
+
+	if (strcmp(node->name, "INBOX") == 0 && node->parent == &tree->root)
+		return TRUE;
+
+	if (prefix_len == 0)
+		return FALSE;
+
+	full_name = dsync_mailbox_node_get_full_name(tree, node);
+	if (node->ns->prefix[prefix_len-1] == mail_namespace_get_sep(node->ns))
+		prefix_len--;
+	return strncmp(full_name, node->ns->prefix, prefix_len) == 0 &&
+		full_name[prefix_len] == '\0';
+}
+
 static void
 sync_rename_node_to_temp(struct dsync_mailbox_tree_sync_ctx *ctx,
 			 struct dsync_mailbox_tree *tree,
 			 struct dsync_mailbox_node *node,
-			 struct dsync_mailbox_node *new_parent)
+			 struct dsync_mailbox_node *new_parent,
+			 const char **reason_r)
 {
 	struct dsync_mailbox_tree_sync_change *change;
 	const char *old_name, *new_name, *p;
 	char name[TEMP_MAX_NAME_LEN+1];
 	buffer_t buf;
 	unsigned int prefix_len, max_prefix_len, counter = 1;
+
+	i_assert(!sync_node_is_namespace_prefix(tree, node));
 
 	buffer_create_from_data(&buf, name, sizeof(name));
 	max_prefix_len = TEMP_MAX_NAME_LEN - TEMP_SUFFIX_MAX_LEN - 1;
@@ -372,6 +418,7 @@ sync_rename_node_to_temp(struct dsync_mailbox_tree_sync_ctx *ctx,
 	old_name = tree != ctx->local_tree ? NULL :
 		dsync_mailbox_node_get_full_name(tree, node);
 
+	*reason_r = t_strdup_printf("Renamed '%s' to '%s'", node->name, str_c(&buf));
 	node->name = p_strdup(tree->pool, str_c(&buf));
 	node->sync_temporary_name = TRUE;
 	node->last_renamed_or_created = 0;
@@ -381,6 +428,7 @@ sync_rename_node_to_temp(struct dsync_mailbox_tree_sync_ctx *ctx,
 		/* we're modifying a local tree. remember this change. */
 		new_name = dsync_mailbox_node_get_full_name(tree, node);
 
+		i_assert(ctx->sync_type != DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_LOCAL);
 		i_assert(strcmp(old_name, "INBOX") != 0);
 		change = array_append_space(&ctx->changes);
 		change->type = DSYNC_MAILBOX_TREE_SYNC_TYPE_RENAME;
@@ -405,12 +453,16 @@ sync_rename_node(struct dsync_mailbox_tree_sync_ctx *ctx,
 		 struct dsync_mailbox_tree *tree,
 		 struct dsync_mailbox_node *temp_node,
 		 struct dsync_mailbox_node *node,
-		 const struct dsync_mailbox_node *other_node)
+		 const struct dsync_mailbox_node *other_node,
+		 const char **reason_r)
 {
 	struct dsync_mailbox_tree_sync_change *change;
 	struct dsync_mailbox_tree *other_tree;
 	struct dsync_mailbox_node *parent;
 	const char *name, *other_name;
+
+	i_assert(node != NULL);
+	i_assert(other_node != NULL);
 
 	/* move/rename node in the tree, so that its position/name is identical
 	   to other_node (in other_tree). temp_node's name is changed to
@@ -424,15 +476,18 @@ sync_rename_node(struct dsync_mailbox_tree_sync_ctx *ctx,
 	if (node_has_parent(parent, node)) {
 		/* don't introduce a loop. temporarily rename node
 		   under root. */
-		sync_rename_node_to_temp(ctx, tree, node, &tree->root);
+		sync_rename_node_to_temp(ctx, tree, node, &tree->root, reason_r);
+		*reason_r = t_strconcat(*reason_r, " (Don't introduce loop)", NULL);
 		return;
 	}
-	sync_rename_node_to_temp(ctx, tree, temp_node, temp_node->parent);
+	sync_rename_node_to_temp(ctx, tree, temp_node, temp_node->parent, reason_r);
 
 	/* get the old name before it's modified */
 	name = dsync_mailbox_node_get_full_name(tree, node);
 
 	/* set the new name */
+	*reason_r = t_strdup_printf("%s + Renamed '%s' to '%s'",
+				    *reason_r, name, other_node->name);
 	node->name = p_strdup(tree->pool, other_node->name);
 	node->sync_temporary_name = other_node->sync_temporary_name;
 	node->last_renamed_or_created = other_node->last_renamed_or_created;
@@ -445,6 +500,7 @@ sync_rename_node(struct dsync_mailbox_tree_sync_ctx *ctx,
 		/* we're modifying a local tree. remember this change. */
 		other_name = dsync_mailbox_node_get_full_name(other_tree, other_node);
 
+		i_assert(ctx->sync_type != DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_LOCAL);
 		i_assert(strcmp(name, "INBOX") != 0);
 		change = array_append_space(&ctx->changes);
 		change->type = DSYNC_MAILBOX_TREE_SYNC_TYPE_RENAME;
@@ -454,8 +510,8 @@ sync_rename_node(struct dsync_mailbox_tree_sync_ctx *ctx,
 	}
 }
 
-static int node_mailbox_guids_cmp2(struct dsync_mailbox_node *node1,
-				   struct dsync_mailbox_node *node2)
+static int node_mailbox_guids_cmp(struct dsync_mailbox_node *node1,
+				  struct dsync_mailbox_node *node2)
 {
 	int ret;
 
@@ -472,8 +528,8 @@ static int node_mailbox_guids_cmp2(struct dsync_mailbox_node *node1,
 		if (ret != 0)
 			return ret;
 
-		ret = node_mailbox_guids_cmp2(node1->first_child,
-					      node2->first_child);
+		ret = node_mailbox_guids_cmp(node1->first_child,
+					     node2->first_child);
 		if (ret != 0)
 			return ret;
 		node1 = node1->next;
@@ -484,12 +540,39 @@ static int node_mailbox_guids_cmp2(struct dsync_mailbox_node *node1,
 	return node1 != NULL ? -1 : 1;
 }
 
-static int node_mailbox_guids_cmp(struct dsync_mailbox_node *node1,
+static int node_mailbox_names_cmp(struct dsync_mailbox_node *node1,
 				  struct dsync_mailbox_node *node2)
 {
 	int ret;
 
-	ret = node_mailbox_guids_cmp2(node1, node2);
+	while (node1 != NULL && node2 != NULL) {
+		ret = strcmp(node1->name, node2->name);
+		if (ret != 0)
+			return ret;
+
+		ret = node_mailbox_names_cmp(node1->first_child,
+					     node2->first_child);
+		if (ret != 0)
+			return ret;
+		node1 = node1->next;
+		node2 = node2->next;
+	}
+	if (node1 == NULL && node2 == NULL)
+		return 0;
+	return node1 != NULL ? -1 : 1;
+}
+
+static int node_mailbox_trees_cmp(struct dsync_mailbox_node *node1,
+				  struct dsync_mailbox_node *node2)
+{
+	int ret;
+
+	ret = node_mailbox_guids_cmp(node1, node2);
+	if (ret == 0) {
+		/* only a directory name changed and all the timestamps
+		   are equal. just pick the alphabetically smaller. */
+		ret = node_mailbox_names_cmp(node1, node2);
+	}
 	i_assert(ret != 0);
 	return ret;
 }
@@ -508,12 +591,23 @@ static time_t nodes_get_timestamp(struct dsync_mailbox_node *node1,
 	return ts;
 }
 
+static bool sync_node_is_namespace_root(struct dsync_mailbox_tree *tree,
+					struct dsync_mailbox_node *node)
+{
+	if (node == NULL)
+		return FALSE;
+	if (node == &tree->root)
+		return TRUE;
+	return sync_node_is_namespace_prefix(tree, node);
+}
+
 static bool ATTR_NULL(3, 4)
 sync_rename_lower_ts(struct dsync_mailbox_tree_sync_ctx *ctx,
 		     struct dsync_mailbox_node *local_node1,
 		     struct dsync_mailbox_node *remote_node1,
 		     struct dsync_mailbox_node *local_node2,
-		     struct dsync_mailbox_node *remote_node2)
+		     struct dsync_mailbox_node *remote_node2,
+		     const char **reason_r)
 {
 	time_t local_ts, remote_ts;
 
@@ -525,6 +619,16 @@ sync_rename_lower_ts(struct dsync_mailbox_tree_sync_ctx *ctx,
 	   remote_node1 are located in the mailbox tree, or if they exist
 	   at all. Note that node1 and node2 may be the same node pointers. */
 	i_assert(strcmp(local_node1->name, remote_node2->name) == 0);
+
+	if (sync_node_is_namespace_root(ctx->remote_tree, remote_node1) ||
+	    sync_node_is_namespace_root(ctx->remote_tree, remote_node2) ||
+	    sync_node_is_namespace_root(ctx->local_tree, local_node1) ||
+	    sync_node_is_namespace_root(ctx->local_tree, local_node2)) {
+		local_node1->sync_delayed_guid_change = TRUE;
+		remote_node2->sync_delayed_guid_change = TRUE;
+		*reason_r = "Can't rename namespace prefixes - will be merged later";
+		return FALSE;
+	}
 
 	local_ts = nodes_get_timestamp(local_node1, local_node2);
 	remote_ts = nodes_get_timestamp(remote_node1, remote_node2);
@@ -541,7 +645,7 @@ sync_rename_lower_ts(struct dsync_mailbox_tree_sync_ctx *ctx,
 	   children. */
 	if (local_ts > remote_ts ||
 	    (local_ts == remote_ts &&
-	     node_mailbox_guids_cmp(local_node1, remote_node2) < 0)) {
+	     node_mailbox_trees_cmp(local_node1, remote_node2) < 0)) {
 		/* local nodes have a higher timestamp. we only want to do
 		   renames where the destination parent is the current node's
 		   (local_node1/remote_node2) parent. */
@@ -556,11 +660,13 @@ sync_rename_lower_ts(struct dsync_mailbox_tree_sync_ctx *ctx,
 			/* local : 1A
 			   remote: 1B, 2A -> 2A-temp, 1A */
 			sync_rename_node(ctx, ctx->remote_tree, remote_node2,
-					 remote_node1, local_node1);
+					 remote_node1, local_node1, reason_r);
+			*reason_r = t_strconcat(*reason_r, "(local: local_node2=NULL)", NULL);
 			return TRUE;
 		} else if (remote_node1 == remote_node2) {
 			/* FIXME: this fixes an infinite loop when in
 			   rename2 test, think it through why :) */
+			*reason_r = "local: remote_node1=remote_node2";
 		} else if (remote_node1 != NULL) {
 			/* a) local_node1->parent == local_node2->parent
 
@@ -580,52 +686,69 @@ sync_rename_lower_ts(struct dsync_mailbox_tree_sync_ctx *ctx,
 			   always renaming 2 to a temporary name and handling
 			   it when we reach B handling. */
 			sync_rename_node(ctx, ctx->remote_tree, remote_node2,
-					 remote_node1, local_node1);
+					 remote_node1, local_node1, reason_r);
+			*reason_r = t_strconcat(*reason_r, "(local: remote_node1=NULL)", NULL);
 			return TRUE;
-		} else if (node_has_parent(local_node1, local_node2)) {
+		} else if (node_has_parent(local_node1, local_node2) &&
+			   ctx->sync_type != DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_LOCAL) {
 			/* node2 is a parent of node1, but it should be
 			   vice versa */
 			sync_rename_node_to_temp(ctx, ctx->local_tree,
-						 local_node1, local_node2->parent);
+				local_node1, local_node2->parent, reason_r);
+			*reason_r = t_strconcat(*reason_r, "(local: node2 parent of node1)", NULL);
 			return TRUE;
-		} else if (node_has_parent(local_node2, local_node1)) {
+		} else if (node_has_parent(local_node2, local_node1) &&
+			   ctx->sync_type != DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_LOCAL) {
 			/* node1 is a parent of node2, but it should be
 			   vice versa */
 			sync_rename_node_to_temp(ctx, ctx->local_tree,
-						 local_node2, local_node1->parent);
+				local_node2, local_node1->parent, reason_r);
+			*reason_r = t_strconcat(*reason_r, "(local: node1 parent of node2)", NULL);
 			return TRUE;
 		} else if (local_node1->existence == DSYNC_MAILBOX_NODE_EXISTS) {
 			sync_rename_node_to_temp(ctx, ctx->remote_tree,
-						 remote_node2, remote_node2->parent);
+				remote_node2, remote_node2->parent, reason_r);
+			*reason_r = t_strconcat(*reason_r, "(local: local_node1 exists)", NULL);
 			return TRUE;
 		} else {
 			/* local : 1A, 2B
 			   remote:     2A     -> (2B)
 			   remote:     2A, 3B -> (3B-temp, 2B) */
+			*reason_r = "local: unchanged";
 		}
 	} else {
 		/* remote nodes have a higher timestamp */
 		if (remote_node1 == NULL) {
 			sync_rename_node(ctx, ctx->local_tree, local_node1,
-					 local_node2, remote_node2);
+					 local_node2, remote_node2, reason_r);
+			*reason_r = t_strconcat(*reason_r, "(remote: remote_node1=NULL)", NULL);
 			return TRUE;
 		} else if (local_node2 == local_node1) {
+			*reason_r = "remote: remote_node2=remote_node1";
 		} else if (local_node2 != NULL) {
 			sync_rename_node(ctx, ctx->local_tree, local_node1,
-					 local_node2, remote_node2);
+					 local_node2, remote_node2, reason_r);
+			*reason_r = t_strconcat(*reason_r, "(remote: local_node2=NULL)", NULL);
 			return TRUE;
-		} else if (node_has_parent(remote_node1, remote_node2)) {
+		} else if (node_has_parent(remote_node1, remote_node2) &&
+			   ctx->sync_type != DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_REMOTE) {
 			sync_rename_node_to_temp(ctx, ctx->remote_tree,
-						 remote_node1, remote_node2->parent);
+				remote_node1, remote_node2->parent, reason_r);
+			*reason_r = t_strconcat(*reason_r, "(remote: node2 parent of node1)", NULL);
 			return TRUE;
-		} else if (node_has_parent(remote_node2, remote_node1)) {
+		} else if (node_has_parent(remote_node2, remote_node1) &&
+			   ctx->sync_type != DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_REMOTE) {
 			sync_rename_node_to_temp(ctx, ctx->remote_tree,
-						 remote_node2, remote_node1->parent);
+				remote_node2, remote_node1->parent, reason_r);
+			*reason_r = t_strconcat(*reason_r, "(remote: node1 parent of node2)", NULL);
 			return TRUE;
 		} else if (remote_node2->existence == DSYNC_MAILBOX_NODE_EXISTS) {
 			sync_rename_node_to_temp(ctx, ctx->local_tree,
-						 local_node1, local_node1->parent);
+				local_node1, local_node1->parent, reason_r);
+			*reason_r = t_strconcat(*reason_r, "(remote: remote_node2 exists)", NULL);
 			return TRUE;
+		} else {
+			*reason_r = "remote: unchanged";
 		}
 	}
 	return FALSE;
@@ -633,10 +756,12 @@ sync_rename_lower_ts(struct dsync_mailbox_tree_sync_ctx *ctx,
 
 static bool sync_rename_conflict(struct dsync_mailbox_tree_sync_ctx *ctx,
 				 struct dsync_mailbox_node *local_node1,
-				 struct dsync_mailbox_node *remote_node2)
+				 struct dsync_mailbox_node *remote_node2,
+				 const char **reason_r)
 {
 	struct dsync_mailbox_node *local_node2, *remote_node1;
 	const uint8_t *guid_p;
+	bool ret;
 
 	guid_p = local_node1->mailbox_guid;
 	remote_node1 = hash_table_lookup(ctx->remote_tree->guid_hash, guid_p);
@@ -646,13 +771,16 @@ static bool sync_rename_conflict(struct dsync_mailbox_tree_sync_ctx *ctx,
 	if ((remote_node1 != NULL && remote_node1->existence == DSYNC_MAILBOX_NODE_EXISTS) ||
 	    (local_node2 != NULL && local_node2->existence == DSYNC_MAILBOX_NODE_EXISTS)) {
 		/* conflicting name, rename the one with lower timestamp */
-		return sync_rename_lower_ts(ctx, local_node1, remote_node1,
-					    local_node2, remote_node2);
+		ret = sync_rename_lower_ts(ctx, local_node1, remote_node1,
+					   local_node2, remote_node2, reason_r);
+		*reason_r = t_strconcat("conflicting name: ", *reason_r, NULL);
+		return ret;
 	} else if (dsync_mailbox_node_is_dir(local_node1) ||
 		   dsync_mailbox_node_is_dir(remote_node2)) {
 		/* one of the nodes is a directory, and the other is a mailbox
 		   that doesn't exist on the other side. there is no conflict,
 		   we'll just need to create the mailbox later. */
+		*reason_r = "mailbox not selectable yet";
 		return FALSE;
 	} else {
 		/* both nodes are mailboxes that don't exist on the other side.
@@ -660,6 +788,7 @@ static bool sync_rename_conflict(struct dsync_mailbox_tree_sync_ctx *ctx,
 		   GUIDs and UIDVALIDITYs to be the same */
 		local_node1->sync_delayed_guid_change = TRUE;
 		remote_node2->sync_delayed_guid_change = TRUE;
+		*reason_r = "GUIDs conflict - will be merged later";
 		return FALSE;
 	}
 }
@@ -690,24 +819,29 @@ sync_find_branch(struct dsync_mailbox_tree *tree,
 
 static bool sync_rename_directory(struct dsync_mailbox_tree_sync_ctx *ctx,
 				  struct dsync_mailbox_node *local_node1,
-				  struct dsync_mailbox_node *remote_node2)
+				  struct dsync_mailbox_node *remote_node2,
+				  const char **reason_r)
 {
 	struct dsync_mailbox_node *remote_node1, *local_node2;
 
 	/* see if we can find matching mailbox branches based on the nodes'
-	   child mailboxes (with GUIDs). */
+	   child mailboxes (with GUIDs). we can then rename the entire branch.
+	   don't try to do this for namespace prefixes though. */
 	remote_node1 = sync_find_branch(ctx->local_tree,
 					ctx->remote_tree, local_node1);
 	local_node2 = sync_find_branch(ctx->remote_tree, ctx->local_tree,
 				       remote_node2);
-	if (remote_node1 == NULL || local_node2 == NULL ||
-	    remote_node1 == &ctx->remote_tree->root ||
-	    local_node2 == &ctx->local_tree->root ||
-	    node_names_equal(remote_node1, local_node2))
+	if (remote_node1 == NULL || local_node2 == NULL) {
+		*reason_r = "Directory rename branch not found";
 		return FALSE;
+	}
+	if (node_names_equal(remote_node1, local_node2)) {
+		*reason_r = "Directory name paths are equal";
+		return FALSE;
+	}
 
 	return sync_rename_lower_ts(ctx, local_node1, remote_node1,
-				    local_node2, remote_node2);
+				    local_node2, remote_node2, reason_r);
 }
 
 static bool sync_rename_mailboxes(struct dsync_mailbox_tree_sync_ctx *ctx,
@@ -717,7 +851,12 @@ static bool sync_rename_mailboxes(struct dsync_mailbox_tree_sync_ctx *ctx,
 	struct dsync_mailbox_node **local_nodep = &local_parent->first_child;
 	struct dsync_mailbox_node **remote_nodep = &remote_parent->first_child;
 	struct dsync_mailbox_node *local_node, *remote_node;
+	const char *reason;
+	string_t *debug = NULL;
 	bool changed;
+
+	if ((ctx->sync_flags & DSYNC_MAILBOX_TREES_SYNC_FLAG_DEBUG) != 0)
+		debug = t_str_new(128);
 
 	/* the nodes are sorted by their names. */
 	while (*local_nodep != NULL || *remote_nodep != NULL) {
@@ -738,28 +877,43 @@ static bool sync_rename_mailboxes(struct dsync_mailbox_tree_sync_ctx *ctx,
 						    remote_parent, local_node);
 		}
 		i_assert(strcmp(local_node->name, remote_node->name) == 0);
+		if (debug != NULL) {
+			str_truncate(debug, 0);
+			str_append(debug, "Mailbox ");
+			dsync_mailbox_node_append_full_name(debug, ctx->local_tree, local_node);
+			str_printfa(debug, ": local=%s/%ld/%d, remote=%s/%ld/%d",
+				    guid_128_to_string(local_node->mailbox_guid),
+				    (long)local_node->last_renamed_or_created,
+				    local_node->existence,
+				    guid_128_to_string(remote_node->mailbox_guid),
+				    (long)remote_node->last_renamed_or_created,
+				    remote_node->existence);
+		}
 
 		if (dsync_mailbox_node_is_dir(local_node) &&
 		    dsync_mailbox_node_is_dir(remote_node)) {
 			/* both nodes are directories (or other side is
 			   nonexistent). see if we can match them by their
 			   child mailboxes */
-			if (sync_rename_directory(ctx, local_node, remote_node))
-				return TRUE;
+			changed = sync_rename_directory(ctx, local_node, remote_node, &reason);
 		} else if (dsync_mailbox_node_guids_equal(local_node,
 							  remote_node)) {
 			/* mailboxes are equal, no need to rename */
+			reason = "Mailboxes are equal";
+			changed = FALSE;
 		} else {
 			/* mailbox naming conflict */
-			T_BEGIN {
-				changed = sync_rename_conflict(ctx, local_node,
-							       remote_node);
-			} T_END;
-			if (changed)
-				return TRUE;
+			changed = sync_rename_conflict(ctx, local_node,
+						       remote_node, &reason);
 		}
 		/* handle children, if there are any */
-		T_BEGIN {
+		if (debug != NULL) {
+			i_debug("brain %c: %s: %s",
+				(ctx->sync_flags & DSYNC_MAILBOX_TREES_SYNC_FLAG_MASTER_BRAIN) != 0 ? 'M' : 'S',
+				str_c(debug), reason);
+		}
+
+		if (!changed) T_BEGIN {
 			changed = sync_rename_mailboxes(ctx, local_node,
 							remote_node);
 		} T_END;
@@ -828,8 +982,9 @@ static void suffix_inc(string_t *str)
 }
 
 static void
-sync_rename_temp_mailbox_node(pool_t pool,
-			      struct dsync_mailbox_node *node)
+sync_rename_temp_mailbox_node(struct dsync_mailbox_tree *tree,
+			      struct dsync_mailbox_node *node,
+			      const char **reason_r)
 {
 	const char *p, *new_suffix;
 	string_t *str = t_str_new(256);
@@ -852,7 +1007,10 @@ sync_rename_temp_mailbox_node(pool_t pool,
 	str_append(str, new_suffix);
 	while (node_has_child(node->parent, str_c(str)))
 		suffix_inc(str);
-	node->name = p_strdup(pool, str_c(str));
+
+	*reason_r = t_strdup_printf("Renamed '%s' to '%s'",
+		dsync_mailbox_node_get_full_name(tree, node), str_c(str));
+	node->name = p_strdup(tree->pool, str_c(str));
 
 	dsync_mailbox_tree_node_move_sorted(node, node->parent);
 	node->sync_temporary_name = FALSE;
@@ -883,6 +1041,8 @@ sync_rename_temp_mailboxes(struct dsync_mailbox_tree_sync_ctx *ctx,
 			   struct dsync_mailbox_tree *tree,
 			   struct dsync_mailbox_node *node)
 {
+	const char *reason;
+
 	for (; node != NULL; node = node->next) {
 		while (sync_rename_temp_mailboxes(ctx, tree, node->first_child)) ;
 
@@ -892,10 +1052,22 @@ sync_rename_temp_mailboxes(struct dsync_mailbox_tree_sync_ctx *ctx,
 			    !node_has_existent_children(node, FALSE))) {
 			/* we can just delete this directory and
 			   any child directories it may have */
+			if ((ctx->sync_flags & DSYNC_MAILBOX_TREES_SYNC_FLAG_DEBUG) != 0) {
+				i_debug("brain %c: %s mailbox %s: Delete directory-only tree",
+					(ctx->sync_flags & DSYNC_MAILBOX_TREES_SYNC_FLAG_MASTER_BRAIN) != 0 ? 'M' : 'S',
+					tree == ctx->local_tree ? "local" : "remote",
+					dsync_mailbox_node_get_full_name(tree, node));
+			}
 			sync_rename_delete_node_dirs(ctx, tree, node);
 		} else {
 			T_BEGIN {
-				sync_rename_temp_mailbox_node(tree->pool, node);
+				sync_rename_temp_mailbox_node(tree, node, &reason);
+				if ((ctx->sync_flags & DSYNC_MAILBOX_TREES_SYNC_FLAG_DEBUG) != 0) {
+					i_debug("brain %c: %s mailbox %s: %s",
+						(ctx->sync_flags & DSYNC_MAILBOX_TREES_SYNC_FLAG_MASTER_BRAIN) != 0 ? 'M' : 'S',
+						tree == ctx->local_tree ? "local" : "remote",
+						dsync_mailbox_node_get_full_name(tree, node), reason);
+				}
 			} T_END;
 			return TRUE;
 		}
@@ -903,19 +1075,61 @@ sync_rename_temp_mailboxes(struct dsync_mailbox_tree_sync_ctx *ctx,
 	return FALSE;
 }
 
-static bool sync_is_wrong_mailbox(struct dsync_mailbox_node *node,
-				  const struct dsync_mailbox_node *wanted_node)
+static void
+dsync_mailbox_tree_handle_renames(struct dsync_mailbox_tree_sync_ctx *ctx)
 {
-	if (wanted_node->existence != DSYNC_MAILBOX_NODE_EXISTS)
-		return TRUE;
-	if (node->uid_validity != wanted_node->uid_validity)
-		return TRUE;
-	if (node->uid_next > wanted_node->uid_next) {
-		/* we can't lower the UIDNEXT */
+	unsigned int count = 0;
+	bool changed;
+
+	do {
+		T_BEGIN {
+			changed = sync_rename_mailboxes(ctx, &ctx->local_tree->root,
+							&ctx->remote_tree->root);
+		} T_END;
+		if ((ctx->sync_flags & DSYNC_MAILBOX_TREES_SYNC_FLAG_DEBUG) != 0 &&
+		    changed) {
+			i_debug("brain %c: -- Mailbox renamed, restart sync --",
+				(ctx->sync_flags & DSYNC_MAILBOX_TREES_SYNC_FLAG_MASTER_BRAIN) != 0 ? 'M' : 'S');
+		}
+	} while (changed && ++count <= MAX_RENAMES);
+
+	if (changed) {
+		i_error("BUG: Mailbox renaming algorithm got into a potentially infinite loop, aborting");
+		ctx->brain->failed = TRUE;
+	}
+
+	while (sync_rename_temp_mailboxes(ctx, ctx->local_tree, &ctx->local_tree->root)) ;
+	while (sync_rename_temp_mailboxes(ctx, ctx->remote_tree, &ctx->remote_tree->root)) ;
+}
+
+static bool sync_is_wrong_mailbox(struct dsync_mailbox_node *node,
+				  const struct dsync_mailbox_node *wanted_node,
+				  const char **reason_r)
+{
+	if (wanted_node->existence != DSYNC_MAILBOX_NODE_EXISTS) {
+		*reason_r = wanted_node->existence == DSYNC_MAILBOX_NODE_DELETED ?
+			"Mailbox has been deleted" : "Mailbox doesn't exist";
 		return TRUE;
 	}
-	return memcmp(node->mailbox_guid, wanted_node->mailbox_guid,
-		      sizeof(node->mailbox_guid)) != 0;
+	if (node->uid_validity != wanted_node->uid_validity) {
+		*reason_r = t_strdup_printf("UIDVALIDITY changed (%u -> %u)",
+					    wanted_node->uid_validity,
+					    node->uid_validity);
+		return TRUE;
+	}
+	if (node->uid_next > wanted_node->uid_next) {
+		/* we can't lower the UIDNEXT */
+		*reason_r = t_strdup_printf("UIDNEXT is too high (%u > %u)",
+					    node->uid_next,
+					    wanted_node->uid_next);
+		return TRUE;
+	}
+	if (memcmp(node->mailbox_guid, wanted_node->mailbox_guid,
+		   sizeof(node->mailbox_guid)) != 0) {
+		*reason_r = "GUID changed";
+		return TRUE;
+	}
+	return FALSE;
 }
 
 static void
@@ -925,6 +1139,7 @@ sync_delete_wrong_mailboxes_branch(struct dsync_mailbox_tree_sync_ctx *ctx,
 				   struct dsync_mailbox_node *node,
 				   const struct dsync_mailbox_node *wanted_node)
 {
+	const char *reason;
 	int ret;
 
 	while (node != NULL && wanted_node != NULL) {
@@ -937,20 +1152,22 @@ sync_delete_wrong_mailboxes_branch(struct dsync_mailbox_tree_sync_ctx *ctx,
 		if (ret < 0) {
 			/* node shouldn't exist */
 			if (node->existence == DSYNC_MAILBOX_NODE_EXISTS &&
-			    !dsync_mailbox_node_is_dir(node))
-				sync_delete_mailbox_node(ctx, tree, node);
+			    !dsync_mailbox_node_is_dir(node)) {
+				sync_delete_mailbox_node(ctx, tree, node,
+					"Mailbox doesn't exist");
+			}
 			node = node->next;
 		} else if (ret > 0) {
 			/* wanted_node doesn't exist. it's created later. */
 			wanted_node = wanted_node->next;
-		} else {
-			if (sync_is_wrong_mailbox(node, wanted_node) &&
+		} else T_BEGIN {
+			if (sync_is_wrong_mailbox(node, wanted_node, &reason) &&
 			    node->existence == DSYNC_MAILBOX_NODE_EXISTS &&
 			    !dsync_mailbox_node_is_dir(node))
-				sync_delete_mailbox_node(ctx, tree, node);
+				sync_delete_mailbox_node(ctx, tree, node, reason);
 			node = node->next;
 			wanted_node = wanted_node->next;
-		}
+		} T_END;
 	}
 	for (; node != NULL; node = node->next) {
 		/* node and its children shouldn't exist */
@@ -961,7 +1178,7 @@ sync_delete_wrong_mailboxes_branch(struct dsync_mailbox_tree_sync_ctx *ctx,
 		}
 		if (node->existence == DSYNC_MAILBOX_NODE_EXISTS &&
 		    !dsync_mailbox_node_is_dir(node))
-			sync_delete_mailbox_node(ctx, tree, node);
+			sync_delete_mailbox_node(ctx, tree, node, "Mailbox doesn't exist");
 	}
 }
 
@@ -1037,11 +1254,22 @@ sync_subscription(struct dsync_mailbox_tree_sync_ctx *ctx,
 		  struct dsync_mailbox_node *local_node,
 		  struct dsync_mailbox_node *remote_node)
 {
-	if (ctx->sync_type == DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_LOCAL ||
-	    local_node->last_subscription_change >
-	    	remote_node->last_subscription_change ||
-	    (local_node->last_subscription_change ==
-	     remote_node->last_subscription_change && local_node->subscribed)) {
+	bool use_local;
+
+	if (ctx->sync_type == DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_LOCAL)
+		use_local = TRUE;
+	else if (ctx->sync_type == DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_REMOTE)
+		use_local = FALSE;
+	else if (local_node->last_subscription_change > remote_node->last_subscription_change)
+		use_local = TRUE;
+	else if (local_node->last_subscription_change < remote_node->last_subscription_change)
+		use_local = FALSE;
+	else {
+		/* local and remote have equal timestamps. prefer to subscribe
+		   rather than unsubscribe. */
+		use_local = local_node->subscribed;
+	}
+	if (use_local) {
 		/* use local subscription state */
 		remote_node->subscribed = local_node->subscribed;
 	} else {
@@ -1103,19 +1331,19 @@ static void sync_mailbox_child_dirs(struct dsync_mailbox_tree_sync_ctx *ctx,
 			sync_subscription(ctx, local_node, remote_node);
 
 		if (local_node->existence == DSYNC_MAILBOX_NODE_DELETED &&
-		    local_node->first_child == NULL &&
+		    !node_has_existent_children(local_node, TRUE) &&
 		    remote_node->existence == DSYNC_MAILBOX_NODE_EXISTS &&
 		    ctx->sync_type != DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_REMOTE) {
 			/* delete from remote */
-			i_assert(remote_node->first_child == NULL);
+			i_assert(!node_has_existent_children(remote_node, TRUE));
 			remote_node->existence = DSYNC_MAILBOX_NODE_NONEXISTENT;
 		}
 		if (remote_node->existence == DSYNC_MAILBOX_NODE_DELETED &&
-		    remote_node->first_child == NULL &&
+		    !node_has_existent_children(remote_node, TRUE) &&
 		    local_node->existence == DSYNC_MAILBOX_NODE_EXISTS &&
 		    ctx->sync_type != DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_LOCAL) {
 			/* delete from local */
-			i_assert(local_node->first_child == NULL);
+			i_assert(!node_has_existent_children(local_node, TRUE));
 			local_node->existence = DSYNC_MAILBOX_NODE_NONEXISTENT;
 			sync_add_dir_change(ctx, local_node,
 				DSYNC_MAILBOX_TREE_SYNC_TYPE_DELETE_DIR);
@@ -1157,11 +1385,11 @@ dsync_mailbox_tree_update_child_timestamps(struct dsync_mailbox_node *node,
 struct dsync_mailbox_tree_sync_ctx *
 dsync_mailbox_trees_sync_init(struct dsync_mailbox_tree *local_tree,
 			      struct dsync_mailbox_tree *remote_tree,
-			      enum dsync_mailbox_trees_sync_type sync_type)
+			      enum dsync_mailbox_trees_sync_type sync_type,
+			      enum dsync_mailbox_trees_sync_flags sync_flags)
 {
 	struct dsync_mailbox_tree_sync_ctx *ctx;
 	pool_t pool;
-	bool ignore_deletes;
 
 	i_assert(hash_table_is_created(local_tree->guid_hash));
 	i_assert(hash_table_is_created(remote_tree->guid_hash));
@@ -1173,18 +1401,18 @@ dsync_mailbox_trees_sync_init(struct dsync_mailbox_tree *local_tree,
 	ctx->local_tree = local_tree;
 	ctx->remote_tree = remote_tree;
 	ctx->sync_type = sync_type;
+	ctx->sync_flags = sync_flags;
 	i_array_init(&ctx->changes, 128);
 
-	ignore_deletes = sync_type == DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_LOCAL;
-	sync_tree_sort_and_delete_mailboxes(ctx, remote_tree, ignore_deletes);
-	ignore_deletes = sync_type == DSYNC_MAILBOX_TREES_SYNC_TYPE_PRESERVE_REMOTE;
-	sync_tree_sort_and_delete_mailboxes(ctx, local_tree, ignore_deletes);
+	sync_tree_sort_and_delete_mailboxes(ctx, remote_tree,
+		sync_type == DSYNC_MAILBOX_TREES_SYNC_TYPE_TWOWAY);
+	sync_tree_sort_and_delete_mailboxes(ctx, local_tree,
+		sync_type == DSYNC_MAILBOX_TREES_SYNC_TYPE_TWOWAY);
 
 	dsync_mailbox_tree_update_child_timestamps(&local_tree->root, 0);
 	dsync_mailbox_tree_update_child_timestamps(&remote_tree->root, 0);
-	while (sync_rename_mailboxes(ctx, &local_tree->root, &remote_tree->root)) ;
-	while (sync_rename_temp_mailboxes(ctx, local_tree, &local_tree->root)) ;
-	while (sync_rename_temp_mailboxes(ctx, remote_tree, &remote_tree->root)) ;
+	if ((sync_flags & DSYNC_MAILBOX_TREES_SYNC_FLAG_NO_RENAMES) == 0)
+		dsync_mailbox_tree_handle_renames(ctx);
 
 	/* if we're not doing a two-way sync, delete now any mailboxes, which
 	   a) shouldn't exist, b) doesn't have a matching GUID/UIDVALIDITY,

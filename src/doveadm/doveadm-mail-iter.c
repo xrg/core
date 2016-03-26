@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "mail-storage.h"
@@ -14,6 +14,7 @@ struct doveadm_mail_iter {
 	struct mailbox *box;
 	struct mailbox_transaction_context *t;
 	struct mail_search_context *search_ctx;
+	bool killed;
 };
 
 int doveadm_mail_iter_init(struct doveadm_mail_cmd_context *ctx,
@@ -99,10 +100,20 @@ doveadm_mail_iter_deinit_full(struct doveadm_mail_iter **_iter,
 	*_iter = NULL;
 
 	ret = doveadm_mail_iter_deinit_transaction(iter, commit);
-	if (ret == 0 && sync)
+	if (ret == 0 && sync) {
 		ret = mailbox_sync(iter->box, 0);
+		if (ret < 0) {
+			i_error("Mailbox %s: Mailbox sync failed: %s",
+				mailbox_get_vname(iter->box),
+				mailbox_get_last_error(iter->box, NULL));
+		}
+	}
 	if (ret < 0)
 		doveadm_mail_failed_mailbox(iter->ctx, iter->box);
+	else if (iter->killed) {
+		iter->ctx->exit_code = EX_TEMPFAIL;
+		ret = -1;
+	}
 	if (!keep_box)
 		mailbox_free(&iter->box);
 	i_free(iter);
@@ -136,6 +147,10 @@ bool doveadm_mail_iter_next(struct doveadm_mail_iter *iter,
 {
 	if (iter->search_ctx == NULL)
 		return FALSE;
+	if (doveadm_is_killed()) {
+		iter->killed = TRUE;
+		return FALSE;
+	}
 	return mailbox_search_next(iter->search_ctx, mail_r);
 }
 

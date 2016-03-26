@@ -1,10 +1,9 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "mail-cache.h"
 #include "mail-storage-private.h"
 
-#include <stdlib.h>
 
 static struct mailbox_header_lookup_ctx *
 mailbox_header_lookup_init_real(struct mailbox *box,

@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2013 Dovecot authors, see the included COPYING memcached_ascii */
+/* Copyright (c) 2008-2016 Dovecot authors, see the included COPYING memcached_ascii */
 
 #include "lib.h"
 #include "array.h"
@@ -53,10 +53,10 @@ struct memcached_ascii_dict {
 	struct dict dict;
 	struct ip_addr ip;
 	char *username, *key_prefix;
-	unsigned int port;
+	in_port_t port;
 	unsigned int timeout_msecs;
 
-	struct ioloop *ioloop;
+	struct ioloop *ioloop, *prev_ioloop;
 	struct timeout *to;
 	struct memcached_ascii_connection conn;
 
@@ -65,6 +65,23 @@ struct memcached_ascii_dict {
 };
 
 static struct connection_list *memcached_ascii_connections;
+
+static void
+memcached_ascii_callback(struct memcached_ascii_dict *dict,
+			 const struct memcached_ascii_dict_reply *reply, int ret)
+{
+	if (reply->callback != NULL) {
+		if (dict->prev_ioloop != NULL) {
+			/* Don't let callback see that we've created our
+			   internal ioloop in case it wants to add some ios
+			   or timeouts. */
+			current_ioloop = dict->prev_ioloop;
+		}
+		reply->callback(ret, reply->context);
+		if (dict->prev_ioloop != NULL)
+			current_ioloop = dict->ioloop;
+	}
+}
 
 static void memcached_ascii_conn_destroy(struct connection *_conn)
 {
@@ -76,10 +93,8 @@ static void memcached_ascii_conn_destroy(struct connection *_conn)
 	if (conn->dict->ioloop != NULL)
 		io_loop_stop(conn->dict->ioloop);
 
-	array_foreach(&conn->dict->replies, reply) {
-		if (reply->callback != NULL)
-			reply->callback(-1, reply->context);
-	}
+	array_foreach(&conn->dict->replies, reply)
+		memcached_ascii_callback(conn->dict, reply, -1);
 	array_clear(&conn->dict->replies);
 	array_clear(&conn->dict->input_states);
 	conn->reply_bytes_left = 0;
@@ -186,8 +201,7 @@ static int memcached_ascii_input_reply(struct memcached_ascii_dict *dict)
 	i_assert(count > 0);
 	i_assert(replies[0].reply_count > 0);
 	if (--replies[0].reply_count == 0) {
-		if (replies[0].callback != NULL)
-			replies[0].callback(1, replies[0].context);
+		memcached_ascii_callback(dict, &replies[0], 1);
 		array_delete(&dict->replies, 0, 1);
 	}
 	return 1;
@@ -217,15 +231,16 @@ static void memcached_ascii_conn_input(struct connection *_conn)
 
 static int memcached_ascii_input_wait(struct memcached_ascii_dict *dict)
 {
-	struct ioloop *old_ioloop = current_ioloop;
-
-	current_ioloop = dict->ioloop;
+	dict->prev_ioloop = current_ioloop;
+	io_loop_set_current(dict->ioloop);
 	if (dict->to != NULL)
 		dict->to = io_loop_move_timeout(&dict->to);
 	connection_switch_ioloop(&dict->conn.conn);
 	io_loop_run(dict->ioloop);
 
-	current_ioloop = old_ioloop;
+	io_loop_set_current(dict->prev_ioloop);
+	dict->prev_ioloop = NULL;
+
 	if (dict->to != NULL)
 		dict->to = io_loop_move_timeout(&dict->to);
 	connection_switch_ioloop(&dict->conn.conn);
@@ -332,9 +347,7 @@ static const char *memcached_ascii_escape_username(const char *username)
 
 static int
 memcached_ascii_dict_init(struct dict *driver, const char *uri,
-			  enum dict_data_type value_type ATTR_UNUSED,
-			  const char *username,
-			  const char *base_dir ATTR_UNUSED,
+			  const struct dict_settings *set,
 			  struct dict **dict_r, const char **error_r)
 {
 	struct memcached_ascii_dict *dict;
@@ -364,7 +377,7 @@ memcached_ascii_dict_init(struct dict *driver, const char *uri,
 				ret = -1;
 			}
 		} else if (strncmp(*args, "port=", 5) == 0) {
-			if (str_to_uint(*args+5, &dict->port) < 0) {
+			if (net_str2port(*args+5, &dict->port) < 0) {
 				*error_r = t_strdup_printf("Invalid port: %s",
 							   *args+5);
 				ret = -1;
@@ -396,17 +409,17 @@ memcached_ascii_dict_init(struct dict *driver, const char *uri,
 	dict->conn.reply_str = str_new(default_pool, 256);
 	dict->conn.dict = dict;
 
-	if (strchr(username, DICT_USERNAME_SEPARATOR) == NULL)
-		dict->username = i_strdup(username);
+	if (strchr(set->username, DICT_USERNAME_SEPARATOR) == NULL)
+		dict->username = i_strdup(set->username);
 	else {
 		/* escape the username */
-		dict->username = i_strdup(memcached_ascii_escape_username(username));
+		dict->username = i_strdup(memcached_ascii_escape_username(set->username));
 	}
 	i_array_init(&dict->input_states, 4);
 	i_array_init(&dict->replies, 4);
 
 	dict->ioloop = io_loop_create();
-	current_ioloop = old_ioloop;
+	io_loop_set_current(old_ioloop);
 	*dict_r = &dict->dict;
 	return 0;
 }
@@ -421,9 +434,9 @@ static void memcached_ascii_dict_deinit(struct dict *_dict)
 		(void)memcached_ascii_wait(dict);
 	connection_deinit(&dict->conn.conn);
 
-	current_ioloop = dict->ioloop;
+	io_loop_set_current(dict->ioloop);
 	io_loop_destroy(&dict->ioloop);
-	current_ioloop = old_ioloop;
+	io_loop_set_current(old_ioloop);
 
 	str_free(&dict->conn.reply_str);
 	array_free(&dict->replies);
@@ -650,6 +663,7 @@ struct dict dict_driver_memcached_ascii = {
 		dict_transaction_memory_set,
 		dict_transaction_memory_unset,
 		dict_transaction_memory_append,
-		dict_transaction_memory_atomic_inc
+		dict_transaction_memory_atomic_inc,
+		NULL
 	}
 };

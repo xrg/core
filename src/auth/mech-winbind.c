@@ -17,7 +17,6 @@
 #include "istream.h"
 #include "ostream.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
 
@@ -146,9 +145,9 @@ winbind_helper_connect(const struct auth_settings *set,
 
 	winbind->pid = pid;
 	winbind->in_pipe =
-		i_stream_create_fd(infd[0], AUTH_CLIENT_MAX_LINE_LENGTH, TRUE);
+		i_stream_create_fd_autoclose(&infd[0], AUTH_CLIENT_MAX_LINE_LENGTH);
 	winbind->out_pipe =
-		o_stream_create_fd(outfd[1], (size_t)-1, TRUE);
+		o_stream_create_fd_autoclose(&outfd[1], (size_t)-1);
 
 	if (!sigchld_handler_set) {
 		sigchld_handler_set = TRUE;
@@ -180,7 +179,7 @@ do_auth_continue(struct auth_request *auth_request,
 	if (o_stream_send(request->winbind->out_pipe,
 			  str_data(str), str_len(str)) < 0 ||
 	    o_stream_flush(request->winbind->out_pipe) < 0) {
-		auth_request_log_error(auth_request, "winbind",
+		auth_request_log_error(auth_request, AUTH_SUBSYS_MECH,
 				       "write(out_pipe) failed: %m");
 		return HR_RESTART;
 	}
@@ -191,7 +190,7 @@ do_auth_continue(struct auth_request *auth_request,
 			break;
 	}
 	if (answer == NULL) {
-		auth_request_log_error(auth_request, "winbind",
+		auth_request_log_error(auth_request, AUTH_SUBSYS_MECH,
 				       "read(in_pipe) failed: %m");
 		return HR_RESTART;
 	}
@@ -200,7 +199,7 @@ do_auth_continue(struct auth_request *auth_request,
 	if (token[0] == NULL ||
 	    (token[1] == NULL && strcmp(token[0], "BH") != 0) ||
 	    (gss_spnego && (token[1] == NULL || token[2] == NULL))) {
-		auth_request_log_error(auth_request, "winbind",
+		auth_request_log_error(auth_request, AUTH_SUBSYS_MECH,
 				       "Invalid input from helper: %s", answer);
 		return HR_RESTART;
 	}
@@ -235,7 +234,7 @@ do_auth_continue(struct auth_request *auth_request,
 	} else if (strcmp(token[0], "NA") == 0) {
 		const char *error = gss_spnego ? token[2] : token[1];
 
-		auth_request_log_info(auth_request, "winbind",
+		auth_request_log_info(auth_request, AUTH_SUBSYS_MECH,
 				      "user not authenticated: %s", error);
 		return HR_FAIL;
 	} else if (strcmp(token[0], "AF") == 0) {
@@ -253,7 +252,7 @@ do_auth_continue(struct auth_request *auth_request,
 		}
 
 		if (!auth_request_set_username(auth_request, user, &error)) {
-			auth_request_log_info(auth_request, "winbind",
+			auth_request_log_info(auth_request, AUTH_SUBSYS_MECH,
 					      "%s", error);
 			return HR_FAIL;
 		}
@@ -270,12 +269,12 @@ do_auth_continue(struct auth_request *auth_request,
 		}
 		return HR_OK;
 	} else if (strcmp(token[0], "BH") == 0) {
-		auth_request_log_info(auth_request, "winbind",
+		auth_request_log_info(auth_request, AUTH_SUBSYS_MECH,
 				      "ntlm_auth reports broken helper: %s",
 				      token[1] != NULL ? token[1] : "");
 		return HR_RESTART;
 	} else {
-		auth_request_log_error(auth_request, "winbind",
+		auth_request_log_error(auth_request, AUTH_SUBSYS_MECH,
 				       "Invalid input from helper: %s", answer);
 		return HR_RESTART;
 	}
@@ -313,7 +312,7 @@ static struct auth_request *do_auth_new(struct winbind_helper *winbind)
 	struct winbind_auth_request *request;
 	pool_t pool;
 
-	pool = pool_alloconly_create("winbind_auth_request", 1024);
+	pool = pool_alloconly_create(MEMPOOL_GROWING"winbind_auth_request", 2048);
 	request = p_new(pool, struct winbind_auth_request, 1);
 	request->auth_request.pool = pool;
 

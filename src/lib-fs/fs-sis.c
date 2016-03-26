@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -359,9 +359,10 @@ static void fs_sis_write_stream(struct fs_file *_file)
 						fs_file_last_error(_file));
 	} else {
 		file->fs_output = fs_write_stream(file->super);
-		if (file->hash_input == NULL)
+		if (file->hash_input == NULL) {
 			_file->output = file->fs_output;
-		else {
+			o_stream_ref(_file->output);
+		} else {
 			/* compare if files are equal */
 			_file->output = o_stream_create_cmp(file->fs_output,
 							    file->hash_input);
@@ -379,17 +380,21 @@ static int fs_sis_write_stream_finish(struct fs_file *_file, bool success)
 			fs_write_stream_abort(file->super, &file->fs_output);
 			fs_sis_file_copy_error(file);
 		}
+		o_stream_unref(&_file->output);
 		return -1;
 	}
 
 	if (file->hash_input != NULL &&
 	    o_stream_cmp_equals(_file->output) &&
 	    i_stream_is_eof(file->hash_input)) {
+		o_stream_unref(&_file->output);
 		if (fs_sis_try_link(file)) {
 			fs_write_stream_abort(file->super, &file->fs_output);
 			return 1;
 		}
 	}
+	if (_file->output != NULL)
+		o_stream_unref(&_file->output);
 
 	if (fs_write_stream_finish(file->super, &file->fs_output) < 0) {
 		fs_sis_file_copy_error(file);

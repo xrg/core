@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -6,7 +6,6 @@
 #include "mail-index-sync-private.h"
 #include "mail-index-modseq.h"
 
-#include <stdlib.h>
 
 void mail_index_sync_set_corrupted(struct mail_index_sync_map_ctx *ctx ATTR_UNUSED,
 				   const char *fmt ATTR_UNUSED, ...) {}

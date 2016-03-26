@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -11,7 +11,6 @@
 #include "mail-storage-settings.h"
 #include "duplicate.h"
 
-#include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -184,10 +183,8 @@ static int duplicate_read(struct duplicate_file *file)
 	}
 
 	if (record_size == 0 ||
-	    duplicate_read_records(file, input, record_size) < 0) {
-		if (unlink(file->path) < 0 && errno != ENOENT)
-			i_error("unlink(%s) failed: %m", file->path);
-	}
+	    duplicate_read_records(file, input, record_size) < 0)
+		i_unlink_if_exists(file->path);
 
 	i_stream_unref(&input);
 	if (close(fd) < 0)
@@ -292,8 +289,13 @@ void duplicate_flush(struct duplicate_context *ctx)
         struct hash_iterate_context *iter;
 	struct duplicate *d;
 
-	if (file == NULL || !file->changed || file->new_fd == -1)
+	if (file == NULL)
 		return;
+	if (!file->changed || file->new_fd == -1) {
+		/* unlock the duplicate database */
+		duplicate_file_free(&ctx->file);
+		return;
+	}
 
 	memset(&hdr, 0, sizeof(hdr));
 	hdr.version = DUPLICATE_VERSION;
@@ -318,16 +320,14 @@ void duplicate_flush(struct duplicate_context *ctx)
 	if (o_stream_nfinish(output) < 0) {
 		i_error("write(%s) failed: %m", file->path);
 		o_stream_unref(&output);
-		file_dotlock_delete(&file->dotlock);
-		file->new_fd = -1;
+		duplicate_file_free(&ctx->file);
 		return;
 	}
 	o_stream_unref(&output);
 
-	file->changed = FALSE;
 	if (file_dotlock_replace(&file->dotlock, 0) < 0)
 		i_error("file_dotlock_replace(%s) failed: %m", file->path);
-	file->new_fd = -1;
+	duplicate_file_free(&ctx->file);
 }
 
 struct duplicate_context *duplicate_init(struct mail_user *user)
@@ -358,7 +358,7 @@ void duplicate_deinit(struct duplicate_context **_ctx)
 	*_ctx = NULL;
 	if (ctx->file != NULL) {
 		duplicate_flush(ctx);
-		duplicate_file_free(&ctx->file);
+		i_assert(ctx->file == NULL);
 	}
 	i_free(ctx->path);
 	i_free(ctx);

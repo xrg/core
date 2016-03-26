@@ -1,11 +1,13 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "safe-memset.h"
 #include "ioloop.h"
 #include "istream.h"
 #include "write-full.h"
 #include "http-url.h"
 #include "http-client.h"
+#include "dns-lookup.h"
 
 struct http_test_request {
 	struct io *io;
@@ -31,9 +33,10 @@ static void payload_input(struct http_test_request *req)
 		i_info("DEBUG: REQUEST: NEED MORE DATA");
 		/* we will be called again for this request */
 	} else {
-		if (req->payload->stream_errno != 0)
-			i_error("REQUEST PAYLOAD READ ERROR: %m");
-		else
+		if (req->payload->stream_errno != 0) {
+			i_error("REQUEST PAYLOAD READ ERROR: %s",
+				i_stream_get_error(req->payload));
+		} else
 			i_info("DEBUG: REQUEST: Finished");
 		io_remove(&req->io);
 		i_stream_unref(&req->payload);
@@ -62,8 +65,7 @@ got_request_response(const struct http_response *response,
 	i_info("DEBUG: REQUEST: Got payload");
 	i_stream_ref(response->payload);
 	req->payload = response->payload;
-	req->io = io_add(i_stream_get_fd(response->payload), IO_READ,
-			 payload_input, req);
+	req->io = io_add_istream(response->payload, payload_input, req);
 	payload_input(req);
 }
 
@@ -180,7 +182,6 @@ static void run_tests(struct http_client *http_client)
 	http_client_request_set_ssl(http_req, TRUE);
 	http_client_request_submit(http_req);
 	http_client_request_abort(&http_req);
-	i_free(test_req);
 
 	test_req = i_new(struct http_test_request, 1);
 	http_req = http_client_request(http_client,
@@ -259,6 +260,14 @@ static void run_tests(struct http_client *http_client)
 
 	test_req = i_new(struct http_test_request, 1);
 	http_req = http_client_request(http_client,
+		"GET", "jigsaw.w3.org", "/HTTP/Basic/",
+		got_request_response, test_req);
+	http_client_request_set_auth_simple
+		(http_req, "guest", "guest");
+	http_client_request_submit(http_req);
+
+	test_req = i_new(struct http_test_request, 1);
+	http_req = http_client_request(http_client,
 		"PUT", "test.dovecot.org", "/http/put/put.php",
 		got_request_response, test_req);
 	post_payload = i_stream_create_file("Makefile.am", 10);
@@ -322,12 +331,33 @@ static void run_http_post(struct http_client *http_client, const char *url_str,
 
 int main(int argc, char *argv[])
 {
+	struct dns_client *dns_client;
+	struct dns_lookup_settings dns_set;
 	struct http_client_settings http_set;
 	struct http_client *http_client;
+	const char *error;
 	struct ioloop *ioloop;
 
+	lib_init();
+
+	ioloop = io_loop_create();
+	io_loop_set_running(ioloop);
+
+	/* kludge: use safe_memset() here since otherwise it's not included in
+	   the binary in all systems (but is in others! so linking
+	   safe-memset.lo directly causes them to fail.) If safe_memset() isn't
+	   included, libssl-iostream plugin loading fails. */
+	safe_memset(&dns_set, 0, sizeof(dns_set));
+	dns_set.dns_client_socket_path = "/var/run/dovecot/dns-client";
+	dns_set.timeout_msecs = 30*1000;
+	dns_set.idle_timeout_msecs = UINT_MAX;
+	dns_client = dns_client_init(&dns_set);
+
+	if (dns_client_connect(dns_client, &error) < 0)
+		i_fatal("Couldn't initialize DNS client: %s", error);
+
 	memset(&http_set, 0, sizeof(http_set));
-	http_set.dns_client_socket_path = "/var/run/dovecot/dns-client";
+	http_set.dns_client = dns_client;
 	http_set.ssl_allow_invalid_cert = TRUE;
 	http_set.ssl_ca_dir = "/etc/ssl/certs"; /* debian */
 	http_set.ssl_ca_file = "/etc/pki/tls/cert.pem"; /* redhat */
@@ -335,14 +365,10 @@ int main(int argc, char *argv[])
 	http_set.max_parallel_connections = 4;
 	http_set.max_pipelined_requests = 4;
 	http_set.max_redirects = 2;
+	http_set.request_timeout_msecs = 10*1000;
 	http_set.max_attempts = 1;
 	http_set.debug = TRUE;
 	http_set.rawlog_dir = "/tmp/http-test";
-
-	lib_init();
-
-	ioloop = io_loop_create();
-	io_loop_set_running(ioloop);
 
 	http_client = http_client_init(&http_set);
 
@@ -362,6 +388,8 @@ int main(int argc, char *argv[])
 
 	http_client_wait(http_client);
 	http_client_deinit(&http_client);
+
+	dns_client_deinit(&dns_client);
 
 	io_loop_destroy(&ioloop);
 	lib_deinit();

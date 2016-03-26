@@ -1,9 +1,8 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "array.h"
 #include "str.h"
-#include "var-expand.h"
 #include "userdb.h"
 #include "userdb-template.h"
 
@@ -67,6 +66,9 @@ void userdb_template_export(struct userdb_template *tmpl,
 	const char *const *args, *value;
 	unsigned int i, count;
 
+	if (userdb_template_is_empty(tmpl))
+		return;
+
 	str = t_str_new(256);
 	table = auth_request_get_var_expand_table(auth_request, NULL);
 
@@ -74,10 +76,11 @@ void userdb_template_export(struct userdb_template *tmpl,
 	i_assert((count % 2) == 0);
 	for (i = 0; i < count; i += 2) {
 		if (args[i+1] == NULL)
-			value = NULL;
+			value = "";
 		else {
 			str_truncate(str, 0);
-			var_expand(str, args[i+1], table);
+			auth_request_var_expand_with_table(str, args[i+1],
+				auth_request, table, NULL);
 			value = str_c(str);
 		}
 		auth_request_set_userdb_field(auth_request, args[i], value);

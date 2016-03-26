@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 /* @UNSAFE: whole file */
 
@@ -19,6 +19,7 @@ struct real_buffer {
 	unsigned int alloced:1;
 	unsigned int dynamic:1;
 };
+typedef int buffer_check_sizes[COMPILE_ERROR_IF_TRUE(sizeof(struct real_buffer) > sizeof(buffer_t)) ?1:1];
 
 static void buffer_alloc(struct real_buffer *buf, size_t size)
 {
@@ -93,6 +94,7 @@ buffer_check_limits(struct real_buffer *buf, size_t pos, size_t data_size)
 	i_assert(buf->used <= buf->alloc);
 }
 
+#undef buffer_create_from_data
 void buffer_create_from_data(buffer_t *buffer, void *data, size_t size)
 {
 	struct real_buffer *buf;
@@ -109,6 +111,7 @@ void buffer_create_from_data(buffer_t *buffer, void *data, size_t size)
 	memset(data, 0, size);
 }
 
+#undef buffer_create_from_const_data
 void buffer_create_from_const_data(buffer_t *buffer,
 				   const void *data, size_t size)
 {
@@ -317,6 +320,20 @@ size_t buffer_get_size(const buffer_t *_buf)
 	const struct real_buffer *buf = (const struct real_buffer *)_buf;
 
 	return buf->alloc;
+}
+
+size_t buffer_get_writable_size(const buffer_t *_buf)
+{
+	const struct real_buffer *buf = (const struct real_buffer *)_buf;
+
+	if (!buf->dynamic || buf->alloc == 0)
+		return buf->alloc;
+
+	/* we reserve +1 for str_c() NUL in buffer_check_limits(), so don't
+	   include that in our return value. otherwise the caller might
+	   increase the buffer's alloc size unnecessarily when it just wants
+	   to access the entire buffer. */
+	return buf->alloc-1;
 }
 
 bool buffer_cmp(const buffer_t *buf1, const buffer_t *buf2)

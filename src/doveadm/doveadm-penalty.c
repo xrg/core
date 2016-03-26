@@ -1,16 +1,15 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "net.h"
 #include "istream.h"
 #include "hash.h"
+#include "time-util.h"
 #include "doveadm.h"
+#include "doveadm-print.h"
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
-#include <time.h>
 
 struct penalty_line {
 	struct ip_addr ip;
@@ -36,28 +35,25 @@ static void penalty_parse_line(const char *line, struct penalty_line *line_r)
 	memset(line_r, 0, sizeof(*line_r));
 
 	(void)net_addr2ip(ident, &line_r->ip);
-	line_r->penalty = strtoul(penalty_str, NULL, 10);
-	line_r->last_penalty = strtoul(last_penalty_str, NULL, 10);
-	line_r->last_update = strtoul(last_update_str, NULL, 10);
+	if (str_to_uint(penalty_str, &line_r->penalty) < 0 ||
+	    str_to_time(last_penalty_str, &line_r->last_penalty) < 0 ||
+	    str_to_time(last_update_str, &line_r->last_update) < 0)
+		i_fatal("Read invalid penalty line: %s", line);
 }
 
 static void
 penalty_print_line(struct penalty_context *ctx,
 		   const struct penalty_line *line)
 {
-	const struct tm *tm;
-	char buf[10];
-
 	if (ctx->net_bits > 0) {
 		if (!net_is_in_network(&line->ip, &ctx->net_ip, ctx->net_bits))
 			return;
 	}
 
-	tm = localtime(&line->last_update);
-	strftime(buf, sizeof(buf), "%H:%M:%S", tm);
-
-	printf("%-16s %7u %s %s\n", net_ip2addr(&line->ip), line->penalty,
-	       unixdate2str(line->last_penalty), buf);
+	doveadm_print(net_ip2addr(&line->ip));
+	doveadm_print(dec2str(line->penalty));
+	doveadm_print(unixdate2str(line->last_penalty));
+	doveadm_print(t_strflocaltime("%H:%M:%S", line->last_update));
 }
 
 static void penalty_lookup(struct penalty_context *ctx)
@@ -70,10 +66,10 @@ static void penalty_lookup(struct penalty_context *ctx)
 
 	fd = doveadm_connect(ctx->anvil_path);
 	net_set_nonblock(fd, FALSE);
-
-	input = i_stream_create_fd(fd, (size_t)-1, TRUE);
 	if (write(fd, ANVIL_CMD, strlen(ANVIL_CMD)) < 0)
 		i_fatal("write(%s) failed: %m", ctx->anvil_path);
+
+	input = i_stream_create_fd_autoclose(&fd, (size_t)-1);
 	while ((line = i_stream_read_next_line(input)) != NULL) {
 		if (*line == '\0')
 			break;
@@ -90,35 +86,38 @@ static void penalty_lookup(struct penalty_context *ctx)
 	i_stream_destroy(&input);
 }
 
-static void cmd_penalty(int argc, char *argv[])
+static void cmd_penalty(struct doveadm_cmd_context *cctx)
 {
 	struct penalty_context ctx;
-	int c;
+	const char *netmask;
 
 	memset(&ctx, 0, sizeof(ctx));
-	ctx.anvil_path = t_strconcat(doveadm_settings->base_dir, "/anvil", NULL);
-	while ((c = getopt(argc, argv, "a:")) > 0) {
-		switch (c) {
-		case 'a':
-			ctx.anvil_path = optarg;
-			break;
-		default:
-			help(&doveadm_cmd_penalty);
+	if (!doveadm_cmd_param_str(cctx, "socket-path", &(ctx.anvil_path)))
+		ctx.anvil_path = t_strconcat(doveadm_settings->base_dir, "/anvil", NULL);
+
+	if (doveadm_cmd_param_str(cctx, "netmask", &netmask)) {
+		if (net_parse_range(netmask, &ctx.net_ip, &ctx.net_bits) != 0) {
+			doveadm_exit_code = EX_USAGE;
+			i_error("Invalid netmask '%s' given", netmask);
+			return;
 		}
 	}
 
-	if (argv[1] != NULL) {
-		if (net_parse_range(argv[1], &ctx.net_ip, &ctx.net_bits) == 0)
-			argv++;
-	}
-	if (argv[1] != NULL)
-		help(&doveadm_cmd_penalty);
+	doveadm_print_init(DOVEADM_PRINT_TYPE_TABLE);
+	doveadm_print_header_simple("IP");
+	doveadm_print_header_simple("penalty");
+	doveadm_print_header_simple("last_penalty");
+	doveadm_print_header_simple("last_update");
 
-	fprintf(stderr, "%-16s penalty last_penalty        last_update\n", "IP");
 	penalty_lookup(&ctx);
 }
 
-struct doveadm_cmd doveadm_cmd_penalty = {
-	cmd_penalty, "penalty",
-	"[-a <anvil socket path>] [<ip/bits>]"
+struct doveadm_cmd_ver2 doveadm_cmd_penalty_ver2 = {
+	.name = "penalty",
+	.cmd = cmd_penalty,
+	.usage = "[-a <anvil socket path>] [<ip/bits>]",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_PARAM('a',"socket-path", CMD_PARAM_STR,0)
+DOVEADM_CMD_PARAM('\0',"netmask", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };

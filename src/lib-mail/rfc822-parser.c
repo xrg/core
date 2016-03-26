@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -164,9 +164,11 @@ int rfc822_parse_dot_atom(struct rfc822_parser_context *ctx, string_t *str)
 	if (ctx->data == ctx->end || !IS_ATEXT(*ctx->data))
 		return -1;
 
-	for (start = ctx->data++; ctx->data != ctx->end; ctx->data++) {
-		if (IS_ATEXT(*ctx->data))
+	for (start = ctx->data++; ctx->data != ctx->end; ) {
+		if (IS_ATEXT(*ctx->data)) {
+			ctx->data++;
 			continue;
+		}
 
 		str_append_n(str, start, ctx->data - start);
 
@@ -407,7 +409,6 @@ int rfc822_parse_content_param(struct rfc822_parser_context *ctx,
 		/* broken / no value */
 	} else if (*ctx->data == '"') {
 		ret = rfc822_parse_quoted_string(ctx, tmp);
-		(void)str_unescape(str_c_modifiable(tmp) + value_pos);
 	} else if (ctx->data != ctx->end && *ctx->data == '=') {
 		/* workaround for broken input:
 		   name==?utf-8?b?...?= */

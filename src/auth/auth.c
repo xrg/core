@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "array.h"
@@ -7,13 +7,21 @@
 #include "mech.h"
 #include "userdb.h"
 #include "passdb.h"
+#include "passdb-template.h"
+#include "userdb-template.h"
 #include "auth.h"
 
-struct auth_userdb_settings userdb_dummy_set = {
+static const struct auth_userdb_settings userdb_dummy_set = {
+	.name = "",
 	.driver = "static",
 	.args = "",
 	.default_fields = "",
-	.override_fields = ""
+	.override_fields = "",
+
+	.skip = "never",
+	.result_success = "return-ok",
+	.result_failure = "continue",
+	.result_internalfail = "continue"
 };
 
 static ARRAY(struct auth *) auths;
@@ -29,20 +37,31 @@ static enum auth_passdb_skip auth_passdb_skip_parse(const char *str)
 	i_unreached();
 }
 
-static enum auth_passdb_rule auth_passdb_rule_parse(const char *str)
+static enum auth_userdb_skip auth_userdb_skip_parse(const char *str)
+{
+	if (strcmp(str, "never") == 0)
+		return AUTH_USERDB_SKIP_NEVER;
+	if (strcmp(str, "found") == 0)
+		return AUTH_USERDB_SKIP_FOUND;
+	if (strcmp(str, "notfound") == 0)
+		return AUTH_USERDB_SKIP_NOTFOUND;
+	i_unreached();
+}
+
+static enum auth_db_rule auth_db_rule_parse(const char *str)
 {
 	if (strcmp(str, "return") == 0)
-		return AUTH_PASSDB_RULE_RETURN;
+		return AUTH_DB_RULE_RETURN;
 	if (strcmp(str, "return-ok") == 0)
-		return AUTH_PASSDB_RULE_RETURN_OK;
+		return AUTH_DB_RULE_RETURN_OK;
 	if (strcmp(str, "return-fail") == 0)
-		return AUTH_PASSDB_RULE_RETURN_FAIL;
+		return AUTH_DB_RULE_RETURN_FAIL;
 	if (strcmp(str, "continue") == 0)
-		return AUTH_PASSDB_RULE_CONTINUE;
+		return AUTH_DB_RULE_CONTINUE;
 	if (strcmp(str, "continue-ok") == 0)
-		return AUTH_PASSDB_RULE_CONTINUE_OK;
+		return AUTH_DB_RULE_CONTINUE_OK;
 	if (strcmp(str, "continue-fail") == 0)
-		return AUTH_PASSDB_RULE_CONTINUE_FAIL;
+		return AUTH_DB_RULE_CONTINUE_FAIL;
 	i_unreached();
 }
 
@@ -56,20 +75,29 @@ auth_passdb_preinit(struct auth *auth, const struct auth_passdb_settings *set,
 	auth_passdb->set = set;
 	auth_passdb->skip = auth_passdb_skip_parse(set->skip);
 	auth_passdb->result_success =
-		auth_passdb_rule_parse(set->result_success);
+		auth_db_rule_parse(set->result_success);
 	auth_passdb->result_failure =
-		auth_passdb_rule_parse(set->result_failure);
+		auth_db_rule_parse(set->result_failure);
 	auth_passdb->result_internalfail =
-		auth_passdb_rule_parse(set->result_internalfail);
+		auth_db_rule_parse(set->result_internalfail);
+
+	auth_passdb->default_fields_tmpl =
+		passdb_template_build(auth->pool, set->default_fields);
+	auth_passdb->override_fields_tmpl =
+		passdb_template_build(auth->pool, set->override_fields);
 
 	/* for backwards compatibility: */
 	if (set->pass)
-		auth_passdb->result_success = AUTH_PASSDB_RULE_CONTINUE;
+		auth_passdb->result_success = AUTH_DB_RULE_CONTINUE;
 
 	for (dest = passdbs; *dest != NULL; dest = &(*dest)->next) ;
 	*dest = auth_passdb;
 
 	auth_passdb->passdb = passdb_preinit(auth->pool, set);
+	/* make sure any %variables in default_fields exist in cache_key */
+	auth_passdb->cache_key =
+		p_strconcat(auth->pool, auth_passdb->passdb->default_cache_key,
+			    set->default_fields, NULL);
 }
 
 static void
@@ -79,21 +107,35 @@ auth_userdb_preinit(struct auth *auth, const struct auth_userdb_settings *set)
 
 	auth_userdb = p_new(auth->pool, struct auth_userdb, 1);
 	auth_userdb->set = set;
+	auth_userdb->skip = auth_userdb_skip_parse(set->skip);
+	auth_userdb->result_success =
+		auth_db_rule_parse(set->result_success);
+	auth_userdb->result_failure =
+		auth_db_rule_parse(set->result_failure);
+	auth_userdb->result_internalfail =
+		auth_db_rule_parse(set->result_internalfail);
+
+	auth_userdb->default_fields_tmpl =
+		userdb_template_build(auth->pool, set->driver,
+				      set->default_fields);
+	auth_userdb->override_fields_tmpl =
+		userdb_template_build(auth->pool, set->driver,
+				      set->override_fields);
 
 	for (dest = &auth->userdbs; *dest != NULL; dest = &(*dest)->next) ;
 	*dest = auth_userdb;
 
 	auth_userdb->userdb = userdb_preinit(auth->pool, set);
+	/* make sure any %variables in default_fields exist in cache_key */
+	auth_userdb->cache_key =
+		p_strconcat(auth->pool, auth_userdb->userdb->default_cache_key,
+			    set->default_fields, NULL);
 }
 
-static bool auth_passdb_list_have_verify_plain(struct auth *auth)
+static bool auth_passdb_list_have_verify_plain(const struct auth *auth)
 {
-	struct auth_passdb *passdb;
+	const struct auth_passdb *passdb;
 
-	for (passdb = auth->masterdbs; passdb != NULL; passdb = passdb->next) {
-		if (passdb->passdb->iface.verify_plain != NULL)
-			return TRUE;
-	}
 	for (passdb = auth->passdbs; passdb != NULL; passdb = passdb->next) {
 		if (passdb->passdb->iface.verify_plain != NULL)
 			return TRUE;
@@ -101,14 +143,10 @@ static bool auth_passdb_list_have_verify_plain(struct auth *auth)
 	return FALSE;
 }
 
-static bool auth_passdb_list_have_lookup_credentials(struct auth *auth)
+static bool auth_passdb_list_have_lookup_credentials(const struct auth *auth)
 {
-	struct auth_passdb *passdb;
+	const struct auth_passdb *passdb;
 
-	for (passdb = auth->masterdbs; passdb != NULL; passdb = passdb->next) {
-		if (passdb->passdb->iface.lookup_credentials != NULL)
-			return TRUE;
-	}
 	for (passdb = auth->passdbs; passdb != NULL; passdb = passdb->next) {
 		if (passdb->passdb->iface.lookup_credentials != NULL)
 			return TRUE;
@@ -116,9 +154,9 @@ static bool auth_passdb_list_have_lookup_credentials(struct auth *auth)
 	return FALSE;
 }
 
-static int auth_passdb_list_have_set_credentials(struct auth *auth)
+static int auth_passdb_list_have_set_credentials(const struct auth *auth)
 {
-	struct auth_passdb *passdb;
+	const struct auth_passdb *passdb;
 
 	for (passdb = auth->masterdbs; passdb != NULL; passdb = passdb->next) {
 		if (passdb->passdb->iface.set_credentials != NULL)
@@ -132,7 +170,7 @@ static int auth_passdb_list_have_set_credentials(struct auth *auth)
 }
 
 static bool
-auth_mech_verify_passdb(struct auth *auth, struct mech_module_list *list)
+auth_mech_verify_passdb(const struct auth *auth, const struct mech_module_list *list)
 {
 	switch (list->module.passdb_need) {
 	case MECH_PASSDB_NEED_NOTHING:
@@ -156,9 +194,9 @@ auth_mech_verify_passdb(struct auth *auth, struct mech_module_list *list)
 	return TRUE;
 }
 
-static void auth_mech_list_verify_passdb(struct auth *auth)
+static void auth_mech_list_verify_passdb(const struct auth *auth)
 {
-	struct mech_module_list *list;
+	const struct mech_module_list *list;
 
 	for (list = auth->reg->modules; list != NULL; list = list->next) {
 		if (!auth_mech_verify_passdb(auth, list))
@@ -203,6 +241,13 @@ auth_preinit(const struct auth_settings *set, const char *service, pool_t pool,
 		if (passdbs[i]->master)
 			continue;
 
+		/* passdb { skip=unauthenticated } as the first passdb doesn't
+		   make sense, since user is never authenticated at that point.
+		   skip over them silently. */
+		if (auth->passdbs == NULL &&
+		    auth_passdb_skip_parse(passdbs[i]->skip) == AUTH_PASSDB_SKIP_UNAUTHENTICATED)
+			continue;
+
 		auth_passdb_preinit(auth, passdbs[i], &auth->passdbs);
 		passdb_count++;
 		last_passdb = i;
@@ -212,6 +257,11 @@ auth_preinit(const struct auth_settings *set, const char *service, pool_t pool,
 
 	for (i = 0; i < db_count; i++) {
 		if (!passdbs[i]->master)
+			continue;
+
+		/* skip skip=unauthenticated, as explained above */
+		if (auth->masterdbs == NULL &&
+		    auth_passdb_skip_parse(passdbs[i]->skip) == AUTH_PASSDB_SKIP_UNAUTHENTICATED)
 			continue;
 
 		if (passdbs[i]->deny)
@@ -236,15 +286,23 @@ auth_preinit(const struct auth_settings *set, const char *service, pool_t pool,
 	return auth;
 }
 
+static void auth_passdb_init(struct auth_passdb *passdb)
+{
+	passdb_init(passdb->passdb);
+
+	i_assert(passdb->passdb->default_pass_scheme != NULL ||
+		 passdb->cache_key == NULL);
+}
+
 static void auth_init(struct auth *auth)
 {
 	struct auth_passdb *passdb;
 	struct auth_userdb *userdb;
 
 	for (passdb = auth->masterdbs; passdb != NULL; passdb = passdb->next)
-		passdb_init(passdb->passdb);
+		auth_passdb_init(passdb);
 	for (passdb = auth->passdbs; passdb != NULL; passdb = passdb->next)
-		passdb_init(passdb->passdb);
+		auth_passdb_init(passdb);
 	for (userdb = auth->userdbs; userdb != NULL; userdb = userdb->next)
 		userdb_init(userdb->userdb);
 }

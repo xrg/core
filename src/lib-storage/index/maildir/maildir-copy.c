@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -12,7 +12,6 @@
 #include "index-mail.h"
 #include "mail-copy.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -34,9 +33,9 @@ static int do_hardlink(struct maildir_mailbox *mbox, const char *path,
 		if (errno == ENOENT)
 			return 0;
 
-		if (ENOSPACE(errno)) {
+		if (ENOQUOTA(errno)) {
 			mail_storage_set_error(&mbox->storage->storage,
-				MAIL_ERROR_NOSPACE, MAIL_ERRSTR_NO_SPACE);
+				MAIL_ERROR_NOQUOTA, MAIL_ERRSTR_NO_QUOTA);
 			return -1;
 		}
 
@@ -92,7 +91,7 @@ maildir_copy_hardlink(struct mail_save_context *ctx, struct mail *mail)
 			return -1;
 	} else {
 		/* raw / lda */
-		if (mail_get_special(mail, MAIL_FETCH_UIDL_FILE_NAME,
+		if (mail_get_special(mail, MAIL_FETCH_STORAGE_ID,
 				     &path) < 0 || *path == '\0')
 			return 0;
 		if (do_hardlink(dest_mbox, path, &do_ctx) < 0)

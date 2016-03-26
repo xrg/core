@@ -1,9 +1,8 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "test-lib.h"
 #include "buffer.h"
 
-#include <stdlib.h>
 
 void test_buffer(void)
 {
@@ -18,10 +17,9 @@ void test_buffer(void)
 
 	buf = buffer_create_dynamic(default_pool, 1);
 	for (i = 0; i < BUF_TEST_SIZE; i++)
-		testdata[i] = random();
+		testdata[i] = rand();
 	memset(shadowbuf, 0, sizeof(shadowbuf));
 
-	srand(1);
 	shadowbuf_size = 0;
 	for (i = 0; i < BUF_TEST_COUNT; i++) {
 		if (buf->used == BUF_TEST_SIZE) {
@@ -98,7 +96,7 @@ void test_buffer(void)
 			}
 			break;
 		case 4:
-			if (shadowbuf_size == 0)
+			if (shadowbuf_size <= 1)
 				break;
 			pos = rand() % (shadowbuf_size-1); /* dest */
 			pos2 = rand() % (shadowbuf_size-1); /* source */

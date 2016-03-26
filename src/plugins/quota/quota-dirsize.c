@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 /* Quota reporting based on simply summing sizes of all files in mailbox
    together. */
@@ -8,7 +8,6 @@
 #include "str.h"
 #include "quota-private.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>

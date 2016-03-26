@@ -25,18 +25,20 @@
 
 static int wildcard_match_int(const char *data, const char *mask, int icase)
 {
-  const char *ma = mask, *na = data, *lsm = 0, *lsn = 0;
+  const char *ma = mask, *na = data, *lsm = NULL, *lsn = NULL;
   int match = 1;
   int sofar = 0;
 
-  /* null strings should never match */
-  if ((ma == 0) || (na == 0) || (!*ma) || (!*na))
-    return NOMATCH;
+  if (na[0] == '\0') {
+	  /* empty string can match only "*" wildcard(s) */
+	  while (ma[0] == '*') ma++;
+	  return ma[0] == '\0' ? MATCH : NOMATCH;
+  }
   /* find the end of each string */
-  while (*(++mask));
-  mask--;
-  while (*(++data));
-  data--;
+  while (*(mask++));
+  mask-=2;
+  while (*(data++));
+  data-=2;
 
   while (data >= na) {
     /* If the mask runs out of chars before the string, fall back on
@@ -46,7 +48,7 @@ static int wildcard_match_int(const char *data, const char *mask, int icase)
         data = --lsn;
         mask = lsm;
         if (data < na)
-          lsm = 0;
+          lsm = NULL;
         sofar = 0;
       }
       else
@@ -81,7 +83,7 @@ static int wildcard_match_int(const char *data, const char *mask, int icase)
       data = --lsn;
       mask = lsm;
       if (data < na)
-        lsm = 0;                /* Rewind to saved pos */
+        lsm = NULL;                /* Rewind to saved pos */
       sofar = 0;
       continue;                 /* Next char, please */
     }

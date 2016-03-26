@@ -1,19 +1,23 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
+#include "net.h"
+#include "str.h"
+#include "strescape.h"
+#include "write-full.h"
 #include "mail-search-build.h"
 #include "mail-storage-private.h"
 #include "mailbox-list-private.h"
 #include "../virtual/virtual-storage.h"
 #include "fts-api-private.h"
+#include "fts-tokenizer.h"
 #include "fts-indexer.h"
 #include "fts-build-mail.h"
 #include "fts-search-serialize.h"
 #include "fts-plugin.h"
 #include "fts-storage.h"
 
-#include <stdlib.h>
 
 #define FTS_CONTEXT(obj) \
 	MODULE_CONTEXT(obj, fts_storage_module)
@@ -21,6 +25,9 @@
 	MODULE_CONTEXT(obj, fts_mail_module)
 #define FTS_LIST_CONTEXT(obj) \
 	MODULE_CONTEXT(obj, fts_mailbox_list_module)
+
+#define INDEXER_SOCKET_NAME "indexer"
+#define INDEXER_HANDSHAKE "VERSION\tindexer\t1\t0\n"
 
 struct fts_mailbox_list {
 	union mailbox_list_module_context module_ctx;
@@ -43,6 +50,7 @@ struct fts_transaction_context {
 	uint32_t highest_virtual_uid;
 
 	unsigned int precached:1;
+	unsigned int mails_saved:1;
 	unsigned int failed:1;
 };
 
@@ -64,8 +72,10 @@ static int fts_mailbox_get_last_cached_seq(struct mailbox *box, uint32_t *seq_r)
 	struct fts_mailbox_list *flist = FTS_LIST_CONTEXT(box->list);
 	uint32_t seq1, seq2, last_uid;
 
-	if (fts_backend_get_last_uid(flist->backend, box, &last_uid) < 0)
+	if (fts_backend_get_last_uid(flist->backend, box, &last_uid) < 0) {
+		mail_storage_set_internal_error(box->storage);
 		return -1;
+	}
 
 	if (last_uid == 0)
 		*seq_r = 0;
@@ -112,20 +122,21 @@ static void fts_scores_unref(struct fts_scores **_scores)
 static void fts_try_build_init(struct mail_search_context *ctx,
 			       struct fts_search_context *fctx)
 {
+	int ret;
+
 	i_assert(!fts_backend_is_updating(fctx->backend));
 
-	switch (fts_indexer_init(fctx->backend, ctx->transaction->box,
-				 &fctx->indexer_ctx)) {
-	case -1:
-		break;
-	case 0:
+	ret = fts_indexer_init(fctx->backend, ctx->transaction->box,
+			       &fctx->indexer_ctx);
+	if (ret < 0)
+		return;
+
+	if (ret == 0) {
 		/* the index was up to date */
 		fts_search_lookup(fctx);
-		break;
-	case 1:
+	} else {
 		/* hide "searching" notifications while building index */
 		ctx->progress_hidden = TRUE;
-		break;
 	}
 }
 
@@ -145,6 +156,25 @@ static bool fts_want_build_args(const struct mail_search_arg *args)
 		case SEARCH_BODY:
 		case SEARCH_TEXT:
 			return TRUE;
+		default:
+			break;
+		}
+	}
+	return FALSE;
+}
+
+static bool fts_args_have_fuzzy(const struct mail_search_arg *args)
+{
+	for (; args != NULL; args = args->next) {
+		if (args->fuzzy)
+			return TRUE;
+		switch (args->type) {
+		case SEARCH_OR:
+		case SEARCH_SUB:
+		case SEARCH_INTHREAD:
+			if (fts_args_have_fuzzy(args->value.subargs))
+				return TRUE;
+			break;
 		default:
 			break;
 		}
@@ -180,12 +210,21 @@ fts_mailbox_search_init(struct mailbox_transaction_context *t,
 	fctx->orig_matches = buffer_create_dynamic(default_pool, 64);
 	fctx->virtual_mailbox =
 		strcmp(t->box->storage->name, VIRTUAL_STORAGE_NAME) == 0;
+	fctx->enforced =
+		mail_user_plugin_getenv(t->box->storage->user,
+					"fts_enforced") != NULL;
 	i_array_init(&fctx->levels, 8);
 	fctx->scores = i_new(struct fts_scores, 1);
 	fctx->scores->refcount = 1;
 	i_array_init(&fctx->scores->score_map, 64);
 	MODULE_CONTEXT_SET(ctx, fts_storage_module, fctx);
 
+	/* FIXME: we'll assume that all the args are fuzzy. not good,
+	   but would require much more work to fix it. */
+	if (!fts_args_have_fuzzy(args->args) &&
+	    mail_user_plugin_getenv(t->box->storage->user,
+				    "fts_no_autofuzzy") != NULL)
+		fctx->flags |= FTS_LOOKUP_FLAG_NO_AUTO_FUZZY;
 	/* transaction contains the last search's scores. they can be
 	   queried later with mail_get_special() */
 	if (ft->scores != NULL)
@@ -193,7 +232,7 @@ fts_mailbox_search_init(struct mailbox_transaction_context *t,
 	ft->scores = fctx->scores;
 	ft->scores->refcount++;
 
-	if (fts_want_build_args(args->args))
+	if (fctx->enforced || fts_want_build_args(args->args))
 		fts_try_build_init(ctx, fctx);
 	else
 		fts_search_lookup(fctx);
@@ -235,6 +274,13 @@ fts_mailbox_search_next_nonblock(struct mail_search_context *ctx,
 {
 	struct fts_mailbox *fbox = FTS_CONTEXT(ctx->transaction->box);
 	struct fts_search_context *fctx = FTS_CONTEXT(ctx);
+	struct fts_transaction_context *ft = FTS_CONTEXT(ctx->transaction);
+
+	if (fctx == NULL && ft->failed) {
+		/* precaching already failed - stop now instead of potentially
+		   going through the same failure for all the mails */
+		return FALSE;
+	}
 
 	if (fctx != NULL && fctx->indexer_ctx != NULL) {
 		/* this command is still building the indexes */
@@ -247,6 +293,8 @@ fts_mailbox_search_next_nonblock(struct mail_search_context *ctx,
 			return FALSE;
 		}
 	}
+	if (fctx != NULL && !fctx->fts_lookup_success && fctx->enforced)
+		return FALSE;
 
 	return fbox->module_ctx.super.
 		search_next_nonblock(ctx, mail_r, tryagain_r);
@@ -321,12 +369,21 @@ static int fts_mailbox_search_deinit(struct mail_search_context *ctx)
 		}
 		if (fctx->indexing_timed_out)
 			ret = -1;
+		if (!fctx->fts_lookup_success && fctx->enforced) {
+			/* FTS lookup failed and we didn't want to fallback to
+			   opening all the mails and searching manually */
+			mail_storage_set_internal_error(ctx->transaction->box->storage);
+			ret = -1;
+		}
 
 		buffer_free(&fctx->orig_matches);
 		array_free(&fctx->levels);
 		pool_unref(&fctx->result_pool);
 		fts_scores_unref(&fctx->scores);
 		i_free(fctx);
+	} else {
+		if (ft->failed)
+			ret = -1;
 	}
 	if (fbox->module_ctx.super.search_deinit(ctx) < 0)
 		ret = -1;
@@ -384,6 +441,7 @@ fts_mail_precache_range(struct mailbox_transaction_context *trans,
 
 	while (mailbox_search_next(ctx, &mail)) {
 		if (fts_build_mail(update_ctx, mail) < 0) {
+			mail_storage_set_internal_error(trans->box->storage);
 			ret = -1;
 			break;
 		}
@@ -440,8 +498,10 @@ static void fts_mail_index(struct mail *_mail)
 
 	if (ft->next_index_seq == _mail->seq) {
 		fts_backend_update_set_mailbox(flist->update_ctx, _mail->box);
-		if (fts_build_mail(flist->update_ctx, _mail) < 0)
+		if (fts_build_mail(flist->update_ctx, _mail) < 0) {
+			mail_storage_set_internal_error(_mail->box->storage);
 			ft->failed = TRUE;
+		}
 		ft->next_index_seq = _mail->seq + 1;
 	}
 }
@@ -527,17 +587,66 @@ static void fts_transaction_rollback(struct mailbox_transaction_context *t)
 	fbox->module_ctx.super.transaction_rollback(t);
 }
 
+static void fts_queue_index(struct mailbox *box)
+{
+	struct mail_user *user = box->storage->user;
+	string_t *str = t_str_new(256);
+	const char *path, *value;
+	unsigned int max_recent_msgs;
+	int fd;
+
+	path = t_strconcat(user->set->base_dir, "/"INDEXER_SOCKET_NAME, NULL);
+	fd = net_connect_unix(path);
+	if (fd == -1) {
+		i_error("net_connect_unix(%s) failed: %m", path);
+		return;
+	}
+
+	value = mail_user_plugin_getenv(user, "fts_autoindex_max_recent_msgs");
+	if (value == NULL || str_to_uint(value, &max_recent_msgs) < 0)
+		max_recent_msgs = 0;
+
+	str_append(str, INDEXER_HANDSHAKE);
+	str_append(str, "APPEND\t0\t");
+	str_append_tabescaped(str, user->username);
+	str_append_c(str, '\t');
+	str_append_tabescaped(str, box->vname);
+	str_printfa(str, "\t%u", max_recent_msgs);
+	str_append_c(str, '\t');
+	str_append_tabescaped(str, box->storage->user->session_id);
+	str_append_c(str, '\n');
+	if (write_full(fd, str_data(str), str_len(str)) < 0)
+		i_error("write(%s) failed: %m", path);
+	i_close_fd(&fd);
+}
+
 static int
 fts_transaction_commit(struct mailbox_transaction_context *t,
 		       struct mail_transaction_commit_changes *changes_r)
 {
+	struct fts_transaction_context *ft = FTS_CONTEXT(t);
 	struct fts_mailbox *fbox = FTS_CONTEXT(t->box);
-	int ret;
+	struct mailbox *box = t->box;
+	bool autoindex;
+	int ret = 0;
 
-	ret = fts_transaction_end(t);
+	autoindex = ft->mails_saved &&
+		mail_user_plugin_getenv(box->storage->user,
+					"fts_autoindex") != NULL;
+
+	if (fts_transaction_end(t) < 0) {
+		mail_storage_set_error(t->box->storage, MAIL_ERROR_TEMP,
+				       "FTS transaction commit failed");
+		ret = -1;
+	}
 	if (fbox->module_ctx.super.transaction_commit(t, changes_r) < 0)
 		ret = -1;
-	return ret;
+	if (ret < 0)
+		return -1;
+
+	if (autoindex)
+		fts_queue_index(box);
+	return 0;
 }
 
 static void fts_mailbox_sync_notify(struct mailbox *box, uint32_t uid,
@@ -596,6 +705,28 @@ static int fts_sync_deinit(struct mailbox_sync_context *ctx,
 	return ret;
 }
 
+static int fts_save_finish(struct mail_save_context *ctx)
+{
+	struct fts_transaction_context *ft = FTS_CONTEXT(ctx->transaction);
+	struct fts_mailbox *fbox = FTS_CONTEXT(ctx->transaction->box);
+
+	if (fbox->module_ctx.super.save_finish(ctx) < 0)
+		return -1;
+	ft->mails_saved = TRUE;
+	return 0;
+}
+
+static int fts_copy(struct mail_save_context *ctx, struct mail *mail)
+{
+	struct fts_transaction_context *ft = FTS_CONTEXT(ctx->transaction);
+	struct fts_mailbox *fbox = FTS_CONTEXT(ctx->transaction->box);
+
+	if (fbox->module_ctx.super.copy(ctx, mail) < 0)
+		return -1;
+	ft->mails_saved = TRUE;
+	return 0;
+}
+
 void fts_mailbox_allocated(struct mailbox *box)
 {
 	struct fts_mailbox_list *flist = FTS_LIST_CONTEXT(box->list);
@@ -619,6 +750,8 @@ void fts_mailbox_allocated(struct mailbox *box)
 	v->transaction_commit = fts_transaction_commit;
 	v->sync_notify = fts_mailbox_sync_notify;
 	v->sync_deinit = fts_sync_deinit;
+	v->save_finish = fts_save_finish;
+	v->copy = fts_copy;
 
 	MODULE_CONTEXT_SET(box, fts_storage_module, fbox);
 }
@@ -631,17 +764,13 @@ static void fts_mailbox_list_deinit(struct mailbox_list *list)
 	flist->module_ctx.super.deinit(list);
 }
 
-void fts_mailbox_list_created(struct mailbox_list *list)
+
+
+static void
+fts_mailbox_list_init(struct mailbox_list *list, const char *name)
 {
 	struct fts_backend *backend;
-	const char *name, *path, *error;
-
-	name = mail_user_plugin_getenv(list->ns->user, "fts");
-	if (name == NULL) {
-		if (list->mail_set->mail_debug)
-			i_debug("fts: No fts setting - plugin disabled");
-		return;
-	}
+	const char *path, *error;
 
 	if (!mailbox_list_get_root_path(list, MAILBOX_LIST_PATH_TYPE_INDEX, &path)) {
 		if (list->mail_set->mail_debug) {
@@ -668,6 +797,22 @@ void fts_mailbox_list_created(struct mailbox_list *list)
 		v->deinit = fts_mailbox_list_deinit;
 		MODULE_CONTEXT_SET(list, fts_mailbox_list_module, flist);
 	}
+}
+
+void fts_mail_namespaces_added(struct mail_namespace *namespaces)
+{
+	struct mail_namespace *ns;
+	const char *name;
+
+	name = mail_user_plugin_getenv(namespaces->user, "fts");
+	if (name == NULL) {
+		if (namespaces->user->mail_debug)
+			i_debug("fts: No fts setting - plugin disabled");
+		return;
+	}
+
+	for (ns = namespaces; ns != NULL; ns = ns->next)
+		fts_mailbox_list_init(ns->list, name);
 }
 
 struct fts_backend *fts_mailbox_backend(struct mailbox *box)

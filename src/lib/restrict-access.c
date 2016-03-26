@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #define _GNU_SOURCE /* setresgid() */
 #include <stdio.h> /* for AIX */
@@ -11,7 +11,6 @@
 #include "env-util.h"
 #include "ipwd.h"
 
-#include <stdlib.h>
 #include <time.h>
 #ifdef HAVE_PR_SET_DUMPABLE
 #  include <sys/prctl.h>

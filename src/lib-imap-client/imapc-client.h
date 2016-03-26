@@ -1,6 +1,8 @@
 #ifndef IMAPC_CLIENT_H
 #define IMAPC_CLIENT_H
 
+#include "net.h"
+
 /* IMAP RFC defines this to be at least 30 minutes. */
 #define IMAPC_DEFAULT_MAX_IDLE_TIME (60*29)
 
@@ -23,6 +25,8 @@ enum imapc_capability {
 	IMAPC_CAPABILITY_CONDSTORE	= 0x100,
 	IMAPC_CAPABILITY_NAMESPACE	= 0x200,
 	IMAPC_CAPABILITY_UNSELECT	= 0x400,
+	IMAPC_CAPABILITY_ESEARCH	= 0x800,
+	IMAPC_CAPABILITY_WITHIN		= 0x1000,
 
 	IMAPC_CAPABILITY_IMAP4REV1	= 0x40000000
 };
@@ -53,13 +57,23 @@ enum imapc_client_ssl_mode {
 #define IMAPC_DEFAULT_CONNECT_TIMEOUT_MSECS (1000*30)
 #define IMAPC_DEFAULT_COMMAND_TIMEOUT_MSECS (1000*60*5)
 
+struct imapc_throttling_settings {
+	unsigned int init_msecs;
+	unsigned int max_msecs;
+	unsigned int shrink_min_msecs;
+};
+
 struct imapc_client_settings {
 	const char *host;
-	unsigned int port;
+	in_port_t port;
 
 	const char *master_user;
 	const char *username;
 	const char *password;
+	/* Space-separated list of SASL mechanisms to try (in the specified
+	   order). The default is to use only LOGIN command or SASL PLAIN. */
+	const char *sasl_mechanisms;
+	bool use_proxyauth; /* Use Sun/Oracle PROXYAUTH command */
 	unsigned int max_idle_time;
 
 	const char *dns_client_socket_path;
@@ -78,6 +92,8 @@ struct imapc_client_settings {
 	/* Timeout for IMAP commands. Reset every time more data is being
 	   sent or received. 0 = default. */
 	unsigned int cmd_timeout_msecs;
+
+	struct imapc_throttling_settings throttle_set;
 };
 
 struct imapc_command_reply {
@@ -146,11 +162,14 @@ imapc_client_cmd(struct imapc_client *client,
 		 imapc_command_callback_t *callback, void *context);
 void imapc_command_set_flags(struct imapc_command *cmd,
 			     enum imapc_command_flags flags);
+bool imapc_command_connection_is_selected(struct imapc_command *cmd);
 void imapc_command_send(struct imapc_command *cmd, const char *cmd_str);
 void imapc_command_sendf(struct imapc_command *cmd, const char *cmd_fmt, ...)
 	ATTR_FORMAT(2, 3);
 void imapc_command_sendvf(struct imapc_command *cmd,
 			  const char *cmd_fmt, va_list args) ATTR_FORMAT(2, 0);
+const char *imapc_command_get_tag(struct imapc_command *cmd);
+void imapc_command_abort(struct imapc_command **cmd);
 
 void imapc_client_register_untagged(struct imapc_client *client,
 				    imapc_untagged_callback_t *callback,
@@ -167,6 +186,7 @@ void imapc_client_mailbox_set_reopen_cb(struct imapc_client_mailbox *box,
 					void (*callback)(void *context),
 					void *context);
 void imapc_client_mailbox_close(struct imapc_client_mailbox **box);
+bool imapc_client_mailbox_can_reconnect(struct imapc_client_mailbox *box);
 void imapc_client_mailbox_reconnect(struct imapc_client_mailbox *box);
 struct imapc_command *
 imapc_client_mailbox_cmd(struct imapc_client_mailbox *box,

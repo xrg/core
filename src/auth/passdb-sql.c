@@ -1,19 +1,15 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "passdb.h"
 
 #ifdef PASSDB_SQL
 
-#include "str.h"
-#include "strescape.h"
-#include "var-expand.h"
 #include "safe-memset.h"
 #include "password-scheme.h"
 #include "auth-cache.h"
 #include "db-sql.h"
 
-#include <stdlib.h>
 #include <string.h>
 
 struct sql_passdb_module {
@@ -74,18 +70,18 @@ static void sql_query_callback(struct sql_result *result,
 		db_sql_success(module->conn);
 	if (ret < 0) {
 		if (!module->conn->default_password_query) {
-			auth_request_log_error(auth_request, "sql",
+			auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 					       "Password query failed: %s",
 					       sql_result_get_error(result));
 		} else {
-			auth_request_log_error(auth_request, "sql",
+			auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 				"Password query failed: %s "
 				"(using built-in default password_query: %s)",
 				sql_result_get_error(result),
 				module->conn->set.password_query);
 		}
 	} else if (ret == 0) {
-		auth_request_log_unknown_user(auth_request, "sql");
+		auth_request_log_unknown_user(auth_request, AUTH_SUBSYS_DB);
 		passdb_result = PASSDB_RESULT_USER_UNKNOWN;
 	} else {
 		sql_query_save_results(result, sql_request);
@@ -96,15 +92,15 @@ static void sql_query_callback(struct sql_result *result,
 		   password. */
 		if (sql_result_find_field(result, "password") < 0 &&
 		    sql_result_find_field(result, "password_noscheme") < 0) {
-			auth_request_log_error(auth_request, "sql",
+			auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 				"Password query must return a field named "
 				"'password'");
 		} else if (sql_result_next_row(result) > 0) {
-			auth_request_log_error(auth_request, "sql",
+			auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 				"Password query returned multiple matches");
 		} else if (auth_request->passdb_password == NULL &&
 			   !auth_fields_exists(auth_request->extra_fields, "nopassword")) {
-			auth_request_log_info(auth_request, "sql",
+			auth_request_log_info(auth_request, AUTH_SUBSYS_DB,
 				"Empty password returned without nopassword");
 			passdb_result = PASSDB_RESULT_PASSWORD_MISMATCH;
 		} else {
@@ -136,7 +132,7 @@ static void sql_query_callback(struct sql_result *result,
 
 	ret = auth_request_password_verify(auth_request,
 					   auth_request->mech_password,
-					   password, scheme, "sql");
+					   password, scheme, AUTH_SUBSYS_DB);
 
 	sql_request->callback.verify_plain(ret > 0 ? PASSDB_RESULT_OK :
 					   PASSDB_RESULT_PASSWORD_MISMATCH,
@@ -158,18 +154,17 @@ static void sql_lookup_pass(struct passdb_sql_request *sql_request)
 	struct passdb_module *_module =
 		sql_request->auth_request->passdb->passdb;
 	struct sql_passdb_module *module = (struct sql_passdb_module *)_module;
-	string_t *query;
+	const char *query;
 
-	query = t_str_new(512);
-	var_expand(query, module->conn->set.password_query,
-		   auth_request_get_var_expand_table(sql_request->auth_request,
-						     passdb_sql_escape));
+	query = t_auth_request_var_expand(module->conn->set.password_query,
+					  sql_request->auth_request,
+					  passdb_sql_escape);
 
-	auth_request_log_debug(sql_request->auth_request, "sql",
-			       "query: %s", str_c(query));
+	auth_request_log_debug(sql_request->auth_request, AUTH_SUBSYS_DB,
+			       "query: %s", query);
 
 	auth_request_ref(sql_request->auth_request);
-	sql_query(module->conn->db, str_c(query),
+	sql_query(module->conn->db, query,
 		  sql_query_callback, sql_request);
 }
 
@@ -207,10 +202,12 @@ static void sql_set_credentials_callback(const char *error,
 
 	if (error != NULL) {
 		if (!module->conn->default_update_query) {
-			auth_request_log_error(sql_request->auth_request, "sql",
+			auth_request_log_error(sql_request->auth_request,
+				AUTH_SUBSYS_DB,
 				"Set credentials query failed: %s", error);
 		} else {
-			auth_request_log_error(sql_request->auth_request, "sql",
+			auth_request_log_error(sql_request->auth_request,
+				AUTH_SUBSYS_DB,
 				"Set credentials query failed: %s"
 				"(using built-in default update_query: %s)",
 				error, module->conn->set.update_query);
@@ -230,21 +227,19 @@ static int sql_set_credentials(struct auth_request *request,
 		(struct sql_passdb_module *) request->passdb->passdb;
 	struct sql_transaction_context *transaction;
 	struct passdb_sql_request *sql_request;
-	string_t *query;
+	const char *query;
 
 	request->mech_password = p_strdup(request->pool, new_credentials);
 
-	query = t_str_new(512);
-	var_expand(query, module->conn->set.update_query, 
-		   auth_request_get_var_expand_table(request,
-						     passdb_sql_escape));
+	query = t_auth_request_var_expand(module->conn->set.update_query,
+					  request, passdb_sql_escape);
 
 	sql_request = i_new(struct passdb_sql_request, 1);
 	sql_request->auth_request = request;
 	sql_request->callback.set_credentials = callback;
 
 	transaction = sql_transaction_begin(module->conn->db);
-	sql_update(transaction, str_c(query));
+	sql_update(transaction, query);
 	sql_transaction_commit(&transaction,
 			       sql_set_credentials_callback, sql_request);
 	return 0;
@@ -259,7 +254,7 @@ passdb_sql_preinit(pool_t pool, const char *args)
 	module = p_new(pool, struct sql_passdb_module, 1);
 	module->conn = conn = db_sql_init(args, FALSE);
 
-	module->module.cache_key =
+	module->module.default_cache_key =
 		auth_cache_parse_key(pool, conn->set.password_query);
 	module->module.default_pass_scheme = conn->set.default_pass_scheme;
 	return &module->module;

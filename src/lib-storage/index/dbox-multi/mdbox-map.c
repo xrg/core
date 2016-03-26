@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -11,7 +11,6 @@
 #include "mdbox-file.h"
 #include "mdbox-map-private.h"
 
-#include <stdlib.h>
 #include <dirent.h>
 
 #define MAX_BACKWARDS_LOOKUPS 10
@@ -316,9 +315,6 @@ int mdbox_map_lookup_full(struct mdbox_map *map, uint32_t map_uid,
 			  struct mdbox_map_mail_index_record *rec_r,
 			  uint16_t *refcount_r)
 {
-	const struct mdbox_map_mail_index_record *rec;
-	const uint16_t *ref16_p;
-	const void *data;
 	uint32_t seq;
 	int ret;
 
@@ -327,6 +323,17 @@ int mdbox_map_lookup_full(struct mdbox_map *map, uint32_t map_uid,
 
 	if ((ret = mdbox_map_get_seq(map, map_uid, &seq)) <= 0)
 		return ret;
+
+	return mdbox_map_lookup_seq_full(map, seq, rec_r, refcount_r);
+}
+
+int mdbox_map_lookup_seq_full(struct mdbox_map *map, uint32_t seq,
+			      struct mdbox_map_mail_index_record *rec_r,
+			      uint16_t *refcount_r)
+{
+	const struct mdbox_map_mail_index_record *rec;
+	const uint16_t *ref16_p;
+	const void *data;
 
 	if (mdbox_map_lookup_seq(map, seq, &rec) < 0)
 		return -1;
@@ -340,6 +347,19 @@ int mdbox_map_lookup_full(struct mdbox_map *map, uint32_t map_uid,
 	ref16_p = data;
 	*refcount_r = *ref16_p;
 	return 1;
+}
+
+uint32_t mdbox_map_lookup_uid(struct mdbox_map *map, uint32_t seq)
+{
+	uint32_t uid;
+
+	mail_index_lookup_uid(map->view, seq, &uid);
+	return uid;
+}
+
+unsigned int mdbox_map_get_messages_count(struct mdbox_map *map)
+{
+	return mail_index_view_get_messages_count(map->view);
 }
 
 int mdbox_map_view_lookup_rec(struct mdbox_map *map,
@@ -463,7 +483,8 @@ mdbox_map_sync_handle(struct mdbox_map *map,
 	}
 }
 
-int mdbox_map_atomic_lock(struct mdbox_map_atomic_context *atomic)
+int mdbox_map_atomic_lock(struct mdbox_map_atomic_context *atomic,
+			  const char *reason)
 {
 	int ret;
 
@@ -476,7 +497,8 @@ int mdbox_map_atomic_lock(struct mdbox_map_atomic_context *atomic)
 	/* use syncing to lock the transaction log, so that we always see
 	   log's head_offset = tail_offset */
 	ret = mail_index_sync_begin(atomic->map->index, &atomic->sync_ctx,
-				    &atomic->sync_view, &atomic->sync_trans, 0);
+				    &atomic->sync_view, &atomic->sync_trans,
+				    MAIL_INDEX_SYNC_FLAG_UPDATE_TAIL_OFFSET);
 	if (mail_index_reset_fscked(atomic->map->index))
 		mdbox_storage_set_corrupted(atomic->map->storage);
 	if (ret <= 0) {
@@ -485,6 +507,7 @@ int mdbox_map_atomic_lock(struct mdbox_map_atomic_context *atomic)
 		mail_index_reset_error(atomic->map->index);
 		return -1;
 	}
+	mail_index_sync_set_reason(atomic->sync_ctx, reason);
 	atomic->locked = TRUE;
 	/* reset refresh state so that if it's wanted to be done locked,
 	   it gets the latest changes */
@@ -563,7 +586,8 @@ mdbox_map_transaction_begin(struct mdbox_map_atomic_context *atomic,
 	return ctx;
 }
 
-int mdbox_map_transaction_commit(struct mdbox_map_transaction_context *ctx)
+int mdbox_map_transaction_commit(struct mdbox_map_transaction_context *ctx,
+				 const char *reason)
 {
 	i_assert(!ctx->committed);
 
@@ -571,7 +595,7 @@ int mdbox_map_transaction_commit(struct mdbox_map_transaction_context *ctx)
 	if (!ctx->changed)
 		return 0;
 
-	if (mdbox_map_atomic_lock(ctx->atomic) < 0)
+	if (mdbox_map_atomic_lock(ctx->atomic, reason) < 0)
 		return -1;
 
 	if (mail_index_transaction_commit(&ctx->trans) < 0) {
@@ -628,7 +652,7 @@ int mdbox_map_update_refcount(struct mdbox_map_transaction_context *ctx,
 					map_uid);
 		return -1;
 	}
-	if (old_diff + new_diff >= 32768) {
+	if (old_diff + new_diff >= 32768 && new_diff > 0) {
 		/* we're getting close to the 64k limit. fail early
 		   to make it less likely that two processes increase
 		   the refcount enough times to cross the limit */
@@ -692,7 +716,7 @@ int mdbox_map_remove_file_id(struct mdbox_map *map, uint32_t file_id)
 		}
 	}
 	if (ret == 0)
-		ret = mdbox_map_transaction_commit(map_trans);
+		ret = mdbox_map_transaction_commit(map_trans, "removing file");
 	mdbox_map_transaction_free(&map_trans);
 	if (mdbox_map_atomic_finish(&atomic) < 0)
 		ret = -1;
@@ -887,9 +911,6 @@ mdbox_map_find_existing_append(struct mdbox_map_append_context *ctx,
 	struct mdbox_file *mfile;
 	unsigned int i, count;
 	uoff_t append_offset;
-
-	if (mail_size >= map->set->mdbox_rotate_size)
-		return NULL;
 
 	/* first try to use files already used in this append */
 	file_appends = array_get(&ctx->file_appends, &count);
@@ -1175,8 +1196,9 @@ mdbox_find_highest_file_id(struct mdbox_map *map, uint32_t *file_id_r)
 	return 0;
 }
 
-static int mdbox_map_assign_file_ids(struct mdbox_map_append_context *ctx,
-				     bool separate_transaction)
+static int
+mdbox_map_assign_file_ids(struct mdbox_map_append_context *ctx,
+			  bool separate_transaction, const char *reason)
 {
 	struct dbox_file_append_context *const *file_appends;
 	unsigned int i, count;
@@ -1185,7 +1207,7 @@ static int mdbox_map_assign_file_ids(struct mdbox_map_append_context *ctx,
 
 	/* start the syncing. we'll need it even if there are no file ids to
 	   be assigned. */
-	if (mdbox_map_atomic_lock(ctx->atomic) < 0)
+	if (mdbox_map_atomic_lock(ctx->atomic, reason) < 0)
 		return -1;
 
 	mdbox_map_get_ext_hdr(ctx->map, ctx->atomic->sync_view, &hdr);
@@ -1253,7 +1275,7 @@ int mdbox_map_append_assign_map_uids(struct mdbox_map_append_context *ctx,
 		return 0;
 	}
 
-	if (mdbox_map_assign_file_ids(ctx, TRUE) < 0)
+	if (mdbox_map_assign_file_ids(ctx, TRUE, "saving - assign uids") < 0)
 		return -1;
 
 	/* append map records to index */
@@ -1315,7 +1337,7 @@ int mdbox_map_append_move(struct mdbox_map_append_context *ctx,
 	unsigned int i, j, map_uids_count, appends_count;
 	uint32_t uid, seq;
 
-	if (mdbox_map_assign_file_ids(ctx, FALSE) < 0)
+	if (mdbox_map_assign_file_ids(ctx, FALSE, "purging - update uids") < 0)
 		return -1;
 
 	memset(&rec, 0, sizeof(rec));
@@ -1436,6 +1458,7 @@ static int mdbox_map_generate_uid_validity(struct mdbox_map *map)
 			offsetof(struct mail_index_header, uid_validity),
 			&uid_validity, sizeof(uid_validity), TRUE);
 	}
+	mail_index_sync_set_reason(sync_ctx, "uidvalidity initialization");
 	return mail_index_sync_commit(&sync_ctx);
 }
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "ioloop.h"
@@ -14,10 +14,15 @@
 #include "auth-worker-client.h"
 #include "auth-worker-server.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 
+/* Initial lookup timeout */
 #define AUTH_WORKER_LOOKUP_TIMEOUT_SECS 60
+/* Timeout for multi-line replies, e.g. listing users. This should be a much
+   higher value, because e.g. doveadm could be doing some long-running commands
+   for the users. And because of buffering this timeout is for handling
+   multiple users, not just one. */
+#define AUTH_WORKER_RESUME_TIMEOUT_SECS (30*60)
 #define AUTH_WORKER_MAX_IDLE_SECS (60*5)
 #define AUTH_WORKER_ABORT_SECS 60
 #define AUTH_WORKER_DELAY_WARN_SECS 3
@@ -26,6 +31,7 @@
 struct auth_worker_request {
 	unsigned int id;
 	time_t created;
+	const char *username;
 	const char *data;
 	auth_worker_callback_t *callback;
 	void *context;
@@ -45,6 +51,8 @@ struct auth_worker_connection {
 	unsigned int received_error:1;
 	unsigned int restart:1;
 	unsigned int shutdown:1;
+	unsigned int timeout_pending_resume:1;
+	unsigned int resuming:1;
 };
 
 static ARRAY(struct auth_worker_connection *) connections = ARRAY_INIT;
@@ -82,6 +90,8 @@ static bool auth_worker_request_send(struct auth_worker_connection *conn,
 {
 	struct const_iovec iov[3];
 	unsigned int age_secs = ioloop_time - request->created;
+
+	i_assert(conn->to != NULL);
 
 	if (age_secs >= AUTH_WORKER_ABORT_SECS) {
 		i_error("Aborting auth request that was queued for %d secs, "
@@ -223,7 +233,9 @@ static void auth_worker_destroy(struct auth_worker_connection **_conn,
 		idle_count--;
 
 	if (conn->request != NULL) {
-		i_error("auth worker: Aborted request: %s", reason);
+		i_error("auth worker: Aborted %s request for %s: %s",
+			t_strcut(conn->request->data, '\t'),
+			conn->request->username, reason);
 		conn->request->callback(t_strdup_printf(
 				"FAIL\t%d", PASSDB_RESULT_INTERNAL_FAILURE),
 				conn->request->context);
@@ -233,7 +245,8 @@ static void auth_worker_destroy(struct auth_worker_connection **_conn,
 		io_remove(&conn->io);
 	i_stream_destroy(&conn->input);
 	o_stream_destroy(&conn->output);
-	timeout_remove(&conn->to);
+	if (conn->to != NULL)
+		timeout_remove(&conn->to);
 
 	if (close(conn->fd) < 0)
 		i_error("close(auth worker) failed: %m");
@@ -263,23 +276,37 @@ static struct auth_worker_connection *auth_worker_find_free(void)
 	return NULL;
 }
 
-static void auth_worker_request_handle(struct auth_worker_connection *conn,
+static bool auth_worker_request_handle(struct auth_worker_connection *conn,
 				       struct auth_worker_request *request,
 				       const char *line)
 {
 	if (strncmp(line, "*\t", 2) == 0) {
 		/* multi-line reply, not finished yet */
-		timeout_reset(conn->to);
+		if (conn->resuming)
+			timeout_reset(conn->to);
+		else {
+			conn->resuming = TRUE;
+			timeout_remove(&conn->to);
+			conn->to = timeout_add(AUTH_WORKER_RESUME_TIMEOUT_SECS * 1000,
+					       auth_worker_call_timeout, conn);
+		}
 	} else {
+		conn->resuming = FALSE;
 		conn->request = NULL;
+		conn->timeout_pending_resume = FALSE;
 		timeout_remove(&conn->to);
 		conn->to = timeout_add(AUTH_WORKER_MAX_IDLE_SECS * 1000,
 				       auth_worker_idle_timeout, conn);
 		idle_count++;
 	}
 
-	if (!request->callback(line, request->context) && conn->io != NULL)
+	if (!request->callback(line, request->context) && conn->io != NULL) {
+		conn->timeout_pending_resume = FALSE;
+		timeout_remove(&conn->to);
 		io_remove(&conn->io);
+		return FALSE;
+	}
+	return TRUE;
 }
 
 static bool auth_worker_error(struct auth_worker_connection *conn)
@@ -373,8 +400,9 @@ static void worker_input(struct auth_worker_connection *conn)
 			continue;
 
 		if (conn->request != NULL && id == conn->request->id) {
-			auth_worker_request_handle(conn, conn->request,
-						   line + 1);
+			if (!auth_worker_request_handle(conn, conn->request,
+							line + 1))
+				break;
 		} else {
 			if (conn->request != NULL) {
 				i_error("BUG: Worker sent reply with id %u, "
@@ -398,8 +426,17 @@ static void worker_input(struct auth_worker_connection *conn)
 		auth_worker_request_send_next(conn);
 }
 
+static void worker_input_resume(struct auth_worker_connection *conn)
+{
+	conn->timeout_pending_resume = FALSE;
+	timeout_remove(&conn->to);
+	conn->to = timeout_add(AUTH_WORKER_RESUME_TIMEOUT_SECS * 1000,
+			       auth_worker_call_timeout, conn);
+	worker_input(conn);
+}
+
 struct auth_worker_connection *
-auth_worker_call(pool_t pool, const char *data,
+auth_worker_call(pool_t pool, const char *username, const char *data,
 		 auth_worker_callback_t *callback, void *context)
 {
 	struct auth_worker_connection *conn;
@@ -407,6 +444,7 @@ auth_worker_call(pool_t pool, const char *data,
 
 	request = p_new(pool, struct auth_worker_request, 1);
 	request->created = ioloop_time;
+	request->username = p_strdup(pool, username);
 	request->data = p_strdup(pool, data);
 	request->callback = callback;
 	request->context = context;
@@ -434,8 +472,19 @@ auth_worker_call(pool_t pool, const char *data,
 
 void auth_worker_server_resume_input(struct auth_worker_connection *conn)
 {
+	if (conn->request == NULL) {
+		/* request was just finished, don't try to resume it */
+		return;
+	}
+
 	if (conn->io == NULL)
 		conn->io = io_add(conn->fd, IO_READ, worker_input, conn);
+	if (!conn->timeout_pending_resume) {
+		conn->timeout_pending_resume = TRUE;
+		if (conn->to != NULL)
+			timeout_remove(&conn->to);
+		conn->to = timeout_add_short(0, worker_input_resume, conn);
+	}
 }
 
 void auth_worker_server_init(void)

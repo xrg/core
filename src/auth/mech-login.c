@@ -24,7 +24,7 @@ mech_login_auth_continue(struct auth_request *request,
 		username = t_strndup(data, data_size);
 
 		if (!auth_request_set_username(request, username, &error)) {
-                        auth_request_log_info(request, "login", "%s", error);
+                        auth_request_log_info(request, AUTH_SUBSYS_MECH, "%s", error);
 			auth_request_fail(request);
 			return;
 		}
@@ -57,7 +57,7 @@ static struct auth_request *mech_login_auth_new(void)
 	struct auth_request *request;
 	pool_t pool;
 
-	pool = pool_alloconly_create("login_auth_request", 1024);
+	pool = pool_alloconly_create(MEMPOOL_GROWING"login_auth_request", 2048);
 	request = p_new(pool, struct auth_request, 1);
 	request->pool = pool;
 	return request;

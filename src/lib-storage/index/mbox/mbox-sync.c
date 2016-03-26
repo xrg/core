@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2016 Dovecot authors, see the included COPYING file */
 
 /*
    Modifying mbox can be slow, so we try to do it all at once minimizing the
@@ -52,7 +52,6 @@
 #include "mbox-sync-private.h"
 
 #include <stddef.h>
-#include <stdlib.h>
 #include <utime.h>
 #include <sys/stat.h>
 
@@ -131,8 +130,10 @@ static int
 mbox_sync_read_next_mail(struct mbox_sync_context *sync_ctx,
 			 struct mbox_sync_mail_context *mail_ctx)
 {
+	uoff_t offset;
+
 	/* get EOF */
-	(void)istream_raw_mbox_get_header_offset(sync_ctx->input);
+	(void)istream_raw_mbox_get_header_offset(sync_ctx->input, &offset);
 	if (istream_raw_mbox_is_eof(sync_ctx->input))
 		return 0;
 
@@ -144,19 +145,27 @@ mbox_sync_read_next_mail(struct mbox_sync_context *sync_ctx,
 
 	mail_ctx->mail.from_offset =
 		istream_raw_mbox_get_start_offset(sync_ctx->input);
-	mail_ctx->mail.offset =
-		istream_raw_mbox_get_header_offset(sync_ctx->input);
+	if (istream_raw_mbox_get_header_offset(sync_ctx->input, &mail_ctx->mail.offset) < 0) {
+		mbox_sync_set_critical(sync_ctx,
+			"Couldn't get header offset for seq=%u", mail_ctx->seq);
+		return -1;
+	}
 
-	mbox_sync_parse_next_mail(sync_ctx->input, mail_ctx);
-	i_assert(sync_ctx->input->v_offset != mail_ctx->mail.from_offset ||
-		 sync_ctx->input->eof);
-
+	if (mbox_sync_parse_next_mail(sync_ctx->input, mail_ctx) < 0)
+		return -1;
 	if (istream_raw_mbox_is_corrupted(sync_ctx->input))
 		return -1;
 
-	mail_ctx->mail.body_size =
-		istream_raw_mbox_get_body_size(sync_ctx->input,
-					       mail_ctx->content_length);
+	i_assert(sync_ctx->input->v_offset != mail_ctx->mail.from_offset ||
+		 sync_ctx->input->eof);
+
+	if (istream_raw_mbox_get_body_size(sync_ctx->input,
+					   mail_ctx->content_length,
+					   &mail_ctx->mail.body_size) < 0) {
+		mbox_sync_set_critical(sync_ctx,
+			"Couldn't get body size for seq=%u", mail_ctx->seq);
+		return -1;
+	}
 	i_assert(mail_ctx->mail.body_size < OFF_T_MAX);
 
 	if ((mail_ctx->mail.flags & MAIL_RECENT) != 0 &&
@@ -630,7 +639,7 @@ static void mbox_sync_handle_expunge(struct mbox_sync_mail_context *mail_ctx)
 static int mbox_sync_handle_header(struct mbox_sync_mail_context *mail_ctx)
 {
 	struct mbox_sync_context *sync_ctx = mail_ctx->sync_ctx;
-	uoff_t orig_from_offset;
+	uoff_t orig_from_offset, postlf_from_offset = (uoff_t)-1;
 	off_t move_diff;
 	int ret;
 
@@ -647,10 +656,13 @@ static int mbox_sync_handle_header(struct mbox_sync_mail_context *mail_ctx)
 			if (sync_ctx->first_mail_crlf_expunged)
 				mail_ctx->mail.from_offset++;
 		}
+		postlf_from_offset = mail_ctx->mail.from_offset;
 
 		/* read the From-line before rewriting overwrites it */
 		if (mbox_read_from_line(mail_ctx) < 0)
 			return -1;
+		i_assert(mail_ctx->mail.from_offset + move_diff != 1 &&
+			 mail_ctx->mail.from_offset + move_diff != 2);
 
 		mbox_sync_update_header(mail_ctx);
 		ret = mbox_sync_try_rewrite(mail_ctx, move_diff);
@@ -676,8 +688,10 @@ static int mbox_sync_handle_header(struct mbox_sync_mail_context *mail_ctx)
 		}
 	} else if (mail_ctx->need_rewrite) {
 		mbox_sync_update_header(mail_ctx);
-		if (sync_ctx->delay_writes) {
-			/* mark it dirty and do it later */
+		if (sync_ctx->delay_writes && sync_ctx->need_space_seq == 0) {
+			/* mark it dirty and do it later. we can't do this
+			   if we're in the middle of rewriting acquiring more
+			   space. */
 			mail_ctx->dirty = TRUE;
 			return 0;
 		}
@@ -698,10 +712,16 @@ static int mbox_sync_handle_header(struct mbox_sync_mail_context *mail_ctx)
 			/* create dummy message to describe the expunged data */
 			struct mbox_sync_mail mail;
 
+			/* if this is going to be the first mail, increase the
+			   from_offset to point to the beginning of the
+			   From-line, because the previous [CR]LF is already
+			   covered by expunged_space. */
+			i_assert(postlf_from_offset != (uoff_t)-1);
+			mail_ctx->mail.from_offset = postlf_from_offset;
+
 			memset(&mail, 0, sizeof(mail));
 			mail.expunged = TRUE;
 			mail.offset = mail.from_offset =
-				(sync_ctx->dest_first_mail ? 1 : 0) +
 				mail_ctx->mail.from_offset -
 				sync_ctx->expunged_space;
 			mail.space = sync_ctx->expunged_space;
@@ -808,7 +828,7 @@ static int
 mbox_sync_seek_to_seq(struct mbox_sync_context *sync_ctx, uint32_t seq)
 {
 	struct mbox_mailbox *mbox = sync_ctx->mbox;
-	uoff_t old_offset;
+	uoff_t old_offset, offset;
 	uint32_t uid;
 	int ret;
         bool deleted;
@@ -862,7 +882,11 @@ mbox_sync_seek_to_seq(struct mbox_sync_context *sync_ctx, uint32_t seq)
 
         sync_ctx->idx_seq = seq;
 	sync_ctx->dest_first_mail = sync_ctx->seq == 0;
-        (void)istream_raw_mbox_get_body_offset(sync_ctx->input);
+	if (istream_raw_mbox_get_body_offset(sync_ctx->input, &offset) < 0) {
+		mbox_sync_set_critical(sync_ctx,
+			"Message body offset lookup failed");
+		return -1;
+	}
 	return 1;
 }
 
@@ -1147,8 +1171,9 @@ static int mbox_sync_loop(struct mbox_sync_context *sync_ctx,
 			sync_ctx->idx_seq++;
 		}
 
-		istream_raw_mbox_next(sync_ctx->input,
-				      mail_ctx->mail.body_size);
+		if (istream_raw_mbox_next(sync_ctx->input,
+					  mail_ctx->mail.body_size) < 0)
+			return -1;
 		offset = istream_raw_mbox_get_start_offset(sync_ctx->input);
 
 		if (sync_ctx->need_space_seq != 0) {
@@ -1518,8 +1543,8 @@ static int mbox_sync_update_index_header(struct mbox_sync_context *sync_ctx)
 	view = mail_index_transaction_open_updated_view(sync_ctx->t);
 	if (mail_index_lookup_seq_range(view, sync_ctx->last_nonrecent_uid + 1,
 					(uint32_t)-1, &seq, &seq2)) {
-		index_mailbox_set_recent_seq(&sync_ctx->mbox->box,
-					     view, seq, seq2);
+		mailbox_recent_flags_set_seqs(&sync_ctx->mbox->box,
+					      view, seq, seq2);
 	}
 	mail_index_view_close(&view);
 
@@ -1550,7 +1575,7 @@ static void mbox_sync_restart(struct mbox_sync_context *sync_ctx)
 		mail_index_reset(sync_ctx->t);
 		sync_ctx->reset_hdr.next_uid = 1;
 		sync_ctx->hdr = &sync_ctx->reset_hdr;
-		index_mailbox_reset_uidvalidity(&sync_ctx->mbox->box);
+		mailbox_recent_flags_reset(&sync_ctx->mbox->box);
 	}
 
 	sync_ctx->prev_msg_uid = 0;
@@ -1763,6 +1788,7 @@ int mbox_sync_has_changed_full(struct mbox_mailbox *mbox, bool leave_dirty,
 static void mbox_sync_context_free(struct mbox_sync_context *sync_ctx)
 {
 	index_sync_changes_deinit(&sync_ctx->sync_changes);
+	index_storage_expunging_deinit(&sync_ctx->mbox->box);
 	if (sync_ctx->index_sync_ctx != NULL)
 		mail_index_sync_rollback(&sync_ctx->index_sync_ctx);
 	pool_unref(&sync_ctx->mail_keyword_pool);
@@ -1851,13 +1877,10 @@ again:
 	if ((flags & MBOX_SYNC_REWRITE) != 0)
 		sync_flags |= MAIL_INDEX_SYNC_FLAG_FLUSH_DIRTY;
 
-	ret = mail_index_sync_begin(mbox->box.index, &index_sync_ctx,
-				    &sync_view, &trans, sync_flags);
-	if (ret <= 0) {
-		if (ret < 0)
-			mailbox_set_index_error(&mbox->box);
+	ret = index_storage_expunged_sync_begin(&mbox->box, &index_sync_ctx,
+						&sync_view, &trans, sync_flags);
+	if (ret <= 0)
 		return ret;
-	}
 
 	if ((mbox->box.flags & MAILBOX_FLAG_DROP_RECENT) != 0) {
 		/* see if we need to drop recent flags */
@@ -1871,6 +1894,7 @@ again:
 	nothing_to_do:
 		/* index may need to do internal syncing though, so commit
 		   instead of rollbacking. */
+		index_storage_expunging_deinit(&mbox->box);
 		if (mail_index_sync_commit(&index_sync_ctx) < 0) {
 			mailbox_set_index_error(&mbox->box);
 			return -1;

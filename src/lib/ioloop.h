@@ -7,6 +7,7 @@
 struct io;
 struct timeout;
 struct ioloop;
+struct istream;
 
 enum io_condition {
 	IO_READ		= 0x01,
@@ -32,6 +33,7 @@ enum io_notify_result {
 typedef void io_callback_t(void *context);
 typedef void timeout_callback_t(void *context);
 typedef void io_loop_time_moved_callback_t(time_t old_time, time_t new_time);
+typedef void io_switch_callback_t(struct ioloop *prev_ioloop);
 
 /* Time when the I/O loop started calling handlers.
    Can be used instead of time(NULL). */
@@ -53,18 +55,31 @@ struct io *io_add(int fd, enum io_condition condition,
 		CALLBACK_TYPECHECK(callback, void (*)(typeof(context))), \
 		(io_callback_t *)callback, context)
 enum io_notify_result
-io_add_notify(const char *path, io_callback_t *callback,
-	      void *context, struct io **io_r) ATTR_NULL(3);
+io_add_notify(const char *path, unsigned int source_linenum,
+	      io_callback_t *callback, void *context,
+	      struct io **io_r) ATTR_NULL(3);
 #define io_add_notify(path, callback, context, io_r) \
-	io_add_notify(path + \
+	io_add_notify(path, __LINE__ + \
 		CALLBACK_TYPECHECK(callback, void (*)(typeof(context))), \
 		(io_callback_t *)callback, context, io_r)
+struct io *io_add_istream(struct istream *input, unsigned int source_linenum,
+			  io_callback_t *callback, void *context) ATTR_NULL(3);
+#define io_add_istream(input, callback, context) \
+	io_add_istream(input, __LINE__ + \
+		CALLBACK_TYPECHECK(callback, void (*)(typeof(context))), \
+		(io_callback_t *)callback, context)
 
 /* Remove I/O handler, and set io pointer to NULL. */
 void io_remove(struct io **io);
 /* Like io_remove(), but assume that the file descriptor is already closed.
    With some backends this simply frees the memory. */
 void io_remove_closed(struct io **io);
+
+/* Make sure the I/O callback is called by io_loop_run() even if there isn't
+   any input actually pending currently as seen by the OS. This may be useful
+   if some of the input has already read into some internal buffer and the
+   caller wants to handle it the same way as if the fd itself had input. */
+void io_set_pending(struct io *io);
 
 /* Timeout handlers */
 struct timeout *
@@ -81,6 +96,13 @@ timeout_add_short(unsigned int msecs, unsigned int source_linenum,
 		  timeout_callback_t *callback, void *context) ATTR_NULL(4);
 #define timeout_add_short(msecs, callback, context) \
 	timeout_add_short(msecs, __LINE__ + \
+		CALLBACK_TYPECHECK(callback, void (*)(typeof(context))), \
+		(io_callback_t *)callback, context)
+struct timeout *timeout_add_absolute(const struct timeval *time,
+			    unsigned int source_linenum,
+			    timeout_callback_t *callback, void *context) ATTR_NULL(4);
+#define timeout_add_absolute(time, callback, context) \
+	timeout_add_absolute(time, __LINE__ + \
 		CALLBACK_TYPECHECK(callback, void (*)(typeof(context))), \
 		(io_callback_t *)callback, context)
 /* Remove timeout handler, and set timeout pointer to NULL. */
@@ -112,6 +134,9 @@ void io_loop_set_time_moved_callback(struct ioloop *ioloop,
 
 /* Change the current_ioloop. */
 void io_loop_set_current(struct ioloop *ioloop);
+/* Call the callback whenever ioloop is changed. */
+void io_loop_add_switch_callback(io_switch_callback_t *callback);
+void io_loop_remove_switch_callback(io_switch_callback_t *callback);
 
 /* This context is used for all further I/O and timeout callbacks that are
    added until returning to ioloop. When a callback is called, this context is
@@ -125,12 +150,30 @@ void io_loop_context_unref(struct ioloop_context **ctx);
 void io_loop_context_add_callbacks(struct ioloop_context *ctx,
 				   io_callback_t *activate,
 				   io_callback_t *deactivate, void *context);
+#define io_loop_context_add_callbacks(ctx, activate, deactivate, context) \
+	io_loop_context_add_callbacks(ctx, 1 ? (io_callback_t *)activate : \
+		CALLBACK_TYPECHECK(activate, void (*)(typeof(context))) + \
+		CALLBACK_TYPECHECK(deactivate, void (*)(typeof(context))), \
+		(io_callback_t *)deactivate, context)
 /* Remove callbacks with the given callbacks and context. */
 void io_loop_context_remove_callbacks(struct ioloop_context *ctx,
 				      io_callback_t *activate,
 				      io_callback_t *deactivate, void *context);
+#define io_loop_context_remove_callbacks(ctx, activate, deactivate, context) \
+	io_loop_context_remove_callbacks(ctx, 1 ? (io_callback_t *)activate : \
+		CALLBACK_TYPECHECK(activate, void (*)(typeof(context))) + \
+		CALLBACK_TYPECHECK(deactivate, void (*)(typeof(context))), \
+		(io_callback_t *)deactivate, context)
 /* Returns the current context set to ioloop. */
 struct ioloop_context *io_loop_get_current_context(struct ioloop *ioloop);
+
+/* Returns fd, which contains all of the ioloop's current notifications.
+   When it becomes readable, there is a new notification. Calling this function
+   stops the existing notifications in the ioloop from working anymore.
+   This function's main idea is that the fd can be passed to another process,
+   which can use it to find out if an interesting notification happens.
+   Returns fd on success, -1 on error. */
+int io_loop_extract_notify_fd(struct ioloop *ioloop);
 
 /* Move the given I/O into the current I/O loop if it's not already
    there. New I/O is returned, while the old one is freed. */
@@ -142,5 +185,10 @@ bool io_loop_have_ios(struct ioloop *ioloop);
 /* Returns TRUE if there is a pending timeout that is going to be run
    immediately. */
 bool io_loop_have_immediate_timeouts(struct ioloop *ioloop);
+/* Returns number of microseconds spent on the ioloop waiting itself. */
+uint64_t io_loop_get_wait_usecs(struct ioloop *ioloop);
+/* Return all io conditions added for the given fd. This needs to scan through
+   all the file ios in the ioloop. */
+enum io_condition io_loop_find_fd_conditions(struct ioloop *ioloop, int fd);
 
 #endif

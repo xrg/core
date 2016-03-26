@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -8,7 +8,6 @@
 #include "auth-server-connection.h"
 #include "auth-client-request.h"
 
-#include <stdlib.h>
 
 struct auth_client_request {
 	pool_t pool;

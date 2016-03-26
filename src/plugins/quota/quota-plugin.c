@@ -1,11 +1,10 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "mail-user.h"
 #include "mail-storage-hooks.h"
 #include "quota-plugin.h"
 
-#include <stdlib.h>
 
 const char *quota_plugin_version = DOVECOT_ABI_VERSION;
 

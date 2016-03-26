@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 /* CRAM-MD5 SASL authentication, see RFC-2195
    Joshua Goodall <joshua@roughtrade.net> */
@@ -15,7 +15,6 @@
 #include "passdb.h"
 #include "hostpid.h"
 
-#include <stdlib.h>
 #include <time.h>
 
 struct cram_auth_request {
@@ -56,7 +55,7 @@ static bool verify_credentials(struct cram_auth_request *request,
 	const char *response_hex;
 
 	if (size != CRAM_MD5_CONTEXTLEN) {
-                auth_request_log_error(&request->auth_request, "cram-md5",
+                auth_request_log_error(&request->auth_request, AUTH_SUBSYS_MECH,
 				       "invalid credentials length");
 		return FALSE;
 	}
@@ -69,7 +68,7 @@ static bool verify_credentials(struct cram_auth_request *request,
 	response_hex = binary_to_hex(digest, sizeof(digest));
 
 	if (memcmp(response_hex, request->response, sizeof(digest)*2) != 0) {
-		auth_request_log_info(&request->auth_request, "cram-md5",
+		auth_request_log_info(&request->auth_request, AUTH_SUBSYS_MECH,
 				      "password mismatch");
 		return FALSE;
 	}
@@ -151,7 +150,7 @@ mech_cram_md5_auth_continue(struct auth_request *auth_request,
 	if (error == NULL)
 		error = "authentication failed";
 
-        auth_request_log_info(auth_request, "cram-md5", "%s", error);
+        auth_request_log_info(auth_request, AUTH_SUBSYS_MECH, "%s", error);
 	auth_request_fail(auth_request);
 }
 
@@ -173,7 +172,7 @@ static struct auth_request *mech_cram_md5_auth_new(void)
 	struct cram_auth_request *request;
 	pool_t pool;
 
-	pool = pool_alloconly_create("cram_md5_auth_request", 2048);
+	pool = pool_alloconly_create(MEMPOOL_GROWING"cram_md5_auth_request", 2048);
 	request = p_new(pool, struct cram_auth_request, 1);
 	request->pool = pool;
 

@@ -67,13 +67,16 @@ bool net_ip_compare(const struct ip_addr *ip1, const struct ip_addr *ip2);
 int net_ip_cmp(const struct ip_addr *ip1, const struct ip_addr *ip2);
 unsigned int net_ip_hash(const struct ip_addr *ip);
 
-/* Connect to socket with ip address. The socket and connect() is
+/* Connect to TCP socket with ip address. The socket and connect() is
    non-blocking. */
-int net_connect_ip(const struct ip_addr *ip, unsigned int port,
+int net_connect_ip(const struct ip_addr *ip, in_port_t port,
 		   const struct ip_addr *my_ip) ATTR_NULL(3);
 /* Like net_connect_ip(), but do a blocking connect(). */
-int net_connect_ip_blocking(const struct ip_addr *ip, unsigned int port,
+int net_connect_ip_blocking(const struct ip_addr *ip, in_port_t port,
 			    const struct ip_addr *my_ip) ATTR_NULL(3);
+/* Like net_connect_ip(), but open a UDP socket. */ 
+int net_connect_udp(const struct ip_addr *ip, in_port_t port,
+		    const struct ip_addr *my_ip);
 /* Returns 0 if we can bind() as given IP, -1 if not. */
 int net_try_bind(const struct ip_addr *ip);
 /* Connect to named UNIX socket */
@@ -96,8 +99,8 @@ void net_get_ip_any4(struct ip_addr *ip);
 void net_get_ip_any6(struct ip_addr *ip);
 
 /* Listen for connections on a socket */
-int net_listen(const struct ip_addr *my_ip, unsigned int *port, int backlog);
-int net_listen_full(const struct ip_addr *my_ip, unsigned int *port,
+int net_listen(const struct ip_addr *my_ip, in_port_t *port, int backlog);
+int net_listen_full(const struct ip_addr *my_ip, in_port_t *port,
 		    enum net_listen_flags *flags, int backlog);
 /* Listen for connections on an UNIX socket */
 int net_listen_unix(const char *path, int backlog);
@@ -107,7 +110,7 @@ int net_listen_unix(const char *path, int backlog);
 int net_listen_unix_unlink_stale(const char *path, int backlog);
 /* Accept a connection on a socket. Returns -1 if the connection got closed,
    -2 for other failures. For UNIX sockets addr_r->family=port=0. */
-int net_accept(int fd, struct ip_addr *addr_r, unsigned int *port_r)
+int net_accept(int fd, struct ip_addr *addr_r, in_port_t *port_r)
 	ATTR_NULL(2, 3);
 
 /* Read data from socket, return number of bytes read,
@@ -130,10 +133,10 @@ const char *net_gethosterror(int error) ATTR_CONST;
 int net_hosterror_notfound(int error) ATTR_CONST;
 
 /* Get socket local address/port. For UNIX sockets addr->family=port=0. */
-int net_getsockname(int fd, struct ip_addr *addr, unsigned int *port)
+int net_getsockname(int fd, struct ip_addr *addr, in_port_t *port)
 	ATTR_NULL(2, 3);
 /* Get socket remote address/port. For UNIX sockets addr->family=port=0. */
-int net_getpeername(int fd, struct ip_addr *addr, unsigned int *port)
+int net_getpeername(int fd, struct ip_addr *addr, in_port_t *port)
 	ATTR_NULL(2, 3);
 /* Get UNIX socket name. */
 int net_getunixname(int fd, const char **name_r);
@@ -145,6 +148,18 @@ int net_getunixcred(int fd, struct net_unix_cred *cred_r);
 const char *net_ip2addr(const struct ip_addr *ip);
 /* char* -> struct ip_addr translation. */
 int net_addr2ip(const char *addr, struct ip_addr *ip);
+/* char* -> net_port_t translation */
+int net_str2port(const char *str, in_port_t *port_r);
+/* char* -> net_port_t translation (allows port zero) */
+int net_str2port_zero(const char *str, in_port_t *port_r);
+/* Parse "host", "host:port", "IPv4", "IPv4:port", "IPv6", "[IPv6]" or
+   "[IPv6]:port" to its host and port components. [IPv6] address is returned
+   without []. If no port is given, return default_port. The :port in the
+   parsed string isn't allowed to be zero, but default_port=0 is passed
+   through. */
+int net_str2hostport(const char *str, in_port_t default_port,
+		     const char **host_r, in_port_t *port_r);
+
 /* Convert IPv6 mapped IPv4 address to an actual IPv4 address. Returns 0 if
    successful, -1 if the source address isn't IPv6 mapped IPv4 address. */
 int net_ipv6_mapped_ipv4_convert(const struct ip_addr *src,
@@ -154,7 +169,7 @@ int net_ipv6_mapped_ipv4_convert(const struct ip_addr *src,
 int net_geterror(int fd);
 
 /* Get name of TCP service */
-const char *net_getservbyport(unsigned short port) ATTR_CONST;
+const char *net_getservbyport(in_port_t port) ATTR_CONST;
 
 bool is_ipv4_address(const char *addr) ATTR_PURE;
 bool is_ipv6_address(const char *addr) ATTR_PURE;
@@ -162,9 +177,10 @@ bool is_ipv6_address(const char *addr) ATTR_PURE;
 /* Parse network as ip/bits. Returns 0 if successful, -1 if invalid input. */
 int net_parse_range(const char *network, struct ip_addr *ip_r,
 		    unsigned int *bits_r);
-/* Returns TRUE if ip is in net_ip/bits network. IPv6 mapped IPv4 addresses
-   are converted to plain IPv4 addresses before matching. Invalid IPs
-   (family=0) never match anything. */
+/* Returns TRUE if ip is in net_ip/bits network. IPv4-mapped IPv6 addresses
+   in "ip" parameter are converted to plain IPv4 addresses before matching.
+   No conversion is done to net_ip though, so using IPv4-mapped IPv6 addresses
+   there will always fail. Invalid IPs (family=0) never match anything. */
 bool net_is_in_network(const struct ip_addr *ip, const struct ip_addr *net_ip,
 		       unsigned int bits) ATTR_PURE;
 

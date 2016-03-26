@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -24,7 +24,7 @@ static int director_host_cmp_p(struct director_host *const *host1,
 
 struct director_host *
 director_host_add(struct director *dir,
-		  const struct ip_addr *ip, unsigned int port)
+		  const struct ip_addr *ip, in_port_t port)
 {
 	struct director_host *host;
 
@@ -90,7 +90,7 @@ void director_host_restarted(struct director_host *host)
 
 struct director_host *
 director_host_get(struct director *dir, const struct ip_addr *ip,
-		  unsigned int port)
+		  in_port_t port)
 {
 	struct director_host *host;
 
@@ -102,7 +102,7 @@ director_host_get(struct director *dir, const struct ip_addr *ip,
 
 struct director_host *
 director_host_lookup(struct director *dir, const struct ip_addr *ip,
-		     unsigned int port)
+		     in_port_t port)
 {
 	struct director_host *const *hostp;
 
@@ -150,17 +150,11 @@ int director_host_cmp_to_self(const struct director_host *b1,
 static void director_host_add_string(struct director *dir, const char *host)
 {
 	struct ip_addr *ips;
-	unsigned int i, port, ips_count;
-	const char *p;
+	in_port_t port;
+	unsigned int i, ips_count;
 
-	p = strrchr(host, ':');
-	if (p != NULL) {
-		if (str_to_uint(p + 1, &port) < 0 || port == 0 || port > 65535)
-			i_fatal("Invalid director port in %s", host);
-		host = t_strdup_until(host, p);
-	} else {
-		port = dir->self_port;
-	}
+	if (net_str2hostport(host, dir->self_port, &host, &port) < 0)
+		i_fatal("Invalid director host:port in '%s'", host);
 
 	if (net_gethostbyname(host, &ips, &ips_count) < 0)
 		i_fatal("Unknown director host: %s", host);

@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,6 +7,7 @@
 #include "mail-search.h"
 #include "../virtual/virtual-storage.h"
 #include "fts-api-private.h"
+#include "fts-search-args.h"
 #include "fts-search-serialize.h"
 #include "fts-storage.h"
 
@@ -23,6 +24,8 @@ uid_range_to_seqs(struct fts_search_context *fctx,
 	if (!array_is_created(seq_range))
 		p_array_init(seq_range, fctx->result_pool, count);
 	for (i = 0; i < count; i++) {
+		if (range[i].seq1 > range[i].seq2)
+			continue;
 		mailbox_get_seq_range(fctx->box, range[i].seq1, range[i].seq2,
 				      &seq1, &seq2);
 		if (seq1 != 0)
@@ -34,6 +37,8 @@ static int fts_search_lookup_level_single(struct fts_search_context *fctx,
 					  struct mail_search_arg *args,
 					  bool and_args)
 {
+	enum fts_lookup_flags flags = fctx->flags |
+		(and_args ? FTS_LOOKUP_FLAG_AND_ARGS : 0);
 	struct fts_search_level *level;
 	struct fts_result result;
 
@@ -43,7 +48,7 @@ static int fts_search_lookup_level_single(struct fts_search_context *fctx,
 	p_array_init(&result.scores, fctx->result_pool, 32);
 
 	mail_search_args_reset(args, TRUE);
-	if (fts_backend_lookup(fctx->backend, fctx->box, args, and_args,
+	if (fts_backend_lookup(fctx->backend, fctx->box, args, flags,
 			       &result) < 0)
 		return -1;
 
@@ -150,6 +155,8 @@ static int fts_search_lookup_level_multi(struct fts_search_context *fctx,
 					 struct mail_search_arg *args,
 					 bool and_args)
 {
+	enum fts_lookup_flags flags = fctx->flags |
+		(and_args ? FTS_LOOKUP_FLAG_AND_ARGS : 0);
 	struct virtual_mailbox *vbox = (struct virtual_mailbox *)fctx->box;
 	ARRAY_TYPE(mailboxes) mailboxes_arr, tmp_mailboxes;
 	struct mailbox *const *mailboxes;
@@ -186,7 +193,7 @@ static int fts_search_lookup_level_multi(struct fts_search_context *fctx,
 		mail_search_args_reset(args, TRUE);
 		if (fts_backend_lookup_multi(backend,
 					     array_idx(&tmp_mailboxes, 0),
-					     args, and_args, &result) < 0)
+					     args, flags, &result) < 0)
 			return -1;
 
 		if (multi_add_lookup_result(fctx, level, args, &result) < 0)
@@ -347,6 +354,10 @@ void fts_search_lookup(struct fts_search_context *fctx)
 			      &seq1, &seq2);
 	fctx->first_unindexed_seq = seq1 != 0 ? seq1 : (uint32_t)-1;
 
+	if ((fctx->backend->flags & FTS_BACKEND_FLAG_TOKENIZED_INPUT) != 0) {
+		if (fts_search_args_expand(fctx->backend, fctx->args) < 0)
+			return;
+	}
 	fts_search_serialize(fctx->orig_matches, fctx->args->args);
 
 	if (fts_search_lookup_level(fctx, fctx->args->args, TRUE) == 0) {

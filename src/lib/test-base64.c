@@ -1,10 +1,9 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "test-lib.h"
 #include "str.h"
 #include "base64.h"
 
-#include <stdlib.h>
 
 static void test_base64_encode(void)
 {

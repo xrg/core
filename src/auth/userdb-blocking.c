@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "str.h"
@@ -6,7 +6,6 @@
 #include "userdb.h"
 #include "userdb-blocking.h"
 
-#include <stdlib.h>
 
 struct blocking_userdb_iterate_context {
 	struct userdb_iterate_context ctx;
@@ -19,7 +18,7 @@ static bool user_callback(const char *reply, void *context)
 {
 	struct auth_request *request = context;
 	enum userdb_result result;
-	const char *args;
+	const char *username, *args;
 
 	if (strncmp(reply, "FAIL\t", 5) == 0) {
 		result = USERDB_RESULT_INTERNAL_FAILURE;
@@ -29,7 +28,14 @@ static bool user_callback(const char *reply, void *context)
 		args = reply + 9;
 	} else if (strncmp(reply, "OK\t", 3) == 0) {
 		result = USERDB_RESULT_OK;
-		args = reply + 3;
+		username = reply + 3;
+		args = strchr(username, '\t');
+		if (args == NULL)
+			args = "";
+		else
+			username = t_strdup_until(username, args++);
+		if (strcmp(request->user, username) != 0)
+			request->user = p_strdup(request->pool, username);
 	} else {
 		result = USERDB_RESULT_INTERNAL_FAILURE;
 		i_error("BUG: auth-worker sent invalid user reply");
@@ -40,7 +46,7 @@ static bool user_callback(const char *reply, void *context)
 	if (*args != '\0') {
 		auth_fields_import(request->userdb_reply, args, 0);
 		if (auth_fields_exists(request->userdb_reply, "tempfail"))
-			request->userdb_lookup_failed = TRUE;
+			request->userdb_lookup_tempfailed = TRUE;
 	}
 
         auth_request_userdb_callback(result, request);
@@ -57,7 +63,8 @@ void userdb_blocking_lookup(struct auth_request *request)
 	auth_request_export(request, str);
 
 	auth_request_ref(request);
-	auth_worker_call(request->pool, str_c(str), user_callback, request);
+	auth_worker_call(request->pool, request->user,
+			 str_c(str), user_callback, request);
 }
 
 static bool iter_callback(const char *reply, void *context)
@@ -65,9 +72,11 @@ static bool iter_callback(const char *reply, void *context)
 	struct blocking_userdb_iterate_context *ctx = context;
 
 	if (strncmp(reply, "*\t", 2) == 0) {
+		if (ctx->destroyed)
+			return TRUE;
 		ctx->next = FALSE;
 		ctx->ctx.callback(reply + 2, ctx->ctx.context);
-		return ctx->next;
+		return ctx->next || ctx->destroyed;
 	}
 
 	if (strcmp(reply, "OK") != 0)
@@ -95,7 +104,8 @@ userdb_blocking_iter_init(struct auth_request *request,
 	ctx->ctx.context = context;
 
 	auth_request_ref(request);
-	ctx->conn = auth_worker_call(request->pool, str_c(str), iter_callback, ctx);
+	ctx->conn = auth_worker_call(request->pool, "*",
+				     str_c(str), iter_callback, ctx);
 	return &ctx->ctx;
 }
 
@@ -118,5 +128,7 @@ int userdb_blocking_iter_deinit(struct userdb_iterate_context **_ctx)
 
 	/* iter_callback() may still be called */
 	ctx->destroyed = TRUE;
+
+	auth_worker_server_resume_input(ctx->conn);
 	return ret;
 }

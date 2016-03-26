@@ -12,8 +12,6 @@ EXTRA_DIST = \
 	COPYING.LGPL \
 	COPYING.MIT \
 	ChangeLog \
-	is-tagged.py \
-	run-test.sh \
 	cc-wrapper.sh.in \
 	update-version.sh \
 	$(conf_DATA)
@@ -22,10 +20,8 @@ noinst_DATA = dovecot-config
 
 nodist_pkginclude_HEADERS = config.h
 
-if MAINTAINER_MODE
-ChangeLog: .hg/dirstate
-	hg log -r tip:fef8259e7277 --style=changelog > ChangeLog
-endif
+ChangeLog:
+	git log --name-status --pretty="format:%ai %aN <%aE> (%h)%n%n%w(80,4,4)%s%n%n%b" 5d5c4f2bfb812c767084c0338dae692db476da10^.. > ChangeLog || rm -f ChangeLog
 
 aclocal_DATA = dovecot.m4
 
@@ -37,7 +33,7 @@ noop:
 dovecot-config: dovecot-config.in Makefile
 	old=`pwd` && cd $(top_builddir) && abs_builddir=`pwd` && cd $$old && \
 	cd $(top_srcdir) && abs_srcdir=`pwd` && cd $$old && \
-	cat dovecot-config.in | sed \
+	(echo "DOVECOT_INSTALLED=no"; cat dovecot-config.in | sed \
 	-e "s|\$$(top_builddir)|$$abs_builddir|g" \
 	-e "s|\$$(incdir)|$$abs_srcdir|g" \
 	-e "s|\$$(LIBICONV)|$(LIBICONV)|g" \
@@ -47,11 +43,11 @@ dovecot-config: dovecot-config.in Makefile
 	-e "s|^\(dovecot_pkglibexecdir\)=|\1=$(libexecdir)/dovecot|" \
 	-e "s|^\(dovecot_docdir\)=|\1=$(docdir)|" \
 	-e "s|^\(dovecot_moduledir\)=|\1=$(moduledir)|" \
-	> dovecot-config
+	) > dovecot-config
 
 if HAVE_SYSTEMD
 %.service: %.service.in
-	$(AM_V_GEN)sed -e 's,@sbindir\@,$(sbindir),g' $< > $@
+	$(AM_V_GEN)sed -e 's,@sbindir\@,$(sbindir),g' -e 's,@bindir\@,$(bindir),g' -e 's,@rundir\@,$(rundir),g' $< > $@
 
 systemdsystemunit_DATA = \
         dovecot.socket \
@@ -64,11 +60,14 @@ install-exec-hook:
 	$(mkdir_p) $(DESTDIR)$(pkglibdir); \
 	grep -v '^LIBDOVECOT_.*_INCLUDE' dovecot-config | \
 	grep -v '^LIBDOVECOT.*_DEPS' | sed \
+	-e "s|^\(DOVECOT_INSTALLED\)=.*$$|\1=yes|" \
 	-e "s|^\(LIBDOVECOT\)=.*$$|\1='-L$(pkglibdir) -ldovecot'|" \
 	-e "s|^\(LIBDOVECOT_LOGIN\)=.*$$|\1='-ldovecot-login $(SSL_LIBS)'|" \
 	-e "s|^\(LIBDOVECOT_SQL\)=.*$$|\1=-ldovecot-sql|" \
 	-e "s|^\(LIBDOVECOT_COMPRESS\)=.*$$|\1=-ldovecot-compression|" \
+	-e "s|^\(LIBDOVECOT_DSYNC\)=.*$$|\1=-ldovecot-dsync|" \
 	-e "s|^\(LIBDOVECOT_LDA\)=.*$$|\1=-ldovecot-lda|" \
+	-e "s|^\(LIBDOVECOT_LIBFTS\)=.*$$|\1=-ldovecot-fts|" \
 	-e "s|^\(LIBDOVECOT_STORAGE\)=.*$$|\1='-ldovecot-storage $(LINKED_STORAGE_LDADD)'|" \
 	-e "s|^\(LIBDOVECOT_INCLUDE\)=.*$$|\1=-I$(pkgincludedir)|" \
 	> $(DESTDIR)$(pkglibdir)/dovecot-config
@@ -76,14 +75,14 @@ install-exec-hook:
 uninstall-hook:
 	rm $(DESTDIR)$(pkglibdir)/dovecot-config
 
-CLEANFILES = $(datafiles)
 if HAVE_SYSTEMD
-CLEANFILES += $systedmsystemunit_DATA
+CLEANFILES = $systedmsystemunit_DATA
 endif
 
 DISTCLEANFILES = \
 	$(top_builddir)/dovecot-version.h \
-	$(top_builddir)/dovecot-config
+	$(top_builddir)/dovecot-config \
+	$(top_builddir)/run-test.sh
 
 distcheck-hook:
 	if which scan-build > /dev/null; then \

@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "abspath.h"
@@ -77,8 +77,7 @@ static void dbox_verify_alt_path(struct mailbox_list *list)
 		return;
 
 	/* unlink/create the current alt path symlink */
-	if (unlink(alt_symlink_path) < 0 && errno != ENOENT)
-		i_error("unlink(%s) failed: %m", alt_symlink_path);
+	i_unlink_if_exists(alt_symlink_path);
 	if (alt_path != NULL) {
 		if (symlink(alt_path, alt_symlink_path) < 0 &&
 		    errno != EEXIST) {
@@ -94,11 +93,7 @@ int dbox_storage_create(struct mail_storage *_storage,
 {
 	struct dbox_storage *storage = (struct dbox_storage *)_storage;
 	const struct mail_storage_settings *set = _storage->set;
-	struct fs_settings fs_set;
 	const char *error;
-
-	memset(&fs_set, 0, sizeof(fs_set));
-	fs_set.temp_file_prefix = mailbox_list_get_global_temp_prefix(ns->list);
 
 	if (*set->mail_attachment_fs != '\0') {
 		const char *name, *args, *dir;
@@ -121,9 +116,10 @@ int dbox_storage_create(struct mail_storage *_storage,
 		dir = mail_user_home_expand(_storage->user,
 					    set->mail_attachment_dir);
 		storage->attachment_dir = p_strdup(_storage->pool, dir);
-		fs_set.root_path = storage->attachment_dir;
-		if (fs_init(name, args, &fs_set, &storage->attachment_fs,
-			    &error) < 0) {
+
+		if (mailbox_list_init_fs(ns->list, name, args,
+					 storage->attachment_dir,
+					 &storage->attachment_fs, &error) < 0) {
 			*error_r = t_strdup_printf("mail_attachment_fs: %s",
 						   error);
 			return -1;
@@ -158,13 +154,13 @@ void dbox_notify_changes(struct mailbox *box)
 	const char *dir, *path;
 
 	if (box->notify_callback == NULL)
-		index_mailbox_check_remove_all(box);
+		mailbox_watch_remove_all(box);
 	else {
 		if (mailbox_get_path_to(box, MAILBOX_LIST_PATH_TYPE_INDEX,
 					&dir) <= 0)
 			return;
 		path = t_strdup_printf("%s/"MAIL_INDEX_PREFIX".log", dir);
-		index_mailbox_check_add(box, path);
+		mailbox_watch_add(box, path);
 	}
 }
 
@@ -258,9 +254,6 @@ int dbox_mailbox_create(struct mailbox *box,
 			const struct mailbox_update *update, bool directory)
 {
 	struct dbox_storage *storage = (struct dbox_storage *)box->storage;
-	struct mail_index_sync_ctx *sync_ctx;
-	struct mail_index_view *view;
-	struct mail_index_transaction *trans;
 	const char *alt_path;
 	struct stat st;
 	int ret;
@@ -293,6 +286,17 @@ int dbox_mailbox_create(struct mailbox *box,
 		}
 		/* dir is empty, ignore it */
 	}
+	return dbox_mailbox_create_indexes(box, update);
+}
+
+int dbox_mailbox_create_indexes(struct mailbox *box,
+				const struct mailbox_update *update)
+{
+	struct dbox_storage *storage = (struct dbox_storage *)box->storage;
+	struct mail_index_sync_ctx *sync_ctx;
+	struct mail_index_view *view;
+	struct mail_index_transaction *trans;
+	int ret;
 
 	/* use syncing as a lock */
 	ret = mail_index_sync_begin(box->index, &sync_ctx, &view, &trans, 0);

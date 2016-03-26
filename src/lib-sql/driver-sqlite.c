@@ -1,8 +1,9 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "str.h"
+#include "hex-binary.h"
 #include "sql-api-private.h"
 
 #ifdef BUILD_SQLITE
@@ -133,7 +134,7 @@ static void driver_sqlite_exec(struct sql_db *_db, const char *query)
 	if (driver_sqlite_connect(_db) < 0)
 		return;
 
-	db->rc = sqlite3_exec(db->sqlite, query, NULL, 0, NULL);
+	db->rc = sqlite3_exec(db->sqlite, query, NULL, NULL, NULL);
 	if (db->rc != SQLITE_OK) {
 		i_error("sqlite: exec(%s) failed: %s (%d)",
 			query, sqlite3_errmsg(db->sqlite), db->rc);
@@ -392,6 +393,18 @@ driver_sqlite_update(struct sql_transaction_context *_ctx, const char *query,
 		*affected_rows = sqlite3_changes(db->sqlite);
 }
 
+static const char *
+driver_sqlite_escape_blob(struct sql_db *_db ATTR_UNUSED,
+			  const unsigned char *data, size_t size)
+{
+	string_t *str = t_str_new(128);
+
+	str_append(str, "x'");
+	binary_to_hex_append(str, data, size);
+	str_append_c(str, '\'');
+	return str_c(str);
+}
+
 const struct sql_db driver_sqlite_db = {
 	.name = "sqlite",
 	.flags = SQL_DB_FLAG_BLOCKING,
@@ -410,7 +423,9 @@ const struct sql_db driver_sqlite_db = {
 		driver_sqlite_transaction_commit,
 		driver_sqlite_transaction_commit_s,
 		driver_sqlite_transaction_rollback,
-		driver_sqlite_update
+		driver_sqlite_update,
+
+		driver_sqlite_escape_blob
 	}
 };
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -10,7 +10,7 @@
 
 static struct connection_list *clients;
 static int fd_listen;
-struct io *io_listen;
+static struct io *io_listen;
 
 struct client {
 	struct connection conn;
@@ -109,10 +109,10 @@ int main(int argc, char *argv[])
 {
 	struct ip_addr my_ip;
 	struct ioloop *ioloop;
-	unsigned int port;
+	in_port_t port;
 
 	lib_init();
-	if (argc < 2 || str_to_uint(argv[1], &port) < 0)
+	if (argc < 2 || net_str2port(argv[1], &port) < 0)
 		i_fatal("Port parameter missing");
 	if (argc < 3)
 		net_get_ip_any4(&my_ip);
@@ -125,7 +125,7 @@ int main(int argc, char *argv[])
 	fd_listen = net_listen(&my_ip, &port, 128);
 	if (fd_listen == -1)
 		i_fatal("listen(port=%u) failed: %m", port);
-	io_listen = io_add(fd_listen, IO_READ, client_accept, NULL);
+	io_listen = io_add(fd_listen, IO_READ, client_accept, (void *)NULL);
 
 	io_loop_run(ioloop);
 

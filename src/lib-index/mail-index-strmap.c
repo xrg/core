@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2008-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -57,7 +57,7 @@ struct mail_index_strmap_read_context {
 	struct istream *input;
 	uoff_t end_offset;
 	uint32_t highest_str_idx;
-	uint32_t uid_lookup_idx;
+	uint32_t uid_lookup_seq;
 	uint32_t lost_expunged_uid;
 
 	const unsigned char *data, *end, *str_idx_base;
@@ -89,7 +89,7 @@ struct mail_index_strmap_hash_key {
 
 #define MAIL_INDEX_STRMAP_TIMEOUT_SECS 10
 
-const struct dotlock_settings default_dotlock_settings = {
+static const struct dotlock_settings default_dotlock_settings = {
 	.timeout = MAIL_INDEX_STRMAP_TIMEOUT_SECS,
 	.stale_timeout = 30
 };
@@ -243,7 +243,7 @@ void mail_index_strmap_view_set_corrupted(struct mail_index_strmap_view *view)
 	mail_index_set_error(view->strmap->index,
 			     "Corrupted strmap index file: %s",
 			     view->strmap->path);
-	(void)unlink(view->strmap->path);
+	i_unlink(view->strmap->path);
 	mail_index_strmap_close(view->strmap);
 	mail_index_strmap_view_reset(view);
 }
@@ -285,7 +285,7 @@ static int mail_index_strmap_open(struct mail_index_strmap_view *view)
 	    hdr.uid_validity != idx_hdr->uid_validity) {
 		/* need to rebuild. if we already had something in the strmap,
 		   we can keep it. */
-		(void)unlink(strmap->path);
+		i_unlink(strmap->path);
 		mail_index_strmap_close(strmap);
 		return 0;
 	}
@@ -381,7 +381,9 @@ mail_index_strmap_uid_exists(struct mail_index_strmap_read_context *ctx,
 {
 	const struct mail_index_record *rec;
 
-	if (ctx->uid_lookup_idx >= ctx->view->view->map->hdr.messages_count) {
+	i_assert(ctx->uid_lookup_seq > 0);
+
+	if (ctx->uid_lookup_seq > ctx->view->view->map->hdr.messages_count) {
 		if (uid >= ctx->view->view->map->hdr.next_uid) {
 			/* thread index has larger UIDs than what we've seen
 			   in our view. we'll have to read them again later
@@ -391,9 +393,9 @@ mail_index_strmap_uid_exists(struct mail_index_strmap_read_context *ctx,
 		return 0;
 	}
 
-	rec = MAIL_INDEX_MAP_IDX(ctx->view->view->map, ctx->uid_lookup_idx);
+	rec = MAIL_INDEX_REC_AT_SEQ(ctx->view->view->map, ctx->uid_lookup_seq);
 	if (rec->uid == uid) {
-		ctx->uid_lookup_idx++;
+		ctx->uid_lookup_seq++;
 		return 1;
 	} else if (rec->uid > uid) {
 		return 0;
@@ -404,7 +406,7 @@ mail_index_strmap_uid_exists(struct mail_index_strmap_read_context *ctx,
 		   been expunged. */
 		mail_index_refresh(ctx->view->view->index);
 		if (mail_index_is_expunged(ctx->view->view,
-					   ctx->uid_lookup_idx + 1))
+					   ctx->uid_lookup_seq))
 			ctx->lost_expunged_uid = rec->uid;
 		return -1;
 	}
@@ -541,7 +543,7 @@ strmap_read_block_init(struct mail_index_strmap_view *view,
 	if (!mail_index_lookup_seq_range(view->view, ctx->rec.uid, (uint32_t)-1,
 					 &seq1, &seq2))
 		seq1 = mail_index_view_get_messages_count(view->view) + 1;
-	ctx->uid_lookup_idx = seq1 - 1;
+	ctx->uid_lookup_seq = seq1;
 	return 1;
 }
 
@@ -561,7 +563,7 @@ strmap_read_block_next(struct mail_index_strmap_read_context *ctx,
 			/* this block is done */
 			return 0;
 		}
-		if (mail_index_strmap_read_packed(ctx, &uid_diff) < 0)
+		if (mail_index_strmap_read_packed(ctx, &uid_diff) <= 0)
 			return -1;
 
 		ctx->rec.uid += uid_diff;
@@ -826,6 +828,7 @@ static void mail_index_strmap_view_renumber(struct mail_index_strmap_view *view)
 
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.view = view;
+	ctx.uid_lookup_seq = 1;
 
 	/* create a map of old -> new index and remove records of
 	   expunged messages */
@@ -1031,7 +1034,7 @@ static int mail_index_strmap_recreate(struct mail_index_strmap_view *view)
 		ret = -1;
 	}
 	if (ret < 0)
-		(void)unlink(temp_path);
+		i_unlink(temp_path);
 	return ret;
 }
 

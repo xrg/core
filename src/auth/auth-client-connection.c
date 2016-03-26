@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "ioloop.h"
@@ -20,7 +20,6 @@
 #include "auth-client-connection.h"
 #include "auth-master-connection.h"
 
-#include <stdlib.h>
 
 #define OUTBUF_THROTTLE_SIZE (1024*50)
 

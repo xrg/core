@@ -14,6 +14,8 @@ struct fts_lucene_settings {
 	const char *whitespace_chars;
 	bool normalize;
 	bool no_snowball;
+	bool mime_parts;
+	bool use_libfts;
 };
 
 struct fts_lucene_user {

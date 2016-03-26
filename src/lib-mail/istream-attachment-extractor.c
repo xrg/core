@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "istream-private.h"
@@ -148,6 +148,10 @@ static bool astream_want_attachment(struct attachment_istream *astream,
 
 static int astream_base64_decode_lf(struct attachment_istream_part *part)
 {
+	if (part->base64_have_crlf && part->base64_state != BASE64_STATE_CR) {
+		/* mixed LF vs CRLFs */
+		return -1;
+	}
 	part->base64_state = BASE64_STATE_0;
 	if (part->cur_base64_blocks < part->base64_line_blocks) {
 		/* last line */
@@ -204,6 +208,12 @@ astream_try_base64_decode_char(struct attachment_istream_part *part,
 		} else if (chr == '=') {
 			part->base64_state = BASE64_STATE_EOM;
 			part->cur_base64_blocks++;
+
+			if (part->cur_base64_blocks > part->base64_line_blocks &&
+			    part->base64_line_blocks > 0) {
+				/* too many blocks */
+				return -1;
+			}
 			return 0;
 		} else {
 			return -1;
@@ -212,7 +222,13 @@ astream_try_base64_decode_char(struct attachment_istream_part *part,
 	case BASE64_STATE_CR:
 		if (chr != '\n')
 			return -1;
-		part->base64_have_crlf = TRUE;
+		if (!part->base64_have_crlf) {
+			if (part->base64_line_blocks != 0) {
+				/* mixed LF vs CRLFs */
+				return -1;
+			}
+			part->base64_have_crlf = TRUE;
+		}
 		return astream_base64_decode_lf(part);
 	case BASE64_STATE_EOB:
 		if (chr != '=')
@@ -221,6 +237,12 @@ astream_try_base64_decode_char(struct attachment_istream_part *part,
 		part->base64_bytes = part->temp_output->offset + pos + 1;
 		part->base64_state = BASE64_STATE_EOM;
 		part->cur_base64_blocks++;
+
+		if (part->cur_base64_blocks > part->base64_line_blocks &&
+		    part->base64_line_blocks > 0) {
+			/* too many blocks */
+			return -1;
+		}
 		return 0;
 	case BASE64_STATE_EOM:
 		i_unreached();
@@ -370,13 +392,14 @@ static int astream_decode_base64(struct attachment_istream *astream)
 	if (ret != -1) {
 		i_assert(failed);
 	} else if (base64_input->stream_errno != 0) {
-		i_error("istream-attachment: read(%s) failed: %m",
-			i_stream_get_name(base64_input));
+		i_error("istream-attachment: read(%s) failed: %s",
+			i_stream_get_name(base64_input),
+			i_stream_get_error(base64_input));
 		failed = TRUE;
 	}
 	if (o_stream_nfinish(output) < 0) {
-		i_error("istream-attachment: write(%s) failed: %m",
-			o_stream_get_name(output));
+		i_error("istream-attachment: write(%s) failed: %s",
+			o_stream_get_name(output), o_stream_get_error(output));
 		failed = TRUE;
 	}
 
@@ -393,8 +416,9 @@ static int astream_decode_base64(struct attachment_istream *astream)
 		}
 		i_assert(ret == -1);
 		if (input->stream_errno != 0) {
-			i_error("istream-attachment: read(%s) failed: %m",
-				i_stream_get_name(base64_input));
+			i_error("istream-attachment: read(%s) failed: %s",
+				i_stream_get_name(input),
+				i_stream_get_error(input));
 			failed = TRUE;
 		}
 	}
@@ -655,11 +679,10 @@ static void i_stream_attachment_extractor_close(struct iostream_private *stream,
 	struct attachment_istream *astream =
 		(struct attachment_istream *)stream;
 	struct message_part *parts;
-	int ret;
 
 	if (astream->parser != NULL) {
-		ret = message_parser_deinit(&astream->parser, &parts);
-		i_assert(ret == 0); /* we didn't use preparsed message_parts */
+		if (message_parser_deinit(&astream->parser, &parts) < 0)
+			i_unreached(); /* we didn't use preparsed message_parts */
 	}
 	hash_format_deinit_free(&astream->set.hash_format);
 	if (astream->pool != NULL)

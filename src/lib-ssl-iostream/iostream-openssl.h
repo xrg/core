@@ -11,7 +11,7 @@ struct ssl_iostream_context {
 	pool_t pool;
 	const struct ssl_iostream_settings *set;
 
-	DH *dh_512, *dh_1024;
+	DH *dh_512, *dh_default;
 	int username_nid;
 
 	unsigned int client_ctx:1;
@@ -26,6 +26,7 @@ struct ssl_iostream {
 
 	struct istream *plain_input;
 	struct ostream *plain_output;
+	struct istream *ssl_input;
 	struct ostream *ssl_output;
 
 	char *host;
@@ -67,7 +68,6 @@ void openssl_iostream_global_deinit(void);
 
 int openssl_iostream_load_key(const struct ssl_iostream_settings *set,
 			      EVP_PKEY **pkey_r, const char **error_r);
-const char *ssl_iostream_get_use_certificate_error(const char *cert);
 int openssl_cert_match_name(SSL *ssl, const char *verify_name);
 int openssl_get_protocol_options(const char *protocols);
 #define OPENSSL_ALL_PROTOCOL_OPTIONS \
@@ -91,8 +91,12 @@ int openssl_iostream_handle_write_error(struct ssl_iostream *ssl_io, int ret,
 
 const char *openssl_iostream_error(void);
 const char *openssl_iostream_key_load_error(void);
+const char *
+openssl_iostream_use_certificate_error(const char *cert, const char *set_name);
+void openssl_iostream_clear_errors(void);
 
-int openssl_iostream_generate_params(buffer_t *output, const char **error_r);
+int openssl_iostream_generate_params(buffer_t *output, unsigned int dh_length,
+				     const char **error_r);
 int openssl_iostream_context_import_params(struct ssl_iostream_context *ctx,
 					   const buffer_t *input);
 void openssl_iostream_context_free_params(struct ssl_iostream_context *ctx);

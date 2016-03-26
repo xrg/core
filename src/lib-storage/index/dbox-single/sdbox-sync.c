@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "dbox-attachment.h"
@@ -125,7 +125,7 @@ static int sdbox_sync_index(struct sdbox_sync_context *ctx)
 	/* mark the newly seen messages as recent */
 	if (mail_index_lookup_seq_range(ctx->sync_view, hdr->first_recent_uid,
 					hdr->next_uid, &seq1, &seq2))
-		index_mailbox_set_recent_seq(box, ctx->sync_view, seq1, seq2);
+		mailbox_recent_flags_set_seqs(box, ctx->sync_view, seq1, seq2);
 
 	while (mail_index_sync_next(ctx->index_sync_ctx, &sync_rec))
 		sdbox_sync_add(ctx, &sync_rec);
@@ -160,8 +160,9 @@ static void dbox_sync_expunge_files(struct sdbox_sync_context *ctx)
 	/* NOTE: Index is no longer locked. Multiple processes may be unlinking
 	   the files at the same time. */
 	ctx->mbox->box.tmp_sync_view = ctx->sync_view;
-	array_foreach(&ctx->expunged_uids, uidp)
+	array_foreach(&ctx->expunged_uids, uidp) T_BEGIN {
 		dbox_sync_file_expunge(ctx, *uidp);
+	} T_END;
 	if (ctx->mbox->box.v.sync_notify != NULL)
 		ctx->mbox->box.v.sync_notify(&ctx->mbox->box, 0, 0);
 	ctx->mbox->box.tmp_sync_view = NULL;
@@ -215,15 +216,12 @@ int sdbox_sync_begin(struct sdbox_mailbox *mbox, enum sdbox_sync_flags flags,
 	sync_flags |= MAIL_INDEX_SYNC_FLAG_AVOID_FLAG_UPDATES;
 
 	for (i = 0;; i++) {
-		ret = mail_index_sync_begin(mbox->box.index,
-					    &ctx->index_sync_ctx,
-					    &ctx->sync_view, &ctx->trans,
-					    sync_flags);
+		ret = index_storage_expunged_sync_begin(&mbox->box,
+				&ctx->index_sync_ctx, &ctx->sync_view,
+				&ctx->trans, sync_flags);
 		if (mail_index_reset_fscked(mbox->box.index))
 			sdbox_set_mailbox_corrupted(&mbox->box);
 		if (ret <= 0) {
-			if (ret < 0)
-				mailbox_set_index_error(&mbox->box);
 			array_free(&ctx->expunged_uids);
 			i_free(ctx);
 			*ctx_r = NULL;
@@ -254,6 +252,7 @@ int sdbox_sync_begin(struct sdbox_mailbox *mbox, enum sdbox_sync_flags flags,
 		}
 		mail_index_sync_rollback(&ctx->index_sync_ctx);
 		if (ret < 0) {
+			index_storage_expunging_deinit(&ctx->mbox->box);
 			array_free(&ctx->expunged_uids);
 			i_free(ctx);
 			return -1;
@@ -273,6 +272,7 @@ int sdbox_sync_finish(struct sdbox_sync_context **_ctx, bool success)
 
 	if (success) {
 		mail_index_view_ref(ctx->sync_view);
+
 		if (mail_index_sync_commit(&ctx->index_sync_ctx) < 0) {
 			mailbox_set_index_error(&ctx->mbox->box);
 			ret = -1;
@@ -284,6 +284,7 @@ int sdbox_sync_finish(struct sdbox_sync_context **_ctx, bool success)
 		mail_index_sync_rollback(&ctx->index_sync_ctx);
 	}
 
+	index_storage_expunging_deinit(&ctx->mbox->box);
 	array_free(&ctx->expunged_uids);
 	i_free(ctx);
 	return ret;

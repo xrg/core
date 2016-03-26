@@ -1,12 +1,14 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "net.h"
 #include "str.h"
 #include "hash.h"
+#include "llist.h"
 #include "array.h"
 #include "ioloop.h"
 #include "istream.h"
+#include "istream-timeout.h"
 #include "ostream.h"
 #include "time-util.h"
 #include "iostream-rawlog.h"
@@ -42,24 +44,19 @@ http_client_connection_debug(struct http_client_connection *conn,
  * Connection
  */
 
+static void http_client_connection_ready(struct http_client_connection *conn);
 static void http_client_connection_input(struct connection *_conn);
+static void
+http_client_connection_disconnect(struct http_client_connection *conn);
 
 unsigned int
 http_client_connection_count_pending(struct http_client_connection *conn)
 {
 	unsigned int pending_count = array_count(&conn->request_wait_list);
 
-	if (conn->pending_request != NULL)
+	if (conn->in_req_callback || conn->pending_request != NULL)
 		pending_count++;
 	return pending_count;
-}
-
-bool http_client_connection_is_ready(struct http_client_connection *conn)
-{
-	return (conn->connected && !conn->output_locked &&
-		!conn->close_indicated &&
-		http_client_connection_count_pending(conn) <
-			conn->client->set.max_pipelined_requests);
 }
 
 bool http_client_connection_is_idle(struct http_client_connection *conn)
@@ -73,8 +70,12 @@ http_client_connection_retry_requests(struct http_client_connection *conn,
 {
 	struct http_client_request **req;
 
+	if (!array_is_created(&conn->request_wait_list))
+		return;
+
 	array_foreach_modifiable(&conn->request_wait_list, req) {
-		http_client_request_retry(*req, status, error);
+		if ((*req)->state < HTTP_REQUEST_STATE_FINISHED)
+			http_client_request_retry(*req, status, error);
 		http_client_request_unref(req);
 	}	
 	array_clear(&conn->request_wait_list);
@@ -86,14 +87,12 @@ http_client_connection_server_close(struct http_client_connection **_conn)
 	struct http_client_connection *conn = *_conn;
 	struct http_client_request **req;
 
-	conn->connected = FALSE;
-	conn->closing = TRUE;
-
 	http_client_connection_debug(conn,
 		"Server explicitly closed connection");
 
 	array_foreach_modifiable(&conn->request_wait_list, req) {
-		http_client_request_resubmit(*req);
+		if ((*req)->state < HTTP_REQUEST_STATE_FINISHED)
+			http_client_request_resubmit(*req);
 		http_client_request_unref(req);
 	}	
 	array_clear(&conn->request_wait_list);
@@ -101,7 +100,7 @@ http_client_connection_server_close(struct http_client_connection **_conn)
 	if (conn->client->ioloop != NULL)
 		io_loop_stop(conn->client->ioloop);
 
-	http_client_connection_unref(_conn);
+	http_client_connection_close(_conn);
 }
 
 static void
@@ -113,16 +112,70 @@ http_client_connection_abort_error(struct http_client_connection **_conn,
 
 	http_client_connection_debug(conn, "Aborting connection: %s", error);
 
-	conn->connected = FALSE;
-	conn->closing = TRUE;
-	
 	array_foreach_modifiable(&conn->request_wait_list, req) {
 		i_assert((*req)->submitted);
 		http_client_request_error(*req, status, error);
 		http_client_request_unref(req);
 	}
 	array_clear(&conn->request_wait_list);
-	http_client_connection_unref(_conn);
+	http_client_connection_close(_conn);
+}
+
+static void
+http_client_connection_abort_any_requests(struct http_client_connection *conn)
+{
+	struct http_client_request **req;
+
+	if (array_is_created(&conn->request_wait_list)) {
+		array_foreach_modifiable(&conn->request_wait_list, req) {
+			i_assert((*req)->submitted);
+			http_client_request_error(*req,
+				HTTP_CLIENT_REQUEST_ERROR_ABORTED,
+				"Aborting");
+			http_client_request_unref(req);
+		}
+		array_clear(&conn->request_wait_list);
+	}
+	if (conn->pending_request != NULL) {
+		struct http_client_request *pending_req = conn->pending_request;
+		conn->pending_request = NULL;
+		http_client_request_error(pending_req,
+			HTTP_CLIENT_REQUEST_ERROR_ABORTED,
+			"Aborting");
+		http_client_request_unref(&pending_req);
+	}
+}
+
+static const char *
+http_client_connection_get_timing_info(struct http_client_connection *conn)
+{
+	struct http_client_request *const *requestp;
+	unsigned int sent_msecs, total_msecs, connected_msecs;
+	string_t *str = t_str_new(64);
+
+	if (array_count(&conn->request_wait_list) > 0) {
+		requestp = array_idx(&conn->request_wait_list, 0);
+		sent_msecs = timeval_diff_msecs(&ioloop_timeval, &(*requestp)->sent_time);
+		total_msecs = timeval_diff_msecs(&ioloop_timeval, &(*requestp)->submit_time);
+
+		str_printfa(str, "Request sent %u.%03u secs ago",
+			    sent_msecs/1000, sent_msecs%1000);
+		if ((*requestp)->attempts > 0) {
+			str_printfa(str, ", %u attempts in %u.%03u secs",
+				    (*requestp)->attempts + 1,
+				    total_msecs/1000, total_msecs%1000);
+		}
+	} else {
+		str_append(str, "No requests");
+		if (conn->conn.last_input != 0) {
+			str_printfa(str, ", last input %d secs ago",
+				    (int)(ioloop_time - conn->conn.last_input));
+		}
+	}
+	connected_msecs = timeval_diff_msecs(&ioloop_timeval, &conn->connected_timestamp);
+	str_printfa(str, ", connected %u.%03u secs ago",
+		    connected_msecs/1000, connected_msecs%1000);
+	return str_c(str);
 }
 
 static void
@@ -148,15 +201,55 @@ http_client_connection_abort_temp_error(struct http_client_connection **_conn,
 			return;
 		}
 	}
+	error = t_strdup_printf("%s (%s)", error,
+				http_client_connection_get_timing_info(conn));
 
 	http_client_connection_debug(conn,
 		"Aborting connection with temporary error: %s", error);
 
-	conn->connected = FALSE;
-	conn->closing = TRUE;
-	
 	http_client_connection_retry_requests(conn, status, error);
-	http_client_connection_unref(_conn);
+	http_client_connection_close(_conn);
+}
+
+bool http_client_connection_is_ready(struct http_client_connection *conn)
+{
+	int ret;
+
+	if (conn->in_req_callback) {
+		/* this can happen when a nested ioloop is created inside request
+		   callback. we currently don't reuse connections that are occupied
+		   this way, but theoretically we could, although that would add
+		   quite a bit of complexity.
+		 */
+		return FALSE;
+	}
+
+	if (!conn->connected || conn->output_locked || conn->output_broken ||
+		conn->close_indicated || conn->tunneling ||
+		http_client_connection_count_pending(conn) >=
+			conn->client->set.max_pipelined_requests)
+		return FALSE;
+
+	if (conn->last_ioloop != NULL && conn->last_ioloop != current_ioloop) {
+		conn->last_ioloop = current_ioloop;
+		/* Active ioloop is different from what we saw earlier;
+		   we may have missed a disconnection event on this connection.
+		   Verify status by reading from connection. */
+		if ((ret=i_stream_read(conn->conn.input)) == -1) {
+			int stream_errno = conn->conn.input->stream_errno;
+
+			i_assert(conn->conn.input->stream_errno != 0 || conn->conn.input->eof);
+			http_client_connection_abort_temp_error(&conn,
+				HTTP_CLIENT_REQUEST_ERROR_CONNECTION_LOST,
+				t_strdup_printf("Connection lost: read(%s) failed: %s",
+						i_stream_get_name(conn->conn.input),
+						stream_errno != 0 ?
+						i_stream_get_error(conn->conn.input) :
+						"EOF"));
+			return FALSE;
+		}
+	}
+	return TRUE;
 }
 
 static void
@@ -164,14 +257,20 @@ http_client_connection_idle_timeout(struct http_client_connection *conn)
 {
 	http_client_connection_debug(conn, "Idle connection timed out");
 
-	http_client_connection_unref(&conn);
+	/* cannot get here unless connection was established at some point */
+	i_assert(conn->connect_succeeded);
+
+	http_client_connection_close(&conn);
 }
 
 void http_client_connection_check_idle(struct http_client_connection *conn)
 {
 	unsigned int timeout, count;
 
-	if (array_count(&conn->request_wait_list) == 0 &&
+	if (conn->connected &&
+		array_is_created(&conn->request_wait_list) &&
+		array_count(&conn->request_wait_list) == 0 &&
+		!conn->in_req_callback &&
 		conn->incoming_payload == NULL &&
 		conn->client->set.max_idle_time_msecs > 0) {
 
@@ -217,13 +316,38 @@ void http_client_connection_check_idle(struct http_client_connection *conn)
 static void
 http_client_connection_request_timeout(struct http_client_connection *conn)
 {
-	unsigned int msecs = conn->client->set.request_timeout_msecs;
-
 	conn->conn.input->stream_errno = ETIMEDOUT;
 	http_client_connection_abort_temp_error(&conn,
-		HTTP_CLIENT_REQUEST_ERROR_TIMED_OUT, t_strdup_printf(
-		"No response for request in %u.%03u secs",
-		msecs/1000, msecs%1000));
+		HTTP_CLIENT_REQUEST_ERROR_TIMED_OUT, "Request timed out");
+}
+
+void http_client_connection_start_request_timeout(
+	struct http_client_connection *conn)
+{
+	unsigned int timeout_msecs = conn->client->set.request_timeout_msecs;
+
+	if (timeout_msecs == 0)
+		;
+	else if (conn->to_requests != NULL)
+		timeout_reset(conn->to_requests);
+	else {
+		conn->to_requests = timeout_add(timeout_msecs,
+						http_client_connection_request_timeout, conn);
+	}
+}
+
+void http_client_connection_reset_request_timeout(
+	struct http_client_connection *conn)
+{
+	if (conn->to_requests != NULL)
+		timeout_reset(conn->to_requests);
+}
+
+void http_client_connection_stop_request_timeout(
+	struct http_client_connection *conn)
+{
+	if (conn->to_requests != NULL)
+		timeout_remove(&conn->to_requests);
 }
 
 static void
@@ -245,7 +369,7 @@ http_client_connection_continue_timeout(struct http_client_connection *conn)
 		array_count(&conn->request_wait_list)-1);
 	req = req_idx[0];
 
-	conn->payload_continue = TRUE;
+	req->payload_sync_continue = TRUE;
 	if (http_client_request_send_more(req, &error) < 0) {
 		http_client_connection_abort_temp_error(&conn,
 			HTTP_CLIENT_REQUEST_ERROR_CONNECTION_LOST,
@@ -271,19 +395,13 @@ int http_client_connection_next_request(struct http_client_connection *conn)
 	if (req == NULL)
 		return 0;	
 
+	i_assert(req->state == HTTP_REQUEST_STATE_QUEUED);
+
 	if (conn->to_idle != NULL)
 		timeout_remove(&conn->to_idle);
 
-	if (conn->client->set.request_timeout_msecs == 0)
-		;
-	else if (conn->to_requests != NULL)
-		timeout_reset(conn->to_requests);
-	else {
-		conn->to_requests = timeout_add(conn->client->set.request_timeout_msecs,
-						http_client_connection_request_timeout, conn);
-	}
 	req->conn = conn;
-	conn->payload_continue = FALSE;
+	req->payload_sync_continue = FALSE;
 	if (conn->peer->no_payload_sync)
 		req->payload_sync = FALSE;
 
@@ -300,16 +418,17 @@ int http_client_connection_next_request(struct http_client_connection *conn)
 		return -1;
 	}
 
-	/* https://tools.ietf.org/html/draft-ietf-httpbis-p2-semantics-21;
-			Section 6.1.2.1:
+	if (req->connect_tunnel)
+		conn->tunneling = TRUE;
 
-	   Because of the presence of older implementations, the protocol allows
-	   ambiguous situations in which a client might send "Expect: 100-continue"
-	   without receiving either a 417 (Expectation Failed) or a 100 (Continue)
-	   status code.  Therefore, when a client sends this header field to an
-	   origin server (possibly via a proxy) from which it has never seen a 100
-	   (Continue) status code, the client SHOULD NOT wait for an indefinite
-	   period before sending the payload body.
+	/* RFC 7231, Section 5.1.1: Expect
+
+		 o  A client that sends a 100-continue expectation is not required to
+		    wait for any specific length of time; such a client MAY proceed to
+		    send the message body even if it has not yet received a response.
+		    Furthermore, since 100 (Continue) responses cannot be sent through
+		    an HTTP/1.0 intermediary, such a client SHOULD NOT wait for an
+		    indefinite period before sending the message body.
 	 */
 	if (req->payload_sync && !conn->peer->seen_100_response) {
 		i_assert(req->payload_chunked || req->payload_size > 0);
@@ -328,9 +447,6 @@ static void http_client_connection_destroy(struct connection *_conn)
 	const char *error;
 	unsigned int msecs;
 
-	conn->closing = TRUE;
-	conn->connected = FALSE;
-
 	switch (_conn->disconnect_reason) {
 	case CONNECTION_DISCONNECT_CONNECT_TIMEOUT:
 		if (conn->connected_timestamp.tv_sec == 0) {
@@ -343,18 +459,17 @@ static void http_client_connection_destroy(struct connection *_conn)
 			msecs = timeval_diff_msecs(&ioloop_timeval,
 						   &conn->connected_timestamp);
 			error = t_strdup_printf(
-				"SSL handshaking to %s failed: Connection timed out in %u.%03u secs",
+				"SSL handshaking with %s failed: Connection timed out in %u.%03u secs",
 				_conn->name, msecs/1000, msecs%1000);
 		}
 		http_client_connection_debug(conn, "%s", error);
-		http_client_connection_retry_requests(conn,
-			HTTP_CLIENT_REQUEST_ERROR_TIMED_OUT, error);
+		http_client_peer_connection_failure(conn->peer, error);
 		break;
 	case CONNECTION_DISCONNECT_CONN_CLOSED:
 		/* retry pending requests if possible */
 		error = _conn->input == NULL ? "Connection lost" :
 			t_strdup_printf("Connection lost: %s",
-					strerror(_conn->input->stream_errno));
+					i_stream_get_error(_conn->input));
 		http_client_connection_debug(conn, "%s", error);
 		http_client_connection_retry_requests(conn,
 			HTTP_CLIENT_REQUEST_ERROR_CONNECTION_LOST, error);
@@ -362,14 +477,14 @@ static void http_client_connection_destroy(struct connection *_conn)
 		break;
 	}
 
-	http_client_connection_unref(&conn);
+	http_client_connection_close(&conn);
 }
 
 static void http_client_payload_finished(struct http_client_connection *conn)
 {
 	timeout_remove(&conn->to_input);
-	conn->conn.io = io_add(conn->conn.fd_in, IO_READ,
-			       http_client_connection_input, &conn->conn);
+	conn->conn.io = io_add_istream(conn->conn.input,
+				       http_client_connection_input, &conn->conn);
 }
 
 static void
@@ -386,20 +501,28 @@ static void http_client_payload_destroyed(struct http_client_request *req)
 {
 	struct http_client_connection *conn = req->conn;
 
+	i_assert(conn != NULL);
 	i_assert(conn->pending_request == req);
 	i_assert(conn->incoming_payload != NULL);
 	i_assert(conn->conn.io == NULL);
 
-	http_client_connection_debug(conn, "Response payload stream destroyed");
+	http_client_connection_debug(conn,
+		"Response payload stream destroyed (%u ms after initial response)",
+		timeval_diff_msecs(&ioloop_timeval, &req->response_time));
 
 	/* caller is allowed to change the socket fd to blocking while reading
 	   the payload. make sure here that it's switched back. */
 	net_set_nonblock(conn->conn.fd_in, TRUE);
 
+	req->conn = NULL;
 	conn->incoming_payload = NULL;
-
-	http_client_request_finish(&req);
 	conn->pending_request = NULL;
+	http_client_connection_ref(conn);
+	http_client_request_finish(req);
+
+	/* room for new requests */
+	if (http_client_connection_is_ready(conn))
+		http_client_peer_trigger_request_handler(conn->peer);
 
 	/* input stream may have pending input. make sure input handler
 	   gets called (but don't do it directly, since we get get here
@@ -408,25 +531,32 @@ static void http_client_payload_destroyed(struct http_client_request *req)
 	   necessary. */
 	conn->to_input =
 		timeout_add_short(0, http_client_payload_destroyed_timeout, conn);
+
+	http_client_request_unref(&req);
+	http_client_connection_unref(&conn);
 }
 
 static bool
-http_client_connection_return_response(struct http_client_connection *conn,
-	struct http_client_request *req, struct http_response *response)
+http_client_connection_return_response(struct http_client_request *req,
+	struct http_response *response)
 {
+	struct http_client_connection *conn = req->conn, *tmp_conn;
 	struct istream *payload;
-	bool retrying;
+	bool retrying, ret;
 
+	i_assert(!conn->in_req_callback);
 	i_assert(conn->incoming_payload == NULL);
 	i_assert(conn->pending_request == NULL);
 
+	http_client_request_ref(req);
 	req->state = HTTP_REQUEST_STATE_GOT_RESPONSE;
 
 	if (response->payload != NULL) {
 		/* wrap the stream to capture the destroy event without destroying the
 		   actual payload stream. */
 		conn->incoming_payload = response->payload =
-			i_stream_create_limit(response->payload, (uoff_t)-1);
+			i_stream_create_timeout(response->payload,
+				conn->client->set.request_timeout_msecs);
 		i_stream_add_destroy_callback(response->payload,
 					      http_client_payload_destroyed,
 					      req);
@@ -435,19 +565,22 @@ http_client_connection_return_response(struct http_client_connection *conn,
 		io_remove(&conn->conn.io);
 		/* we've received the request itself, and we can't reset the
 		   timeout during the payload reading. */
-		if (conn->to_requests != NULL)
-			timeout_remove(&conn->to_requests);
+		http_client_connection_stop_request_timeout(conn);
 	}
-
+	
+	conn->in_req_callback = TRUE;
 	http_client_connection_ref(conn);
 	retrying = !http_client_request_callback(req, response);
-	http_client_connection_unref(&conn);
-	if (conn == NULL) {
+	tmp_conn = conn;
+	if (!http_client_connection_unref(&tmp_conn)) {
 		/* the callback managed to get this connection destroyed */
+		req->conn = NULL;
 		if (!retrying)
-			http_client_request_finish(&req);
+			http_client_request_finish(req);
+		http_client_request_unref(&req);
 		return FALSE;
 	}
+	conn->in_req_callback = FALSE;
 
 	if (retrying) {
 		/* retrying, don't destroy the request */
@@ -455,33 +588,43 @@ http_client_connection_return_response(struct http_client_connection *conn,
 			i_stream_remove_destroy_callback(conn->incoming_payload,
 							 http_client_payload_destroyed);
 			i_stream_unref(&conn->incoming_payload);
-			conn->conn.io = io_add(conn->conn.fd_in, IO_READ,
+			conn->conn.io = io_add_istream(conn->conn.input,
 					       http_client_connection_input,
 					       &conn->conn);
 		}
+		http_client_request_unref(&req);
 		return TRUE;
 	}
 
+	http_client_connection_ref(conn);
 	if (response->payload != NULL) {
 		req->state = HTTP_REQUEST_STATE_PAYLOAD_IN;
 		payload = response->payload;
 		response->payload = NULL;
 		conn->pending_request = req;
+
+		/* request is dereferenced in payload destroy callback */
 		i_stream_unref(&payload);
-		if (conn->to_input != NULL) {
+
+		if (conn->to_input != NULL && conn->conn.input != NULL) {
 			/* already finished reading the payload */
 			http_client_payload_finished(conn);
 		}
 	} else {
-		http_client_request_finish(&req);
+		req->conn = NULL;
+		http_client_request_finish(req);
+		http_client_request_unref(&req);
 	}
 
-	if (conn->incoming_payload == NULL) {
-		i_assert(conn->conn.io != NULL);
-		return TRUE;
+	if (conn->incoming_payload == NULL && conn->conn.input != NULL) {
+		i_assert(conn->conn.io != NULL ||
+			conn->peer->addr.type == HTTP_CLIENT_PEER_ADDR_RAW);
+		ret = TRUE;
+	} else {
+		ret = FALSE;
 	}
-
-	return FALSE;
+	http_client_connection_unref(&conn);
+	return ret;
 }
 
 static void http_client_connection_input(struct connection *_conn)
@@ -489,13 +632,51 @@ static void http_client_connection_input(struct connection *_conn)
 	struct http_client_connection *conn =
 		(struct http_client_connection *)_conn;
 	struct http_response response;
-	struct http_client_request *const *req_idx;
-	struct http_client_request *req = NULL;
+	struct http_client_request *const *reqs;
+	struct http_client_request *req = NULL, *req_ref;
+	enum http_response_payload_type payload_type;
+	unsigned int count;
 	int finished = 0, ret;
 	const char *error;
-	bool no_payload = FALSE;
 
 	i_assert(conn->incoming_payload == NULL);
+
+	_conn->last_input = ioloop_time;
+
+	if (conn->ssl_iostream != NULL &&
+		!ssl_iostream_is_handshaked(conn->ssl_iostream)) {
+		/* finish SSL negotiation by reading from input stream */
+		while ((ret=i_stream_read(conn->conn.input)) > 0) {
+			if (ssl_iostream_is_handshaked(conn->ssl_iostream))
+				break;
+		}
+		if (ret < 0) {
+			int stream_errno = conn->conn.input->stream_errno;
+
+			/* failed somehow */
+			i_assert(ret != -2);
+			error = t_strdup_printf(
+				"SSL handshaking with %s failed: "
+				"read(%s) failed: %s",
+				_conn->name,
+				i_stream_get_name(conn->conn.input),
+				stream_errno != 0 ?
+					i_stream_get_error(conn->conn.input) : "EOF");
+			http_client_peer_connection_failure(conn->peer, error);
+			http_client_connection_debug(conn, "%s", error);
+			http_client_connection_close(&conn);
+			return;
+		}
+
+		if (!ssl_iostream_is_handshaked(conn->ssl_iostream)) {
+			/* not finished */
+			i_assert(ret == 0);
+			return;
+		}
+
+		/* ready for first request */
+		http_client_connection_ready(conn);
+	}
 
 	if (conn->to_input != NULL) {
 		/* We came here from a timeout added by
@@ -506,58 +687,81 @@ static void http_client_connection_input(struct connection *_conn)
 		http_client_payload_finished(conn);
 		finished++;
 	}
-	if (conn->to_requests != NULL)
-		timeout_reset(conn->to_requests);
+
+	/* we've seen activity from the server; reset request timeout */
+	http_client_connection_reset_request_timeout(conn);
 
 	/* get first waiting request */
-	if (array_count(&conn->request_wait_list) > 0) {
-		req_idx = array_idx(&conn->request_wait_list, 0);
-		req = req_idx[0];
+	reqs = array_get(&conn->request_wait_list, &count);
+	if (count > 0) {
+		req = reqs[0];
 
-		/* https://tools.ietf.org/html/draft-ietf-httpbis-p1-messaging-21
-		     Section 3.3.2:
-
-		   A server MAY send a Content-Length header field in a response to a
-		   HEAD request [...]
-		 */
-		no_payload = (strcmp(req->method, "HEAD") == 0);
+		/* determine whether to expect a response payload */
+		payload_type = http_client_request_get_payload_type(req);
+	} else {
+		req = NULL;
+		payload_type = HTTP_RESPONSE_PAYLOAD_TYPE_ALLOWED;
 	}
 
-	// FIXME: handle somehow if server replies before request->input is at EOF
+	/* drop connection with broken output if last possible input was
+	   received */
+	if (conn->output_broken && (count == 0 ||
+		(count == 1 && req->state == HTTP_REQUEST_STATE_ABORTED))) {
+		http_client_connection_server_close(&conn);
+		return;
+	}
+
 	while ((ret=http_response_parse_next
-		(conn->http_parser, no_payload, &response, &error)) > 0) {
-		bool aborted;
+		(conn->http_parser, payload_type, &response, &error)) > 0) {
+		bool aborted, early = FALSE;
 
 		if (req == NULL) {
 			/* server sent response without any requests in the wait list */
-			http_client_connection_debug(conn, "Got unexpected input from server");
-			http_client_connection_unref(&conn);
+			if (response.status == 408) {
+				http_client_connection_debug(conn,
+					"Server explicitly closed connection: 408 %s",
+					response.reason);
+			} else {
+				http_client_connection_debug(conn,
+					"Got unexpected input from server: %u %s",
+					response.status, response.reason);
+			}
+			http_client_connection_close(&conn);
 			return;
 		}
+		req->response_time = ioloop_timeval;
 
 		/* Got some response; cancel response timeout */
 		if (conn->to_response != NULL)
 			timeout_remove(&conn->to_response);
 
-		/* https://tools.ietf.org/html/draft-ietf-httpbis-p2-semantics-21
-		     Section 7.2:
+		/* RFC 7231, Section 6.2:
 
-		   A client MUST be prepared to accept one or more 1xx status responses
-		   prior to a regular response, even if the client does not expect a 100
-		   (Continue) status message.  Unexpected 1xx status responses MAY be
-		   ignored by a user agent.
+		   A client MUST be able to parse one or more 1xx responses received
+		   prior to a final response, even if the client does not expect one.  A
+		   user agent MAY ignore unexpected 1xx responses.
 		 */
 		if (req->payload_sync && response.status == 100) {
-			if (conn->payload_continue) {
+			if (req->payload_sync_continue) {
 				http_client_connection_debug(conn,
 					"Got 100-continue response after timeout");
 				continue;
 			}
+
 			conn->peer->no_payload_sync = FALSE;
 			conn->peer->seen_100_response = TRUE;
-			conn->payload_continue = TRUE;
+			req->payload_sync_continue = TRUE;
+
 			http_client_connection_debug(conn,
 				"Got expected 100-continue response");
+
+			if (req->state == HTTP_REQUEST_STATE_ABORTED) {
+				http_client_connection_debug(conn,
+					"Request aborted before sending payload was complete.");
+				http_client_connection_close(&conn);
+				return;
+			}
+
 			if (http_client_request_send_more(req, &error) < 0) {
 				http_client_connection_abort_temp_error(&conn,
 					HTTP_CLIENT_REQUEST_ERROR_CONNECTION_LOST,
@@ -565,48 +769,110 @@ static void http_client_connection_input(struct connection *_conn)
 			}
 			return;
 		} else if (response.status / 100 == 1) {
-			/* ignore them for now */
+			/* ignore other 1xx for now */
 			http_client_connection_debug(conn,
 				"Got unexpected %u response; ignoring", response.status);
 			continue;
-		} 
+		} else 	if (!req->payload_sync &&
+			req->state == HTTP_REQUEST_STATE_PAYLOAD_OUT) {
+			/* got early response from server while we're still sending request
+			   payload. we cannot recover from this reliably, so we stop sending
+			   payload and close the connection once the response is processed */
+			http_client_connection_debug(conn,
+				"Got early input from server; "
+				"request payload not completely sent (will close connection)");
+			o_stream_unset_flush_callback(conn->conn.output);
+			conn->output_broken = early = TRUE;
+		}
 
 		http_client_connection_debug(conn,
-			"Got %u response for request %s",
-			response.status, http_client_request_label(req));
+			"Got %u response for request %s (took %u ms + %u ms in queue)",
+			response.status, http_client_request_label(req),
+			timeval_diff_msecs(&req->response_time, &req->sent_time),
+			timeval_diff_msecs(&req->sent_time, &req->submit_time));
 
 		/* make sure connection output is unlocked if 100-continue failed */
-		if (req->payload_sync && !conn->payload_continue)
-			conn->output_locked = FALSE;	
+		if (req->payload_sync && !req->payload_sync_continue) {
+			http_client_connection_debug(conn, "Unlocked output");
+			conn->output_locked = FALSE;
+		}
 
 		/* remove request from queue */
 		array_delete(&conn->request_wait_list, 0, 1);
 		aborted = (req->state == HTTP_REQUEST_STATE_ABORTED);
-		i_assert(req->refcount > 1 || aborted);
-		http_client_request_unref(&req);
+		req_ref = req;
+		if (!http_client_request_unref(&req_ref)) {
+			i_assert(aborted);
+			req = NULL;
+		}
 		
 		conn->close_indicated = response.connection_close;
 
 		if (!aborted) {
-			if (response.status == 417 && req->payload_sync) {
-				/* drop Expect: continue */
-				req->payload_sync = FALSE;
-				conn->output_locked = FALSE;
-				conn->peer->no_payload_sync = TRUE;
-				http_client_request_retry(req, response.status, response.reason);
-	
-			} else if (response.status / 100 == 3 && response.status != 304 &&
-				response.location != NULL) {
-				/* redirect */
-				http_client_request_redirect(req, response.status, response.location);
-			} else {
-				/* response for application */
-				if (!http_client_connection_return_response(conn, req, &response))
-					return;
+			bool handled = FALSE;
+
+			/* response cannot be 2xx if request payload was not completely sent
+			 */
+			if (early && response.status / 100 == 2) {
+				http_client_request_error(req,
+					HTTP_CLIENT_REQUEST_ERROR_BAD_RESPONSE,
+					"Server responded with success response "
+					"before all payload was sent");
+				http_client_request_unref(&req);
+				http_client_connection_close(&conn);
+				return;
+			} 
+
+			/* don't redirect/retry if we're sending data in small
+			   blocks via http_client_request_send_payload()
+			   and we're not waiting for 100 continue */
+			if (!req->payload_wait ||
+				(req->payload_sync && !req->payload_sync_continue)) {
+				/* failed Expect: */
+				if (response.status == 417 && req->payload_sync) {
+					/* drop Expect: continue */
+					req->payload_sync = FALSE;
+					conn->output_locked = FALSE;
+					conn->peer->no_payload_sync = TRUE;
+					if (http_client_request_try_retry(req))
+						handled = TRUE;
+				/* redirection */
+				} else if (!req->client->set.no_auto_redirect &&
+					response.status / 100 == 3 && response.status != 304 &&
+					response.location != NULL) {
+					/* redirect (possibly after delay) */
+					if (http_client_request_delay_from_response(req, &response) >= 0) {
+						http_client_request_redirect
+							(req, response.status, response.location);
+						handled = TRUE;
+					}
+				/* service unavailable */
+				} else if (response.status == 503) {
+					/* automatically retry after delay if indicated */
+					if ( response.retry_after != (time_t)-1 &&
+						http_client_request_delay_from_response(req, &response) > 0 &&
+						http_client_request_try_retry(req))
+						handled = TRUE;
+				/* request timeout (by server) */
+				} else if (response.status == 408) {
+					/* automatically retry */
+					if (http_client_request_try_retry(req))
+						handled = TRUE;
+					/* connection close is implicit, although server should indicate
+					   that explicitly */
+					conn->close_indicated = TRUE;
+				}
 			}
 
-			finished++;
+			if (!handled) {
+				/* response for application */
+				i_assert(req->conn == conn);
+				if (!http_client_connection_return_response(req, &response))
+					return;
+			}
 		}
+
+		finished++;
 
 		/* server closing connection? */
 		if (conn->close_indicated) {
@@ -615,16 +881,25 @@ static void http_client_connection_input(struct connection *_conn)
 		}
 
 		/* get next waiting request */
-		if (array_count(&conn->request_wait_list) > 0) {
-			req_idx = array_idx(&conn->request_wait_list, 0);
-			req = req_idx[0];
-			no_payload = (strcmp(req->method, "HEAD") == 0);
+		reqs = array_get(&conn->request_wait_list, &count);
+		if (count > 0) {
+			req = reqs[0];
+
+			/* determine whether to expect a response payload */
+			payload_type = http_client_request_get_payload_type(req);
 		} else {
 			/* no more requests waiting for the connection */
-			if (conn->to_requests != NULL)
-				timeout_remove(&conn->to_requests);
+			http_client_connection_stop_request_timeout(conn);
 			req = NULL;
-			no_payload = FALSE;
+			payload_type = HTTP_RESPONSE_PAYLOAD_TYPE_ALLOWED;
+		}
+
+		/* drop connection with broken output if last possible input was
+		   received */
+		if (conn->output_broken && (count == 0 ||
+			(count == 1 && req->state == HTTP_REQUEST_STATE_ABORTED))) {
+			http_client_connection_server_close(&conn);
+			return;
 		}
 	}
 
@@ -636,7 +911,8 @@ static void http_client_connection_input(struct connection *_conn)
 			t_strdup_printf("Connection lost: read(%s) failed: %s",
 					i_stream_get_name(conn->conn.input),
 					stream_errno != 0 ?
-					strerror(stream_errno) : "EOF"));
+					i_stream_get_error(conn->conn.input) :
+					"EOF"));
 		return;
 	}
 
@@ -659,30 +935,49 @@ static void http_client_connection_input(struct connection *_conn)
 
 int http_client_connection_output(struct http_client_connection *conn)
 {
-	struct http_client_request *const *req_idx, *req;
+	struct http_client_request *const *reqs;
 	struct ostream *output = conn->conn.output;
+	unsigned int count;
 	const char *error;
 	int ret;
 
-	if (conn->to_requests != NULL)
-		timeout_reset(conn->to_requests);
+	/* we've seen activity from the server; reset request timeout */
+	http_client_connection_reset_request_timeout(conn);
 
 	if ((ret = o_stream_flush(output)) <= 0) {
 		if (ret < 0) {
 			http_client_connection_abort_temp_error(&conn,
 				HTTP_CLIENT_REQUEST_ERROR_CONNECTION_LOST,
-				t_strdup_printf("Connection lost: write(%s) failed: %m",
-						o_stream_get_name(output)));
+				t_strdup_printf("Connection lost: write(%s) failed: %s",
+						o_stream_get_name(output),
+						o_stream_get_error(output)));
 		}
 		return ret;
 	}
 
-	if (array_count(&conn->request_wait_list) > 0 && conn->output_locked) {
-		req_idx = array_idx(&conn->request_wait_list,
-			array_count(&conn->request_wait_list)-1);
-		req = req_idx[0];
+	i_assert(!conn->output_broken);
 
-		if (!req->payload_sync || conn->payload_continue) {
+	if (conn->ssl_iostream != NULL &&
+		!ssl_iostream_is_handshaked(conn->ssl_iostream))
+		return 1;
+
+	reqs = array_get(&conn->request_wait_list, &count);
+	if (count > 0 && conn->output_locked) {
+		struct http_client_request *req = reqs[count-1];
+
+		if (req->state == HTTP_REQUEST_STATE_ABORTED) {
+			http_client_connection_debug(conn,
+				"Request aborted before sending payload was complete.");
+			if (count == 1) {
+				http_client_connection_close(&conn);
+			} else {
+				o_stream_unset_flush_callback(output);
+				conn->output_broken = TRUE;
+			}
+			return 1;
+		}
+
+		if (!req->payload_sync || req->payload_sync_continue) {
 			if (http_client_request_send_more(req, &error) < 0) {
 				http_client_connection_abort_temp_error(&conn,
 					HTTP_CLIENT_REQUEST_ERROR_CONNECTION_LOST,
@@ -699,16 +994,42 @@ int http_client_connection_output(struct http_client_connection *conn)
 	return 1;
 }
 
+void
+http_client_connection_start_tunnel(struct http_client_connection **_conn,
+	struct http_client_tunnel *tunnel)
+{
+	struct http_client_connection *conn = *_conn;
+
+	i_assert(conn->tunneling);
+
+	/* claim connection streams */
+	memset(tunnel, 0, sizeof(*tunnel));
+	tunnel->input = conn->conn.input;
+	tunnel->output = conn->conn.output;
+	tunnel->fd_in = conn->conn.fd_in;
+	tunnel->fd_out = conn->conn.fd_out;
+
+	/* detach from connection */
+	conn->conn.input = NULL;
+	conn->conn.output = NULL;
+	conn->conn.fd_in = -1;
+	conn->conn.fd_out = -1;
+	conn->closing = TRUE;
+	conn->connected = FALSE;
+	connection_disconnect(&conn->conn);
+
+	http_client_connection_unref(_conn);
+}
+
 static void 
 http_client_connection_ready(struct http_client_connection *conn)
 {
-	struct stat st;
+	http_client_connection_debug(conn, "Ready for requests");
 
 	/* connected */
 	conn->connected = TRUE;
-	if (conn->to_connect != NULL &&
-	    (conn->ssl_iostream == NULL ||
-	     ssl_iostream_is_handshaked(conn->ssl_iostream)))
+	conn->last_ioloop = current_ioloop;
+	if (conn->to_connect != NULL)
 		timeout_remove(&conn->to_connect);
 
 	/* indicate connection success */
@@ -716,10 +1037,37 @@ http_client_connection_ready(struct http_client_connection *conn)
 	http_client_peer_connection_success(conn->peer);
 
 	/* start raw log */
-	if (conn->client->set.rawlog_dir != NULL &&
-		stat(conn->client->set.rawlog_dir, &st) == 0) {
+	if (conn->client->set.rawlog_dir != NULL) {
 		iostream_rawlog_create(conn->client->set.rawlog_dir,
 				       &conn->conn.input, &conn->conn.output);
+	}
+
+	/* direct tunneling connections handle connect requests just by providing a
+	   raw connection */
+	if (conn->peer->addr.type == HTTP_CLIENT_PEER_ADDR_RAW) {
+		struct http_client_request *req;
+		
+		req = http_client_peer_claim_request(conn->peer, FALSE);
+		if (req != NULL) {
+			struct http_response response;
+
+			http_client_request_ref(req);
+			req->conn = conn;
+			conn->tunneling = TRUE;
+
+			memset(&response, 0, sizeof(response));
+			response.status = 200;
+			response.reason = "OK";
+
+			(void)http_client_connection_return_response(req, &response);
+			http_client_request_unref(&req);
+			return;
+		} 
+		
+		http_client_connection_debug(conn,
+			"No raw connect requests pending; closing useless connection");
+		http_client_connection_close(&conn);
+		return;
 	}
 
 	/* start protocol I/O */
@@ -733,7 +1081,7 @@ static int
 http_client_connection_ssl_handshaked(const char **error_r, void *context)
 {
 	struct http_client_connection *conn = context;
-	const char *error, *host = conn->peer->addr.https_name;
+	const char *error, *host = conn->peer->addr.a.tcp.https_name;
 
 	if (ssl_iostream_check_cert_validity(conn->ssl_iostream, host, &error) == 0)
 		http_client_connection_debug(conn, "SSL handshake successful");
@@ -744,8 +1092,6 @@ http_client_connection_ssl_handshaked(const char **error_r, void *context)
 		*error_r = error;
 		return -1;
 	}
-	if (conn->to_connect != NULL)
-		timeout_remove(&conn->to_connect);
 	return 0;
 }
 
@@ -769,7 +1115,7 @@ http_client_connection_ssl_init(struct http_client_connection *conn,
 		http_client_connection_debug(conn, "Starting SSL handshake");
 
 	if (io_stream_create_ssl_client(conn->client->ssl_ctx,
-					conn->peer->addr.https_name, &ssl_set,
+					conn->peer->addr.a.tcp.https_name, &ssl_set,
 					&conn->conn.input, &conn->conn.output,
 					&conn->ssl_iostream, &error) < 0) {
 		*error_r = t_strdup_printf(
@@ -785,7 +1131,14 @@ http_client_connection_ssl_init(struct http_client_connection *conn,
 		return -1;
 	}
 
-	http_client_connection_ready(conn);
+	if (ssl_iostream_is_handshaked(conn->ssl_iostream)) {
+		http_client_connection_ready(conn);
+	} else {
+		/* wait for handshake to complete; connection input handler does the rest
+		   by reading from the input stream */
+		o_stream_set_flush_callback(conn->conn.output,
+			http_client_connection_output, conn);
+	}
 	return 0;
 }
 
@@ -802,11 +1155,11 @@ http_client_connection_connected(struct connection *_conn, bool success)
 	} else {
 		conn->connected_timestamp = ioloop_timeval;
 		http_client_connection_debug(conn, "Connected");
-		if (conn->peer->addr.https_name != NULL) {
+		if (http_client_peer_addr_is_https(&conn->peer->addr)) {
 			if (http_client_connection_ssl_init(conn, &error) < 0) {
 				http_client_peer_connection_failure(conn->peer, error);
 				http_client_connection_debug(conn, "%s", error);
-				http_client_connection_unref(&conn);
+				http_client_connection_close(&conn);
 			}
 			return;
 		}
@@ -817,7 +1170,8 @@ http_client_connection_connected(struct connection *_conn, bool success)
 static const struct connection_settings http_client_connection_set = {
 	.input_max_size = (size_t)-1,
 	.output_max_size = (size_t)-1,
-	.client = TRUE
+	.client = TRUE,
+	.delayed_unix_client_connected_callback = TRUE
 };
 
 static const struct connection_vfuncs http_client_connection_vfuncs = {
@@ -839,7 +1193,7 @@ http_client_connection_delayed_connect_error(struct http_client_connection *conn
 	timeout_remove(&conn->to_input);
 	errno = conn->connect_errno;
 	http_client_connection_connected(&conn->conn, FALSE);
-	http_client_connection_unref(&conn);
+	http_client_connection_close(&conn);
 }
 
 static void http_client_connect_timeout(struct http_client_connection *conn)
@@ -848,7 +1202,8 @@ static void http_client_connect_timeout(struct http_client_connection *conn)
 	http_client_connection_destroy(&conn->conn);
 }
 
-static void http_client_connection_connect(struct http_client_connection *conn)
+static void
+http_client_connection_connect(struct http_client_connection *conn)
 {
 	unsigned int msecs;
 
@@ -872,80 +1227,163 @@ static void http_client_connection_connect(struct http_client_connection *conn)
 	}
 }
 
+static void
+http_client_connect_tunnel_timeout(struct http_client_connection *conn)
+{
+	const char *error, *name = http_client_peer_addr2str(&conn->peer->addr);
+	unsigned int msecs;
+
+	msecs = timeval_diff_msecs(&ioloop_timeval,
+				   &conn->connect_start_timestamp);
+	error = t_strdup_printf(
+		"Tunnel connect(%s) failed: "
+		"Connection timed out in %u.%03u secs",
+		name, msecs/1000, msecs%1000);
+
+	http_client_connection_debug(conn, "%s", error);
+	http_client_peer_connection_failure(conn->peer, error);
+	http_client_connection_close(&conn);
+}
+
+static void
+http_client_connection_tunnel_response(const struct http_response *response,
+			       struct http_client_connection *conn)
+{
+	struct http_client_tunnel tunnel;
+	const char *name = http_client_peer_addr2str(&conn->peer->addr);
+
+	if (response->status != 200) {
+		http_client_peer_connection_failure(conn->peer, t_strdup_printf(
+			"Tunnel connect(%s) failed: %d %s", name,
+				response->status, response->reason));
+		conn->connect_request = NULL;
+		return;
+	}
+
+	http_client_request_start_tunnel(conn->connect_request, &tunnel);
+	conn->connect_request = NULL;
+
+	connection_init_from_streams
+		(conn->client->conn_list, &conn->conn, name, tunnel.input, tunnel.output);
+	i_stream_unref(&tunnel.input);
+	o_stream_unref(&tunnel.output);
+	conn->connect_initialized = TRUE;
+}
+
+static void
+http_client_connection_connect_tunnel(struct http_client_connection *conn,
+	const struct ip_addr *ip, in_port_t port)
+{
+	unsigned int msecs;
+
+	conn->connect_start_timestamp = ioloop_timeval;
+
+	conn->connect_request = http_client_request_connect_ip
+		(conn->client, ip, port, http_client_connection_tunnel_response, conn);
+	http_client_request_set_urgent(conn->connect_request);
+	http_client_request_submit(conn->connect_request);
+
+	/* don't use connection.h timeout because we want this timeout
+	   to include also the SSL handshake */
+	msecs = conn->client->set.connect_timeout_msecs;
+	if (msecs == 0)
+		msecs = conn->client->set.request_timeout_msecs;
+	if (msecs > 0) {
+		conn->to_connect =
+			timeout_add(msecs, http_client_connect_tunnel_timeout, conn);
+	}
+}
+
 struct http_client_connection *
 http_client_connection_create(struct http_client_peer *peer)
 {
 	struct http_client_connection *conn;
 	static unsigned int id = 0;
 	const struct http_client_peer_addr *addr = &peer->addr;
+	const char *conn_type = "UNKNOWN";
+
+	switch (peer->addr.type) {
+	case HTTP_CLIENT_PEER_ADDR_HTTP:
+		conn_type = "HTTP";
+		break;
+	case HTTP_CLIENT_PEER_ADDR_HTTPS:
+		conn_type = "HTTPS";
+		break;
+	case HTTP_CLIENT_PEER_ADDR_HTTPS_TUNNEL:
+		conn_type = "Tunneled HTTPS";
+		break;
+	case HTTP_CLIENT_PEER_ADDR_RAW:
+		conn_type = "Raw";
+		break;
+	case HTTP_CLIENT_PEER_ADDR_UNIX:
+		conn_type = "Unix";
+		break;
+	}
 
 	conn = i_new(struct http_client_connection, 1);
 	conn->refcount = 1;
 	conn->client = peer->client;
 	conn->id = id++;
 	conn->peer = peer;
-	i_array_init(&conn->request_wait_list, 16);
+	if (peer->addr.type != HTTP_CLIENT_PEER_ADDR_RAW)
+		i_array_init(&conn->request_wait_list, 16);
 
-	connection_init_client_ip
-		(peer->client->conn_list, &conn->conn, &addr->ip, addr->port);
-	http_client_connection_connect(conn);
+	switch (peer->addr.type) {
+	case HTTP_CLIENT_PEER_ADDR_HTTPS_TUNNEL:
+		http_client_connection_connect_tunnel
+			(conn, &addr->a.tcp.ip, addr->a.tcp.port);
+		break;
+	case HTTP_CLIENT_PEER_ADDR_UNIX:
+		connection_init_client_unix(peer->client->conn_list, &conn->conn,
+			addr->a.un.path);
+		conn->connect_initialized = TRUE;
+		http_client_connection_connect(conn);
+		break;
+	default:
+		connection_init_client_ip(peer->client->conn_list, &conn->conn,
+			&addr->a.tcp.ip, addr->a.tcp.port);
+		conn->connect_initialized = TRUE;
+		http_client_connection_connect(conn);
+	}
 
 	array_append(&peer->conns, &conn, 1);
 
 	http_client_connection_debug(conn,
-		"Connection created (%d parallel connections exist)%s",
-		array_count(&peer->conns), (conn->to_input == NULL ? "" : " [broken]"));
+		"%s connection created (%d parallel connections exist)%s",
+		conn_type, array_count(&peer->conns),
+		(conn->to_input == NULL ? "" : " [broken]"));
 	return conn;
 }
 
 void http_client_connection_ref(struct http_client_connection *conn)
 {
+	i_assert(conn->refcount > 0);
 	conn->refcount++;
 }
 
-void http_client_connection_unref(struct http_client_connection **_conn)
+static void
+http_client_connection_disconnect(struct http_client_connection *conn)
 {
-	struct http_client_connection *conn = *_conn;
-	struct http_client_connection *const *conn_idx;
-	struct http_client_peer *peer = conn->peer;
-	struct http_client_request **req;
-
-	i_assert(conn->refcount > 0);
-
-	if (--conn->refcount > 0)
-		return;
-
-	http_client_connection_debug(conn, "Connection destroy");
-
 	conn->closing = TRUE;
 	conn->connected = FALSE;
+
+	if (conn->connect_request != NULL)
+		http_client_request_abort(&conn->connect_request);
 
 	if (conn->incoming_payload != NULL) {
 		/* the stream is still accessed by lib-http caller. */
 		i_stream_remove_destroy_callback(conn->incoming_payload,
 						 http_client_payload_destroyed);
+		conn->incoming_payload = NULL;
 	}
 
-	connection_disconnect(&conn->conn);
-
-	/* abort all pending requests */
-	array_foreach_modifiable(&conn->request_wait_list, req) {
-		i_assert((*req)->submitted);
-		http_client_request_error(*req, HTTP_CLIENT_REQUEST_ERROR_ABORTED,
-			"Aborting");
-	}
-	if (conn->pending_request != NULL) {
-		http_client_request_error(conn->pending_request,
-			HTTP_CLIENT_REQUEST_ERROR_ABORTED, "Aborting");
-	}
-	array_free(&conn->request_wait_list);
+	http_client_connection_abort_any_requests(conn);
 
 	if (conn->http_parser != NULL)
 		http_response_parser_deinit(&conn->http_parser);
 
-	if (conn->ssl_iostream != NULL)
-		ssl_iostream_unref(&conn->ssl_iostream);
-	connection_deinit(&conn->conn);
+	if (conn->connect_initialized)
+		connection_disconnect(&conn->conn);
 
 	if (conn->io_req_payload != NULL)
 		io_remove(&conn->io_req_payload);
@@ -959,12 +1397,39 @@ void http_client_connection_unref(struct http_client_connection **_conn)
 		timeout_remove(&conn->to_idle);
 	if (conn->to_response != NULL)
 		timeout_remove(&conn->to_response);
+}
+
+bool http_client_connection_unref(struct http_client_connection **_conn)
+{
+	struct http_client_connection *conn = *_conn;
+	struct http_client_connection *const *conn_idx;
+	ARRAY_TYPE(http_client_connection) *conn_arr;
+	struct http_client_peer *peer = conn->peer;
+
+	i_assert(conn->refcount > 0);
+
+	*_conn = NULL;
+
+	if (--conn->refcount > 0)
+		return TRUE;
+
+	http_client_connection_debug(conn, "Connection destroy");
+
+	http_client_connection_disconnect(conn);
+
+	if (array_is_created(&conn->request_wait_list))
+		array_free(&conn->request_wait_list);
+
+	if (conn->ssl_iostream != NULL)
+		ssl_iostream_unref(&conn->ssl_iostream);
+	if (conn->connect_initialized)
+		connection_deinit(&conn->conn);
 	
 	/* remove this connection from the list */
-	array_foreach(&conn->peer->conns, conn_idx) {
+	conn_arr = &conn->peer->conns;
+	array_foreach(conn_arr, conn_idx) {
 		if (*conn_idx == conn) {
-			array_delete(&conn->peer->conns,
-				array_foreach_idx(&conn->peer->conns, conn_idx), 1);
+			array_delete(conn_arr, array_foreach_idx(conn_arr, conn_idx), 1);
 			break;
 		}
 	}
@@ -972,7 +1437,18 @@ void http_client_connection_unref(struct http_client_connection **_conn)
 	if (conn->connect_succeeded)
 		http_client_peer_connection_lost(peer);
 	i_free(conn);
-	*_conn = NULL;
+	return FALSE;
+}
+
+void http_client_connection_close(struct http_client_connection **_conn)
+{
+	struct http_client_connection *conn = *_conn;
+
+	http_client_connection_debug(conn, "Connection close");
+
+	http_client_connection_disconnect(conn);
+
+	http_client_connection_unref(_conn);
 }
 
 void http_client_connection_switch_ioloop(struct http_client_connection *conn)
@@ -989,5 +1465,7 @@ void http_client_connection_switch_ioloop(struct http_client_connection *conn)
 		conn->to_idle = io_loop_move_timeout(&conn->to_idle);
 	if (conn->to_response != NULL)
 		conn->to_response = io_loop_move_timeout(&conn->to_response);
+	if (conn->incoming_payload != NULL)
+		i_stream_switch_ioloop(conn->incoming_payload);
 	connection_switch_ioloop(&conn->conn);
 }

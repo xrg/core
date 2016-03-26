@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -41,7 +41,7 @@ pop3c_storage_create(struct mail_storage *_storage,
 		*error_r = "missing pop3c_host";
 		return -1;
 	}
-	if (storage->set->pop3c_password == '\0') {
+	if (storage->set->pop3c_password[0] == '\0') {
 		*error_r = "missing pop3c_password";
 		return -1;
 	}
@@ -63,6 +63,7 @@ pop3c_client_create_from_set(struct mail_storage *storage,
 	client_set.master_user = set->pop3c_master_user;
 	client_set.password = set->pop3c_password;
 	client_set.dns_client_socket_path =
+		storage->user->set->base_dir[0] == '\0' ? "" :
 		t_strconcat(storage->user->set->base_dir, "/",
 			    DNS_CLIENT_SOCKET_NAME, NULL);
 	str = t_str_new(128);
@@ -175,7 +176,7 @@ static int pop3c_mailbox_open(struct mailbox *box)
 	mbox->client = pop3c_client_create_from_set(box->storage,
 						    mbox->storage->set);
 	pop3c_client_login(mbox->client, pop3c_login_callback, mbox);
-	pop3c_client_run(mbox->client);
+	pop3c_client_wait_one(mbox->client);
 	return mbox->logged_in ? 0 : -1;
 }
 
@@ -185,7 +186,8 @@ static void pop3c_mailbox_close(struct mailbox *box)
 
 	if (mbox->uidl_pool != NULL)
 		pool_unref(&mbox->uidl_pool);
-	i_free(mbox->msg_sizes);
+	i_free_and_null(mbox->msg_uids);
+	i_free_and_null(mbox->msg_sizes);
 	pop3c_client_deinit(&mbox->client);
 	index_storage_mailbox_close(box);
 }
@@ -211,6 +213,21 @@ pop3c_mailbox_update(struct mailbox *box,
 				       "POP3 mailbox update isn't supported");
 	}
 	return index_storage_mailbox_update(box, update);
+}
+
+static int pop3c_mailbox_get_status(struct mailbox *box,
+				    enum mailbox_status_items items,
+				    struct mailbox_status *status_r)
+{
+	struct pop3c_mailbox *mbox = (struct pop3c_mailbox *)box;
+
+	if (index_storage_get_status(box, items, status_r) < 0)
+		return -1;
+
+	if ((pop3c_client_get_capabilities(mbox->client) &
+	     POP3C_CAPABILITY_UIDL) == 0)
+		status_r->have_guids = FALSE;
+	return 0;
 }
 
 static int pop3c_mailbox_get_metadata(struct mailbox *box,
@@ -280,7 +297,8 @@ static bool pop3c_storage_is_inconsistent(struct mailbox *box)
 
 struct mail_storage pop3c_storage = {
 	.name = POP3C_STORAGE_NAME,
-	.class_flags = MAIL_STORAGE_CLASS_FLAG_NO_ROOT,
+	.class_flags = MAIL_STORAGE_CLASS_FLAG_NO_ROOT |
+		MAIL_STORAGE_CLASS_FLAG_HAVE_MAIL_GUIDS,
 
 	.v = {
 		pop3c_get_setting_parser_info,
@@ -307,7 +325,7 @@ struct mailbox pop3c_mailbox = {
 		pop3c_mailbox_update,
 		index_storage_mailbox_delete,
 		index_storage_mailbox_rename,
-		index_storage_get_status,
+		pop3c_mailbox_get_status,
 		pop3c_mailbox_get_metadata,
 		index_storage_set_subscribed,
 		index_storage_attribute_set,
@@ -326,7 +344,7 @@ struct mailbox pop3c_mailbox = {
 		index_transaction_commit,
 		index_transaction_rollback,
 		NULL,
-		index_mail_alloc,
+		pop3c_mail_alloc,
 		index_storage_search_init,
 		index_storage_search_deinit,
 		index_storage_search_next_nonblock,

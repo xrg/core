@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -11,7 +11,6 @@
 #include "maildir-sync.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 
 struct maildir_index_sync_context {
@@ -95,7 +94,7 @@ static int maildir_expunge(struct maildir_mailbox *mbox, const char *path,
 	}
 	if (errno == ENOENT)
 		return 0;
-	if (errno == EISDIR)
+	if (UNLINK_EISDIR(errno))
 		return maildir_lose_unexpected_dir(box->storage, path);
 
 	mail_storage_set_critical(&mbox->storage->storage,
@@ -228,11 +227,9 @@ int maildir_sync_index_begin(struct maildir_mailbox *mbox,
 	if (maildir_sync_ctx == NULL)
 		sync_flags &= ~MAIL_INDEX_SYNC_FLAG_DROP_RECENT;
 
-	if (mail_index_sync_begin(_box->index, &sync_ctx, &view,
-				  &trans, sync_flags) < 0) {
-		mailbox_set_index_error(_box);
+	if (index_storage_expunged_sync_begin(_box, &sync_ctx, &view,
+					      &trans, sync_flags) < 0)
 		return -1;
-	}
 
 	ctx = i_new(struct maildir_index_sync_context, 1);
 	ctx->mbox = mbox;
@@ -316,6 +313,7 @@ static int maildir_sync_index_finish(struct maildir_index_sync_context *ctx,
 			  mailbox_get_path(&ctx->mbox->box), time_diff,
 			  ctx->new_msgs_count, ctx->flag_change_count,
 			  ctx->expunge_count);
+		mail_index_sync_no_warning(ctx->sync_ctx);
 	}
 
 	if (ret < 0)
@@ -335,6 +333,7 @@ static int maildir_sync_index_finish(struct maildir_index_sync_context *ctx,
 		mbox->syncing_commit = FALSE;
 	}
 
+	index_storage_expunging_deinit(&mbox->box);
 	maildir_keywords_sync_deinit(&ctx->keywords_sync_ctx);
 	index_sync_changes_deinit(&ctx->sync_changes);
 	i_free(ctx);
@@ -483,7 +482,7 @@ int maildir_sync_index(struct maildir_index_sync_context *ctx,
 			  mailbox_get_path(&ctx->mbox->box),
 			  hdr->uid_validity, uid_validity);
 		mail_index_reset(trans);
-		index_mailbox_reset_uidvalidity(&mbox->box);
+		mailbox_recent_flags_reset(&mbox->box);
 
 		first_uid = hdr->messages_count + 1;
 		memset(&empty_hdr, 0, sizeof(empty_hdr));
@@ -636,7 +635,7 @@ int maildir_sync_index(struct maildir_index_sync_context *ctx,
 			/* UIDVALIDITY changed, skip over the old messages */
 			seq = first_uid;
 		}
-		index_mailbox_set_recent_seq(&mbox->box, view2, seq, seq2);
+		mailbox_recent_flags_set_seqs(&mbox->box, view2, seq, seq2);
 	}
 	mail_index_view_close(&view2);
 
@@ -715,10 +714,12 @@ int maildir_list_index_has_changed(struct mailbox *box,
 	int ret;
 
 	ret = index_storage_list_index_has_changed(box, list_view, seq);
-	if (ret != 0)
+	if (ret != 0 || box->storage->set->mailbox_list_index_very_dirty_syncs)
 		return ret;
-	if (mbox->storage->set->maildir_very_dirty_syncs)
+	if (mbox->storage->set->maildir_very_dirty_syncs) {
+		/* we don't track cur/new directories with dirty syncs */
 		return 0;
+	}
 
 	ext_id = maildir_list_get_ext_id(mbox, list_view);
 	mail_index_lookup_ext(list_view, seq, ext_id, &data, &expunged);
@@ -772,8 +773,10 @@ void maildir_list_index_update_sync(struct mailbox *box,
 	bool expunged;
 
 	index_storage_list_index_update_sync(box, trans, seq);
-	if (mbox->storage->set->maildir_very_dirty_syncs)
+	if (mbox->storage->set->maildir_very_dirty_syncs) {
+		/* we don't track cur/new directories with dirty syncs */
 		return;
+	}
 
 	/* get the current record */
 	list_view = mail_index_transaction_get_view(trans);

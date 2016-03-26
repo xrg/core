@@ -1,10 +1,9 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "test-lib.h"
 #include "array.h"
 #include "seq-range-array.h"
 
-#include <stdlib.h>
 
 static void
 boundaries_permute(uint32_t *input, unsigned int i, unsigned int count)
@@ -54,10 +53,36 @@ static void test_seq_range_array_add_merge(void)
 	test_end();
 }
 
+static void test_seq_range_array_remove_nth(void)
+{
+	ARRAY_TYPE(seq_range) range;
+	const struct seq_range *r;
+
+	test_begin("seq_range_array_remove_nth()");
+	t_array_init(&range, 8);
+	seq_range_array_add_range(&range, 1, 5);
+	seq_range_array_add(&range, 7);
+	seq_range_array_add_range(&range, 10,20);
+	test_assert(array_count(&range) == 3);
+
+	seq_range_array_remove_nth(&range, 0, 2);
+	r = array_idx(&range, 0); test_assert(r->seq1 == 3 && r->seq2 == 5);
+
+	seq_range_array_remove_nth(&range, 1, 4);
+	r = array_idx(&range, 0); test_assert(r->seq1 == 3 && r->seq2 == 3);
+	r = array_idx(&range, 1); test_assert(r->seq1 == 11 && r->seq2 == 20);
+
+	seq_range_array_remove_nth(&range, 5, (uint32_t)-1);
+	r = array_idx(&range, 1); test_assert(r->seq1 == 11 && r->seq2 == 14);
+
+	test_assert(array_count(&range) == 2);
+	test_end();
+}
+
 static void test_seq_range_array_random(void)
 {
-#define SEQ_RANGE_TEST_BUFSIZE 20
-#define SEQ_RANGE_TEST_COUNT 10000
+#define SEQ_RANGE_TEST_BUFSIZE 100
+#define SEQ_RANGE_TEST_COUNT 20000
 	unsigned char shadowbuf[SEQ_RANGE_TEST_BUFSIZE];
 	ARRAY_TYPE(seq_range) range;
 	const struct seq_range *seqs;
@@ -74,12 +99,18 @@ static void test_seq_range_array_random(void)
 		test = rand() % 4;
 		switch (test) {
 		case 0:
-			seq_range_array_add(&range, seq1);
+			ret = seq_range_array_add(&range, seq1) ? 0 : 1; /* FALSE == added */
+			ret2 = shadowbuf[seq1] == 0 ? 1 : 0;
 			shadowbuf[seq1] = 1;
 			break;
 		case 1:
-			seq_range_array_add_range(&range, seq1, seq2);
-			memset(shadowbuf + seq1, 1, seq2 - seq1 + 1);
+			ret = seq_range_array_add_range_count(&range, seq1, seq2);
+			for (ret2 = 0; seq1 <= seq2; seq1++) {
+				if (shadowbuf[seq1] == 0) {
+					ret2++;
+					shadowbuf[seq1] = 1;
+				}
+			}
 			break;
 		case 2:
 			ret = seq_range_array_remove(&range, seq1) ? 1 : 0;
@@ -125,6 +156,7 @@ fail:
 		test_out_reason("seq_range_array random", FALSE,
 			t_strdup_printf("round %u test %d failed", i, test));
 	}
+	array_free(&range);
 }
 
 static void test_seq_range_array_invert(void)
@@ -206,6 +238,7 @@ void test_seq_range_array(void)
 {
 	test_seq_range_array_add_boundaries();
 	test_seq_range_array_add_merge();
+	test_seq_range_array_remove_nth();
 	test_seq_range_array_invert();
 	test_seq_range_array_have_common();
 	test_seq_range_array_random();

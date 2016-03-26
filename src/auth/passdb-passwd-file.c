@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "passdb.h"
@@ -7,7 +7,6 @@
 
 #include "str.h"
 #include "auth-cache.h"
-#include "var-expand.h"
 #include "password-scheme.h"
 #include "db-passwd-file.h"
 
@@ -28,16 +27,14 @@ static void passwd_file_save_results(struct auth_request *request,
 	string_t *str;
 	char **p;
 
-	*crypted_pass_r = pu->password;
+	*crypted_pass_r = pu->password != NULL ? pu->password : "";
 	*scheme_r = password_get_scheme(crypted_pass_r);
 	if (*scheme_r == NULL)
 		*scheme_r = request->passdb->passdb->default_pass_scheme;
 
 	/* save the password so cache can use it */
-	if (*crypted_pass_r != NULL) {
-		auth_request_set_field(request, "password",
-				       *crypted_pass_r, *scheme_r);
-        }
+	auth_request_set_field(request, "password",
+			       *crypted_pass_r, *scheme_r);
 
 	if (pu->extra_fields != NULL) {
 		str = t_str_new(512);
@@ -48,7 +45,8 @@ static void passwd_file_save_results(struct auth_request *request,
 			if (value != NULL) {
 				key = t_strdup_until(*p, value);
 				str_truncate(str, 0);
-				var_expand(str, value + 1, table);
+				auth_request_var_expand_with_table(str, value + 1,
+					request, table, NULL);
 				value = str_c(str);
 			} else {
 				key = *p;
@@ -80,7 +78,7 @@ passwd_file_verify_plain(struct auth_request *request, const char *password,
 	passwd_file_save_results(request, pu, &crypted_pass, &scheme);
 
 	ret = auth_request_password_verify(request, password, crypted_pass,
-					   scheme, "passwd-file");
+					   scheme, AUTH_SUBSYS_DB);
 
 	callback(ret > 0 ? PASSDB_RESULT_OK : PASSDB_RESULT_PASSWORD_MISMATCH,
 		 request);
@@ -154,9 +152,9 @@ passwd_file_preinit(pool_t pool, const char *args)
 	module->username_format = format;
 
 	if (!module->pwf->vars)
-		module->module.cache_key = format;
+		module->module.default_cache_key = format;
 	else {
-		module->module.cache_key = auth_cache_parse_key(pool,
+		module->module.default_cache_key = auth_cache_parse_key(pool,
 			t_strconcat(format, module->pwf->path, NULL));
 	}
 

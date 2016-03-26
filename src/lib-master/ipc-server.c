@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -154,6 +154,8 @@ void ipc_server_deinit(struct ipc_server **_server)
 	i_assert(server->ipc_cmd_refcount == 0);
 
 	ipc_server_disconnect(server);
+	if (server->to != NULL)
+		timeout_remove(&server->to);
 	i_free(server->name);
 	i_free(server->path);
 	i_free(server);

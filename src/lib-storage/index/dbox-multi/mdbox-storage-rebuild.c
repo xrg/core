@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -16,9 +16,10 @@
 #include "mdbox-sync.h"
 #include "mdbox-storage-rebuild.h"
 
-#include <stdlib.h>
 #include <dirent.h>
 #include <unistd.h>
+
+#define REBUILD_MAX_REFCOUNT 32768
 
 struct mdbox_rebuild_msg {
 	struct mdbox_rebuild_msg *guid_hash_next;
@@ -247,8 +248,7 @@ rebuild_rename_file(struct mdbox_storage_rebuild_context *ctx,
 		/* use link()+unlink() instead of rename() to make sure we
 		   don't overwrite any files. */
 		if (link(old_path, new_path) == 0) {
-			if (unlink(old_path) < 0)
-				i_error("unlink(%s) failed: %m", old_path);
+			i_unlink(old_path);
 			*fname_p = strrchr(new_path, '/') + 1;
 			*file_id_r = ctx->highest_file_id;
 			return 0;
@@ -458,7 +458,8 @@ rebuild_mailbox_multi(struct mdbox_storage_rebuild_context *ctx,
 			   GUID exists multiple times */
 		}
 
-		if (rec != NULL) T_BEGIN {
+		if (rec != NULL &&
+		    rec->refcount < REBUILD_MAX_REFCOUNT) T_BEGIN {
 			/* keep this message. add it to mailbox index. */
 			i_assert(map_uid != 0);
 			rec->refcount++;
@@ -581,6 +582,7 @@ rebuild_mailbox(struct mdbox_storage_rebuild_context *ctx,
 	rebuild_mailbox_multi(ctx, rebuild_ctx, mbox, view, trans);
 	index_index_rebuild_deinit(&rebuild_ctx, dbox_get_uidvalidity_next);
 
+	mail_index_sync_set_reason(sync_ctx, "mdbox storage rebuild");
 	if (mail_index_sync_commit(&sync_ctx) < 0) {
 		mailbox_set_index_error(box);
 		ret = -1;
@@ -640,6 +642,7 @@ static int rebuild_mailboxes(struct mdbox_storage_rebuild_context *ctx)
 
 static int rebuild_msg_mailbox_commit(struct rebuild_msg_mailbox *msg)
 {
+	mail_index_sync_set_reason(msg->sync_ctx, "mdbox storage rebuild");
 	if (mail_index_sync_commit(&msg->sync_ctx) < 0)
 		return -1;
 	mailbox_free(&msg->box);
@@ -758,6 +761,7 @@ static int rebuild_restore_msg(struct mdbox_storage_rebuild_context *ctx,
 	mail_index_update_ext(ctx->prev_msg.trans, seq, mbox->guid_ext_id,
 			      msg->guid_128, NULL);
 
+	i_assert(msg->refcount == 0);
 	msg->refcount++;
 	return 0;
 }
@@ -899,7 +903,7 @@ static int mdbox_storage_rebuild_scan(struct mdbox_storage_rebuild_context *ctx)
 
 	/* begin by locking the map, so that other processes can't try to
 	   rebuild at the same time. */
-	if (mdbox_map_atomic_lock(ctx->atomic) < 0)
+	if (mdbox_map_atomic_lock(ctx->atomic, "mdbox storage rebuild") < 0)
 		return -1;
 
 	/* fsck the map just in case its UIDs are broken */

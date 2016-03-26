@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "str.h"
@@ -9,7 +9,6 @@
 #include "compression.h"
 #include "imap-zlib-plugin.h"
 
-#include <stdlib.h>
 
 #define IMAP_COMPRESS_DEFAULT_LEVEL 6
 
@@ -19,6 +18,8 @@
 struct zlib_client {
 	union imap_module_context module_ctx;
 
+	int (*next_state_export)(struct client *client, bool internal,
+				 buffer_t *dest, const char **error_r);
 	const struct compression_handler *handler;
 };
 
@@ -87,11 +88,6 @@ static bool cmd_compress(struct client_command_context *cmd)
 			t_str_ucase(zclient->handler->name)));
 		return TRUE;
 	}
-	if (client->tls_compression) {
-		client_send_tagline(cmd,
-			"NO [COMPRESSIONACTIVE] TLS compression already enabled.");
-		return TRUE;
-	}
 
 	handler = compression_lookup_handler(t_str_lcase(mechanism));
 	if (handler == NULL || handler->create_istream == NULL) {
@@ -123,6 +119,19 @@ static bool cmd_compress(struct client_command_context *cmd)
 	return TRUE;
 }
 
+static int
+imap_zlib_state_export(struct client *client, bool internal,
+		       buffer_t *dest, const char **error_r)
+{
+	struct zlib_client *zclient = IMAP_ZLIB_IMAP_CONTEXT(client);
+
+	if (zclient->handler != NULL && internal) {
+		*error_r = "COMPRESS enabled";
+		return 0;
+	}
+	return zclient->next_state_export(client, internal, dest, error_r);
+}
+
 static void imap_zlib_client_created(struct client **clientp)
 {
 	struct client *client = *clientp;
@@ -132,6 +141,9 @@ static void imap_zlib_client_created(struct client **clientp)
 	    compression_lookup_handler("deflate") != NULL) {
 		zclient = p_new(client->pool, struct zlib_client, 1);
 		MODULE_CONTEXT_SET(client, imap_zlib_imap_module, zclient);
+
+		zclient->next_state_export = (*clientp)->v.state_export;
+		(*clientp)->v.state_export = imap_zlib_state_export;
 
 		str_append(client->capability_string, " COMPRESS=DEFLATE");
 	}

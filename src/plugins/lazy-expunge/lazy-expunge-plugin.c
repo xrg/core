@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -14,7 +14,6 @@
 #include "lazy-expunge-plugin.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <time.h>
@@ -104,6 +103,8 @@ mailbox_open_or_create(struct mailbox_list *list, struct mailbox *src_box,
 
 	*error_r = mailbox_get_last_error(box, &error);
 	if (error != MAIL_ERROR_NOTFOUND) {
+		*error_r = t_strdup_printf("Failed to open mailbox %s: %s",
+					   name, *error_r);
 		mailbox_free(&box);
 		return NULL;
 	}
@@ -111,7 +112,8 @@ mailbox_open_or_create(struct mailbox_list *list, struct mailbox *src_box,
 	/* try creating and re-opening it. */
 	if (mailbox_create(box, NULL, FALSE) < 0 ||
 	    mailbox_open(box) < 0) {
-		*error_r = mailbox_get_last_error(box, NULL);
+		*error_r = t_strdup_printf("Failed to create mailbox %s: %s", name,
+					   mailbox_get_last_error(box, NULL));
 		mailbox_free(&box);
 		return NULL;
 	}
@@ -147,12 +149,19 @@ static int lazy_expunge_mail_is_last_instace(struct mail *_mail)
 {
 	struct lazy_expunge_transaction *lt =
 		LAZY_EXPUNGE_CONTEXT(_mail->transaction);
-	const char *value;
+	const char *value, *errstr;
 	unsigned long refcount;
+	enum mail_error error;
 
 	if (mail_get_special(_mail, MAIL_FETCH_REFCOUNT, &value) < 0) {
+		errstr = mailbox_get_last_error(_mail->box, &error);
+		if (error == MAIL_ERROR_EXPUNGED) {
+			/* already expunged - just ignore it */
+			return 0;
+		}
 		mail_storage_set_critical(_mail->box->storage,
-			"lazy_expunge: Couldn't lookup message's refcount");
+			"lazy_expunge: Couldn't lookup message's refcount: %s",
+			errstr);
 		return -1;
 	}
 	if (*value == '\0') {
@@ -197,13 +206,18 @@ static void lazy_expunge_mail_expunge(struct mail *_mail)
 		LAZY_EXPUNGE_CONTEXT(_mail->transaction);
 	struct lazy_expunge_mailbox_list *llist;
 	struct mailbox *real_box;
+	struct mail *real_mail;
 	struct mail_save_context *save_ctx;
 	const char *error;
 	int ret;
 
 	/* don't copy the mail if we're expunging from lazy_expunge
 	   namespace (even if it's via a virtual mailbox) */
-	real_box = mail_get_real_mail(_mail)->box;
+	if (mail_get_backend_mail(_mail, &real_mail) < 0) {
+		lt->failed = TRUE;
+		return;
+	}
+	real_box = real_mail->box;
 	llist = LAZY_EXPUNGE_LIST_CONTEXT(real_box->list);
 	if (llist != NULL && llist->internal_namespace) {
 		mmail->super.expunge(_mail);
@@ -439,7 +453,7 @@ static void lazy_expunge_mail_user_created(struct mail_user *user)
 	const char *env;
 
 	env = mail_user_plugin_getenv(user, "lazy_expunge");
-	if (env != NULL) {
+	if (env != NULL && env[0] != '\0') {
 		luser = p_new(user->pool, struct lazy_expunge_mail_user, 1);
 		luser->module_ctx.super = *v;
 		user->vlast = &luser->module_ctx.super;

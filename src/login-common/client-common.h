@@ -6,6 +6,7 @@
 #include "sasl-server.h"
 #include "master-login.h" /* for LOGIN_MAX_SESSION_ID_LEN */
 
+#define LOGIN_MAX_SESSION_ID_LEN 64
 #define LOGIN_MAX_MASTER_PREFIX_LEN 128
 
 /* max. size of input buffer. this means:
@@ -33,6 +34,8 @@
 #define AUTH_MASTER_WAITING_MSG \
 	"Waiting for authentication master process to respond.."
 
+struct master_service_connection;
+
 enum client_disconnect_reason {
 	CLIENT_DISCONNECT_TIMEOUT,
 	CLIENT_DISCONNECT_SYSTEM_SHUTDOWN,
@@ -55,13 +58,18 @@ enum client_auth_result {
 struct client_auth_reply {
 	const char *master_user, *reason;
 	/* for proxying */
-	const char *host, *hostip, *destuser, *password, *proxy_mech;
-	unsigned int port;
+	const char *host, *hostip, *source_ip;
+	const char *destuser, *password, *proxy_mech;
+	in_port_t port;
 	unsigned int proxy_timeout_msecs;
 	unsigned int proxy_refresh_secs;
 	enum login_proxy_ssl_flags ssl_flags;
 
+	/* all the key=value fields returned by passdb */
+	const char *const *all_fields;
+
 	unsigned int proxy:1;
+	unsigned int proxy_nopipelining:1;
 	unsigned int temp:1;
 	unsigned int nologin:1;
 	unsigned int authz_failure:1;
@@ -103,12 +111,12 @@ struct client {
 	struct ip_addr local_ip;
 	struct ip_addr ip;
 	struct ip_addr real_remote_ip, real_local_ip;
-	unsigned int local_port, remote_port;
-	unsigned int real_local_port, real_remote_port;
+	in_port_t local_port, remote_port;
+	in_port_t real_local_port, real_remote_port;
 	struct ssl_proxy *ssl_proxy;
 	const struct login_settings *set;
 	const struct master_service_ssl_settings *ssl_set;
-	const char *session_id;
+	const char *session_id, *listener_name, *postlogin_socket_path;
 
 	int fd;
 	struct istream *input;
@@ -132,6 +140,7 @@ struct client {
 	string_t *auth_response;
 	time_t auth_first_started, auth_finished;
 	const char *sasl_final_resp;
+	const char *const *auth_passdb_args;
 
 	unsigned int master_auth_id;
 	unsigned int master_tag;
@@ -141,7 +150,10 @@ struct client {
 	unsigned int auth_attempts, auth_successes;
 	pid_t mail_pid;
 
-	char *virtual_user, *virtual_user_orig;
+	/* Module-specific contexts. */
+	ARRAY(union login_client_module_context *) module_contexts;
+
+	char *virtual_user, *virtual_user_orig, *virtual_auth_user;
 	unsigned int destroyed:1;
 	unsigned int input_blocked:1;
 	unsigned int login_success:1;
@@ -157,6 +169,7 @@ struct client {
 	unsigned int auth_initializing:1;
 	unsigned int auth_process_comm_fail:1;
 	unsigned int proxy_auth_failed:1;
+	unsigned int proxy_nopipelining:1;
 	unsigned int auth_waiting:1;
 	unsigned int auth_user_disabled:1;
 	unsigned int auth_pass_expired:1;
@@ -165,14 +178,26 @@ struct client {
 	/* ... */
 };
 
+union login_client_module_context {
+	struct client_vfuncs super;
+	struct login_module_register *reg;
+};
+
 extern struct client *clients;
+
+typedef void login_client_allocated_func_t(struct client *client);
+
+/* Sets the client allocation hook and returns the previous hook,
+   which the new hook should call. */
+login_client_allocated_func_t *
+login_client_allocated_hook_set(login_client_allocated_func_t *new_hook);
 
 struct client *
 client_create(int fd, bool ssl, pool_t pool,
+	      const struct master_service_connection *conn,
 	      const struct login_settings *set,
 	      const struct master_service_ssl_settings *ssl_set,
-	      void **other_sets,
-	      const struct ip_addr *local_ip, const struct ip_addr *remote_ip);
+	      void **other_sets);
 void client_destroy(struct client *client, const char *reason);
 void client_destroy_success(struct client *client, const char *reason);
 void client_destroy_internal_failure(struct client *client);

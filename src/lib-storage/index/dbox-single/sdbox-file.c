@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "eacces-error.h"
@@ -24,6 +24,7 @@ static void sdbox_file_init_paths(struct sdbox_file *file, const char *fname)
 	i_free(file->file.alt_path);
 	file->file.primary_path =
 		i_strdup_printf("%s/%s", mailbox_get_path(box), fname);
+	file->file.cur_path = file->file.primary_path;
 
 	if (mailbox_get_path_to(box, MAILBOX_LIST_PATH_TYPE_ALT_MAILBOX,
 				&alt_path) > 0)
@@ -44,10 +45,7 @@ struct dbox_file *sdbox_file_init(struct sdbox_mailbox *mbox, uint32_t uid)
 			sdbox_file_init_paths(file, fname);
 			file->uid = uid;
 		} else {
-			file->file.primary_path =
-				i_strdup_printf("%s/%s",
-						mailbox_get_path(&mbox->box),
-						dbox_generate_tmp_filename());
+			sdbox_file_init_paths(file, dbox_generate_tmp_filename());
 		}
 	} T_END;
 	dbox_file_init(&file->file);
@@ -151,16 +149,19 @@ static int sdbox_file_rename_attachments(struct sdbox_file *file)
 
 int sdbox_file_assign_uid(struct sdbox_file *file, uint32_t uid)
 {
-	const char *old_path, *new_fname, *new_path;
+	const char *p, *old_path, *dir, *new_fname, *new_path;
 	struct stat st;
 
 	i_assert(file->uid == 0);
 	i_assert(uid != 0);
 
 	old_path = file->file.cur_path;
+	p = strrchr(old_path, '/');
+	i_assert(p != NULL);
+	dir = t_strdup_until(old_path, p);
+
 	new_fname = t_strdup_printf(SDBOX_MAIL_FILE_FORMAT, uid);
-	new_path = t_strdup_printf("%s/%s", mailbox_get_path(&file->mbox->box),
-				   new_fname);
+	new_path = t_strdup_printf("%s/%s", dir, new_fname);
 
 	if (stat(new_path, &st) == 0) {
 		mail_storage_set_critical(&file->file.storage->storage,
@@ -255,7 +256,8 @@ int sdbox_file_create_fd(struct dbox_file *file, const char *path, bool parents)
 		dir = t_strdup_until(path, p);
 		if (mkdir_parents_chgrp(dir, perm->dir_create_mode,
 					perm->file_create_gid,
-					perm->file_create_gid_origin) < 0) {
+					perm->file_create_gid_origin) < 0 &&
+		   errno != EEXIST) {
 			mail_storage_set_critical(box->storage,
 				"mkdir_parents(%s) failed: %m", dir);
 			return -1;
@@ -351,7 +353,7 @@ int sdbox_file_move(struct dbox_file *file, bool alt_path)
 		ret = -1;
 	}
 	if (ret < 0) {
-		(void)unlink(temp_path);
+		i_unlink(temp_path);
 		return -1;
 	}
 	/* preserve the original atime/mtime. this isn't necessary for Dovecot,
@@ -369,14 +371,14 @@ int sdbox_file_move(struct dbox_file *file, bool alt_path)
 	if (rename(temp_path, dest_path) < 0) {
 		mail_storage_set_critical(storage,
 			"rename(%s, %s) failed: %m", temp_path, dest_path);
-		(void)unlink(temp_path);
+		i_unlink_if_exists(temp_path);
 		return -1;
 	}
 	if (storage->set->parsed_fsync_mode != FSYNC_MODE_NEVER) {
 		if (fdatasync_path(dest_dir) < 0) {
 			mail_storage_set_critical(storage,
 				"fdatasync(%s) failed: %m", dest_dir);
-			(void)unlink(dest_path);
+			i_unlink(dest_path);
 			return -1;
 		}
 	}
@@ -384,7 +386,7 @@ int sdbox_file_move(struct dbox_file *file, bool alt_path)
 		dbox_file_set_syscall_error(file, "unlink()");
 		if (errno == EACCES) {
 			/* configuration problem? revert the write */
-			(void)unlink(dest_path);
+			i_unlink(dest_path);
 		}
 		/* who knows what happened to the file. keep both just to be
 		   sure both won't get deleted. */
@@ -436,7 +438,7 @@ int sdbox_file_unlink_with_attachments(struct sdbox_file *sfile)
 
 	pool = pool_alloconly_create("sdbox attachments unlink", 1024);
 	p_array_init(&extrefs, pool, 16);
-	if (!dbox_attachment_parse_extref(extrefs_line, pool, &extrefs)) {
+	if (!index_attachment_parse_extrefs(extrefs_line, pool, &extrefs)) {
 		i_warning("%s: Ignoring corrupted extref: %s",
 			  sfile->file.cur_path, extrefs_line);
 		array_clear(&extrefs);

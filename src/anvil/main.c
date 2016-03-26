@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2016 Dovecot authors, see the included COPYING file */
 
 #include "common.h"
 #include "array.h"
@@ -13,7 +13,6 @@
 #include "penalty.h"
 #include "anvil-connection.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 
 struct connect_limit *connect_limit;

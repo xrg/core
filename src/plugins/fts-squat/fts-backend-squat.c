@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -11,7 +11,6 @@
 #include "squat-trie.h"
 #include "fts-squat-plugin.h"
 
-#include <stdlib.h>
 
 #define SQUAT_FILE_PREFIX "dovecot.index.search"
 
@@ -430,11 +429,13 @@ static int squat_lookup_arg(struct squat_fts_backend *backend,
 
 static int
 fts_backend_squat_lookup(struct fts_backend *_backend, struct mailbox *box,
-			 struct mail_search_arg *args, bool and_args,
+			 struct mail_search_arg *args,
+			 enum fts_lookup_flags flags,
 			 struct fts_result *result)
 {
 	struct squat_fts_backend *backend =
 		(struct squat_fts_backend *)_backend;
+	bool and_args = (flags & FTS_LOOKUP_FLAG_AND_ARGS) != 0;
 	bool first = TRUE;
 	int ret;
 

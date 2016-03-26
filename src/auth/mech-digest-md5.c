@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 /* Digest-MD5 SASL authentication, see RFC-2831 */
 
@@ -13,7 +13,6 @@
 #include "mech.h"
 #include "passdb.h"
 
-#include <stdlib.h>
 
 #define MAX_REALM_LEN 64
 
@@ -122,7 +121,7 @@ static bool verify_credentials(struct digest_auth_request *request,
 
 	/* get the MD5 password */
 	if (size != MD5_RESULTLEN) {
-                auth_request_log_error(&request->auth_request, "digest-md5",
+                auth_request_log_error(&request->auth_request, AUTH_SUBSYS_MECH,
 				       "invalid credentials length");
 		return FALSE;
 	}
@@ -211,7 +210,7 @@ static bool verify_credentials(struct digest_auth_request *request,
 			/* verify response */
 			if (memcmp(response_hex, request->response, 32) != 0) {
 				auth_request_log_info(&request->auth_request,
-						      "digest-md5",
+						      AUTH_SUBSYS_MECH,
 						      "password mismatch");
 				return FALSE;
 			}
@@ -246,7 +245,7 @@ static bool parse_next(char **data, char **key, char **value)
 	*value = p+1;
 
 	/* skip trailing whitespace in key */
-	while (IS_LWS(p[-1]))
+	while (p > *data && IS_LWS(p[-1]))
 		p--;
 	*p = '\0';
 
@@ -334,12 +333,19 @@ static bool auth_handle_response(struct digest_auth_request *request,
 	}
 
 	if (strcmp(key, "nc") == 0) {
+		unsigned int nc;
+
 		if (request->nonce_count != NULL) {
 			*error = "nonce-count must not exist more than once";
 			return FALSE;
 		}
 
-		if (atoi(value) != 1) {
+		if (str_to_uint(value, &nc) < 0) {
+			*error = "nonce-count value invalid";
+			return FALSE;
+		}
+
+		if (nc != 1) {
 			*error = "re-auth not supported currently";
 			return FALSE;
 		}
@@ -566,7 +572,7 @@ mech_digest_md5_auth_continue(struct auth_request *auth_request,
 	}
 
 	if (error != NULL)
-                auth_request_log_info(auth_request, "digest-md5", "%s", error);
+                auth_request_log_info(auth_request, AUTH_SUBSYS_MECH, "%s", error);
 
 	auth_request_fail(auth_request);
 }
@@ -592,7 +598,7 @@ static struct auth_request *mech_digest_md5_auth_new(void)
 	struct digest_auth_request *request;
 	pool_t pool;
 
-	pool = pool_alloconly_create("digest_md5_auth_request", 2048);
+	pool = pool_alloconly_create(MEMPOOL_GROWING"digest_md5_auth_request", 2048);
 	request = p_new(pool, struct digest_auth_request, 1);
 	request->pool = pool;
 	request->qop = QOP_AUTH;

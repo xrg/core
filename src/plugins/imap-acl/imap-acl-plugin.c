@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2008-2016 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "str.h"
@@ -12,7 +12,6 @@
 #include "acl-plugin.h"
 #include "imap-acl-plugin.h"
 
-#include <stdlib.h>
 
 #define ERROR_NOT_ADMIN "["IMAP_RESP_CODE_NOPERM"] " \
 	"You lack administrator privileges on this mailbox."

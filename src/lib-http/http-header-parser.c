@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -19,7 +19,6 @@ enum http_header_parse_state {
 	HTTP_HEADER_PARSE_STATE_CR,
 	HTTP_HEADER_PARSE_STATE_LF,
 	HTTP_HEADER_PARSE_STATE_NEW_LINE,
-	HTTP_HEADER_PARSE_STATE_LAST_LINE,
 	HTTP_HEADER_PARSE_STATE_EOH
 };
 
@@ -37,16 +36,19 @@ struct http_header_parser {
 	buffer_t *value_buf;
 
 	enum http_header_parse_state state;
+
+	unsigned int lenient:1;
 };
 
 struct http_header_parser *
 http_header_parser_init(struct istream *input,
-	const struct http_header_limits *limits)
+	const struct http_header_limits *limits, bool lenient)
 {
 	struct http_header_parser *parser;
 
 	parser = i_new(struct http_header_parser, 1);
 	parser->input = input;
+	parser->lenient = lenient;
 	parser->name = str_new(default_pool, 128);
 	parser->value_buf = buffer_create_dynamic(default_pool, 4096);
 
@@ -67,11 +69,12 @@ void http_header_parser_deinit(struct http_header_parser **_parser)
 {
 	struct http_header_parser *parser = *_parser;
 
+	*_parser = NULL;
+
 	//i_stream_skip(ctx->input, ctx->skip);
 	buffer_free(&parser->value_buf);
 	str_free(&parser->name);
 	i_free(parser);
-	*_parser = NULL;
 }
 
 void http_header_parser_reset(struct http_header_parser *parser)
@@ -116,14 +119,28 @@ static int http_header_parse_ows(struct http_header_parser *parser)
 
 static int http_header_parse_content(struct http_header_parser *parser)
 {
-	const unsigned char *first = parser->cur;
+	const unsigned char *first;
 
-	/* field-content  = *( HTAB / SP / VCHAR / obs-text )
+	/* field-content  = field-vchar [ 1*( SP / HTAB ) field-vchar ]
+	   field-vchar    = VCHAR / obs-text
 	 */
-	while (parser->cur < parser->end && http_char_is_text(*parser->cur))
-		parser->cur++;
+	do {
+		first = parser->cur;
+		while (parser->cur < parser->end && http_char_is_text(*parser->cur)) {
+			parser->cur++;
+		}
+		buffer_append(parser->value_buf, first, parser->cur-first);
 
-	buffer_append(parser->value_buf, first, parser->cur-first);
+		if (!parser->lenient)
+			break;
+
+		/* We'll be lenient here to accommodate for some bad servers. We just
+		   drop offending characters */
+		while (parser->cur < parser->end && !http_char_is_text(*parser->cur) &&
+			(*parser->cur != '\r' && *parser->cur != '\n'))
+			parser->cur++;
+	} while (parser->cur < parser->end &&
+		(*parser->cur != '\r' && *parser->cur != '\n'));
 
 	if (parser->cur == parser->end)
 		return 0;
@@ -141,14 +158,19 @@ static int http_header_parse(struct http_header_parser *parser)
 {
 	int ret;
 
-	/* 'header'       = *( header-field CRLF ) CRLF
+	/* RFC 7230, Section 3.2: Header Fields
+
+	   'header'       = *( header-field CRLF ) CRLF
+	                  ; Actually part of HTTP-message syntax
+
 	   header-field   = field-name ":" OWS field-value OWS
 	   field-name     = token
 	   field-value    = *( field-content / obs-fold )
-	   field-content  = *( HTAB / SP / VCHAR / obs-text )
-	   obs-fold       = CRLF ( SP / HTAB )
+	   field-content  = field-vchar [ 1*( SP / HTAB ) field-vchar ]
+	   field-vchar    = VCHAR / obs-text
+	   obs-fold       = CRLF 1*( SP / HTAB )
 	                  ; obsolete line folding
-	                  ; see Section 3.2.2
+	                  ; see Section 3.2.4
 	 */
 
 	for (;;) {
@@ -156,16 +178,24 @@ static int http_header_parse(struct http_header_parser *parser)
 		case HTTP_HEADER_PARSE_STATE_INIT:
 			buffer_set_used_size(parser->value_buf, 0);
 			str_truncate(parser->name, 0);
+			if (*parser->cur == '\r') {
+				/* last CRLF */
+				parser->cur++;
+				parser->state = HTTP_HEADER_PARSE_STATE_EOH;
+				if (parser->cur == parser->end)
+					return 0;
+				break;
+			} else if (*parser->cur == '\n') {
+				/* last LF */
+				parser->state = HTTP_HEADER_PARSE_STATE_EOH;
+				break;
+			}
+			/* next line */
 			parser->state = HTTP_HEADER_PARSE_STATE_NAME;
 			/* fall through */
 		case HTTP_HEADER_PARSE_STATE_NAME:
-			if (http_char_is_token(*parser->cur)) {
-				if ((ret=http_header_parse_name(parser)) <= 0)
-					return ret;
-			} else if (*parser->cur != ':' && str_len(parser->name) == 0) {
-				parser->state = HTTP_HEADER_PARSE_STATE_LAST_LINE;
-				break;
-			}
+			if ((ret=http_header_parse_name(parser)) <= 0)
+				return ret;
 			parser->state = HTTP_HEADER_PARSE_STATE_COLON;
 			/* fall through */
 		case HTTP_HEADER_PARSE_STATE_COLON:
@@ -200,6 +230,12 @@ static int http_header_parse(struct http_header_parser *parser)
 		case HTTP_HEADER_PARSE_STATE_CR:
 			if (*parser->cur == '\r') {
 				parser->cur++;
+			} else if (*parser->cur != '\n') {
+				parser->error = t_strdup_printf
+					("Invalid character %s in content of header field '%s'",
+						_chr_sanitize(*parser->cur),
+						str_sanitize(str_c(parser->name),64));
+				return -1;
 			}
 			parser->state = HTTP_HEADER_PARSE_STATE_LF;
 			if (parser->cur == parser->end)
@@ -208,7 +244,7 @@ static int http_header_parse(struct http_header_parser *parser)
 		case HTTP_HEADER_PARSE_STATE_LF:
 			if (*parser->cur != '\n') {
 				parser->error = t_strdup_printf
-					("Expected line end after header field '%s', but found %s",
+					("Expected LF after CR at end of header field '%s', but found %s",
 						str_sanitize(str_c(parser->name),64),
 						_chr_sanitize(*parser->cur));
 				return -1;
@@ -224,31 +260,14 @@ static int http_header_parse(struct http_header_parser *parser)
 				buffer_append_c(parser->value_buf, ' ');
 				parser->state = HTTP_HEADER_PARSE_STATE_OWS;
 				break;
-			}
+			} 
+			/* next header line */
 			parser->state = HTTP_HEADER_PARSE_STATE_INIT;
 			return 1;
-		case HTTP_HEADER_PARSE_STATE_LAST_LINE:
-			if (*parser->cur == '\r') {
-				/* last CRLF */
-				parser->cur++;
-				parser->state = HTTP_HEADER_PARSE_STATE_EOH;
-				if (parser->cur == parser->end)
-					return 0;
-				break;
-			} else if (*parser->cur == '\n') {
-				/* header fully parsed */
-				parser->cur++;
-				parser->state = HTTP_HEADER_PARSE_STATE_EOH;
-				return 1;
-			}
-			parser->error = t_strdup_printf
-				("Expected CRLF or header field name, but found %s",
-					_chr_sanitize(*parser->cur));
-			return -1;
 		case HTTP_HEADER_PARSE_STATE_EOH:
 			if (*parser->cur != '\n') {
 				parser->error = t_strdup_printf
-					("Expected LF after CR at end of header, but found %s",
+					("Encountered stray CR at beginning of header line, followed by %s",
 						_chr_sanitize(*parser->cur));
 				return -1;
 			}
@@ -272,7 +291,7 @@ int http_header_parse_next_field(struct http_header_parser *parser,
 	const uoff_t max_size = parser->limits.max_size;
 	const uoff_t max_field_size = parser->limits.max_field_size;
 	const unsigned char *data;
-	uoff_t size;
+	size_t size;
 	int ret;
 
 	*error_r = NULL;
@@ -334,7 +353,11 @@ int http_header_parse_next_field(struct http_header_parser *parser,
 	}
 
 	i_assert(ret != -2);
-	if (ret < 0)
-		*error_r = "Stream error";
+	if (ret < 0) {
+		if (i_stream_is_eof(parser->input))
+			*error_r = "Premature end of input";
+		else
+			*error_r = "Stream error";
+	}
 	return ret;
 }

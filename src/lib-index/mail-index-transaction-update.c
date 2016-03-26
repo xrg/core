@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 /* Inside transaction we keep messages stored in sequences in uid fields.
    Before they're written to transaction log the sequences are changed to
@@ -101,6 +101,7 @@ void mail_index_transaction_reset_v(struct mail_index_transaction *t)
 	t->index_undeleted = FALSE;
 	t->log_updates = FALSE;
 	t->log_ext_updates = FALSE;
+	t->tail_offset_changed = FALSE;
 }
 
 void mail_index_transaction_set_log_updates(struct mail_index_transaction *t)
@@ -978,6 +979,7 @@ void mail_index_update_ext(struct mail_index_transaction *t, uint32_t seq,
 		rext = array_idx(&index->extensions, ext_id);
 		record_size = rext->record_size;
 	}
+	i_assert(record_size > 0);
 
 	if (!array_is_created(&t->ext_rec_updates))
 		i_array_init(&t->ext_rec_updates, ext_id + 2);

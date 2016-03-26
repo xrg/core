@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "istream.h"
@@ -66,13 +66,15 @@ http_request_parser_init(struct istream *input,
 		max_payload_size = HTTP_REQUEST_DEFAULT_MAX_PAYLOAD_SIZE;
 
 	http_message_parser_init
-		(&parser->parser, input, &hdr_limits, max_payload_size);
+		(&parser->parser, input, &hdr_limits, max_payload_size, FALSE);
 	return parser;
 }
 
 void http_request_parser_deinit(struct http_request_parser **_parser)
 {
 	struct http_request_parser *parser = *_parser;
+
+	*_parser = NULL;
 
 	http_message_parser_deinit(&parser->parser);
 	i_free(parser);
@@ -158,9 +160,11 @@ static int http_request_parse(struct http_request_parser *parser,
 	struct http_message_parser *_parser = &parser->parser;
 	int ret;
 
-	/* request-line = method SP request-target SP HTTP-version CRLF
-	 */
+	/* RFC 7230, Section 3.1.1: Request Line
 
+	   request-line  = method SP request-target SP HTTP-version CRLF
+	   method        = token
+	 */
 	for (;;) {
 		switch (parser->state) {
 		case HTTP_REQUEST_PARSE_STATE_INIT:
@@ -168,6 +172,7 @@ static int http_request_parse(struct http_request_parser *parser,
 			parser->state = HTTP_REQUEST_PARSE_STATE_SKIP_LINE;
 			if (_parser->cur == _parser->end)
 				return 0;
+			/* fall through */
 		case HTTP_REQUEST_PARSE_STATE_SKIP_LINE:
 			if (*_parser->cur == '\r' || *_parser->cur == '\n') {
 				if (parser->skipping_line) {
@@ -328,7 +333,8 @@ http_request_parser_message_error(struct http_request_parser *parser)
 	return HTTP_REQUEST_PARSE_ERROR_BROKEN_REQUEST;
 }
 
-bool http_request_parser_pending_payload(struct http_request_parser *parser)
+bool http_request_parser_pending_payload(
+	struct http_request_parser *parser)
 {
 	if (parser->parser.payload == NULL)
 		return FALSE;
@@ -344,13 +350,11 @@ http_request_parse_expect_header(struct http_request_parser *parser,
 	bool parse_error = FALSE;
 	unsigned int num_expectations = 0;
 
-	/* Expect       = 1#expectation
-	   expectation  = expect-name [ BWS "=" BWS expect-value ]
-	                    *( OWS ";" [ OWS expect-param ] )
-	   expect-param = expect-name [ BWS "=" BWS expect-value ]
-	   expect-name  = token
-	   expect-value = token / quoted-string
+	/* RFC 7231, Section 5.1.1:
+
+	   Expect  = "100-continue"
 	 */
+	// FIXME: simplify; RFC 7231 discarded Expect extension mechanism
 	http_parser_init(&hparser, (const unsigned char *)hdr->value, hdr->size);
 	while (!parse_error) {
 		const char *expect_name, *expect_value;
@@ -361,18 +365,6 @@ http_request_parse_expect_header(struct http_request_parser *parser,
 			if (strcasecmp(expect_name, "100-continue") == 0) {
 				request->expect_100_continue = TRUE;
 			} else {
-				/* http://tools.ietf.org/html/draft-ietf-httpbis-p2-semantics-23
-				     Section 5.1.1:
-
-				   If all received Expect header field(s) are syntactically valid but
-				   contain an expectation that the recipient does not understand or
-				   cannot comply with, the recipient MUST respond with a 417
-				   (Expectation Failed) status code.  A recipient of a syntactically
-				   invalid Expectation header field MUST respond with a 4xx status code
-				   other than 417.
-
-				   --> Must check rest of expect header syntax before returning error.
-				 */
 				if (parser->error_code == HTTP_REQUEST_PARSE_ERROR_NONE) {
 					parser->error_code = HTTP_REQUEST_PARSE_ERROR_EXPECTATION_FAILED;
 					_parser->error = t_strdup_printf
@@ -390,7 +382,7 @@ http_request_parse_expect_header(struct http_request_parser *parser,
 				http_parse_ows(&hparser);
 
 				/* value */
-				if (http_parse_word(&hparser, &expect_value) <= 0) {
+				if (http_parse_token_or_qstring(&hparser, &expect_value) <= 0) {
 					parse_error = TRUE;
 					break;
 				}
@@ -429,7 +421,7 @@ http_request_parse_expect_header(struct http_request_parser *parser,
 				http_parse_ows(&hparser);
 
 				/* value */
-				if (http_parse_word(&hparser, &value) <= 0) {
+				if (http_parse_token_or_qstring(&hparser, &value) <= 0) {
 					parse_error = TRUE;
 					break;
 				}
@@ -479,6 +471,7 @@ http_request_parse_headers(struct http_request_parser *parser,
 	array_foreach(hdrs, hdr) {
 		int ret = 0;
 
+		/* Expect: */
 		if (http_header_field_is(hdr, "Expect"))
 			ret = http_request_parse_expect_header(parser, request, hdr);
 
@@ -488,12 +481,11 @@ http_request_parse_headers(struct http_request_parser *parser,
 	return 0;
 }
 
-int http_request_parse_next(struct http_request_parser *parser,
-			    pool_t pool, struct http_request *request,
-			    enum http_request_parse_error *error_code_r, const char **error_r)
+int http_request_parse_finish_payload(
+	struct http_request_parser *parser,
+	enum http_request_parse_error *error_code_r,
+	const char **error_r)
 {
-	const struct http_header_field *hdr;
-	const char *error;
 	int ret;
 
 	*error_code_r = parser->error_code = HTTP_REQUEST_PARSE_ERROR_NONE;
@@ -506,10 +498,26 @@ int http_request_parse_next(struct http_request_parser *parser,
 			*error_code_r = http_request_parser_message_error(parser);
 			*error_r = parser->parser.error;
 		}
-		return ret;
 	}
+	return ret;
+}
 
-	/* HTTP-message   = start-line
+int http_request_parse_next(struct http_request_parser *parser,
+			    pool_t pool, struct http_request *request,
+			    enum http_request_parse_error *error_code_r, const char **error_r)
+{
+	const struct http_header_field *hdr;
+	const char *error;
+	int ret;
+
+	/* initialize and get rid of any payload of previous request */
+	if ((ret=http_request_parse_finish_payload
+		(parser, error_code_r, error_r)) <= 0)
+		return ret;
+
+	/* RFC 7230, Section 3:
+		
+	   HTTP-message   = start-line
 	                   *( header-field CRLF )
 	                    CRLF
 	                    [ message-body ]
@@ -547,8 +555,7 @@ int http_request_parse_next(struct http_request_parser *parser,
 	}
 	parser->state = HTTP_REQUEST_PARSE_STATE_INIT;
 
-	/* https://tools.ietf.org/html/draft-ietf-httpbis-p1-messaging-23
-	     Section 5.4:
+	/* RFC 7230, Section 5.4: Host
 
 	   A server MUST respond with a 400 (Bad Request) status code to any
 	   HTTP/1.1 request message that lacks a Host header field and to any
@@ -591,5 +598,9 @@ int http_request_parse_next(struct http_request_parser *parser,
 	request->header = parser->parser.msg.header;
 	request->connection_options = parser->parser.msg.connection_options;
 	request->connection_close = parser->parser.msg.connection_close;
+
+	/* reset this state early */
+	parser->request_method = NULL;
+	parser->request_target = NULL;
 	return 1;
 }

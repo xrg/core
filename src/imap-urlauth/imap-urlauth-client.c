@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "imap-urlauth-common.h"
 #include "array.h"
@@ -19,7 +19,6 @@
 #include "master-service.h"
 #include "master-interface.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
 

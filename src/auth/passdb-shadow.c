@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "passdb.h"
@@ -12,36 +12,46 @@
 #define SHADOW_CACHE_KEY "%u"
 #define SHADOW_PASS_SCHEME "CRYPT"
 
+static enum passdb_result
+shadow_lookup(struct auth_request *request, struct spwd **spw_r)
+{
+	auth_request_log_debug(request, AUTH_SUBSYS_DB, "lookup");
+
+	*spw_r = getspnam(request->user);
+	if (*spw_r == NULL) {
+		auth_request_log_unknown_user(request, AUTH_SUBSYS_DB);
+		return PASSDB_RESULT_USER_UNKNOWN;
+	}
+
+	if (!IS_VALID_PASSWD((*spw_r)->sp_pwdp)) {
+		auth_request_log_info(request, AUTH_SUBSYS_DB,
+				      "invalid password field");
+		return PASSDB_RESULT_USER_DISABLED;
+	}
+
+	/* save the password so cache can use it */
+	auth_request_set_field(request, "password", (*spw_r)->sp_pwdp,
+			       SHADOW_PASS_SCHEME);
+	return PASSDB_RESULT_OK;
+}
+
 static void
 shadow_verify_plain(struct auth_request *request, const char *password,
 		    verify_plain_callback_t *callback)
 {
 	struct spwd *spw;
+	enum passdb_result res;
 	int ret;
 
-	auth_request_log_debug(request, "shadow", "lookup");
-
-	spw = getspnam(request->user);
-	if (spw == NULL) {
-		auth_request_log_unknown_user(request, "shadow");
-		callback(PASSDB_RESULT_USER_UNKNOWN, request);
+	res = shadow_lookup(request, &spw);
+	if (res != PASSDB_RESULT_OK) {
+		callback(res, request);
 		return;
 	}
-
-	if (!IS_VALID_PASSWD(spw->sp_pwdp)) {
-		auth_request_log_info(request, "shadow",
-				      "invalid password field");
-		callback(PASSDB_RESULT_USER_DISABLED, request);
-		return;
-	}
-
-	/* save the password so cache can use it */
-	auth_request_set_field(request, "password", spw->sp_pwdp,
-			       SHADOW_PASS_SCHEME);
 
 	/* check if the password is valid */
 	ret = auth_request_password_verify(request, password, spw->sp_pwdp,
-					   SHADOW_PASS_SCHEME, "shadow");
+					   SHADOW_PASS_SCHEME, AUTH_SUBSYS_DB);
 
 	/* clear the passwords from memory */
 	safe_memset(spw->sp_pwdp, 0, strlen(spw->sp_pwdp));
@@ -57,6 +67,24 @@ shadow_verify_plain(struct auth_request *request, const char *password,
 	callback(PASSDB_RESULT_OK, request);
 }
 
+static void
+shadow_lookup_credentials(struct auth_request *request,
+			  lookup_credentials_callback_t *callback)
+{
+	struct spwd *spw;
+	enum passdb_result res;
+
+	res = shadow_lookup(request, &spw);
+	if (res != PASSDB_RESULT_OK) {
+		callback(res, NULL, 0, request);
+		return;
+	}
+	/* make sure we're using the username exactly as it's in the database */
+        auth_request_set_field(request, "user", spw->sp_namp, NULL);
+	passdb_handle_credentials(PASSDB_RESULT_OK, spw->sp_pwdp,
+				  SHADOW_PASS_SCHEME, callback, request);
+}
+
 static struct passdb_module *
 shadow_preinit(pool_t pool, const char *args)
 {
@@ -69,7 +97,7 @@ shadow_preinit(pool_t pool, const char *args)
 	else if (*args != '\0')
 		i_fatal("passdb shadow: Unknown setting: %s", args);
 
-	module->cache_key = SHADOW_CACHE_KEY;
+	module->default_cache_key = SHADOW_CACHE_KEY;
 	module->default_pass_scheme = SHADOW_PASS_SCHEME;
 	return module;
 }
@@ -87,7 +115,7 @@ struct passdb_module_interface passdb_shadow = {
 	shadow_deinit,
 
 	shadow_verify_plain,
-	NULL,
+	shadow_lookup_credentials,
 	NULL
 };
 #else

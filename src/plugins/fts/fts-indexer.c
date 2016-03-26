@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -113,9 +113,10 @@ int fts_indexer_init(struct fts_backend *backend, struct mailbox *box,
 		return 0;
 	}
 
-	cmd = t_strdup_printf("PREPEND\t1\t%s\t%s\n",
+	cmd = t_strdup_printf("PREPEND\t1\t%s\t%s\t0\t%s\n",
 			      str_tabescape(box->storage->user->username),
-			      str_tabescape(box->vname));
+			      str_tabescape(box->vname),
+			      str_tabescape(box->storage->user->session_id));
 	fd = fts_indexer_cmd(box->storage->user, cmd, &path);
 	if (fd == -1)
 		return -1;
@@ -192,7 +193,9 @@ static int fts_indexer_input(struct fts_indexer_context *ctx)
 		}
 	}
 	if (ctx->input->stream_errno != 0) {
-		i_error("indexer read() failed: %m");
+		i_error("indexer read(%s) failed: %s",
+			i_stream_get_name(ctx->input),
+			i_stream_get_error(ctx->input));
 		return -1;
 	}
 	if (ctx->input->eof) {

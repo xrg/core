@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 
@@ -10,7 +10,6 @@
 #include "db-sql.h"
 
 #include <stddef.h>
-#include <stdlib.h>
 
 #define DEF_STR(name) DEF_STRUCT_STR(name, sql_settings)
 #define DEF_INT(name) DEF_STRUCT_INT(name, sql_settings)

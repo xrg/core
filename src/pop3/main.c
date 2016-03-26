@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "pop3-common.h"
 #include "ioloop.h"
@@ -19,7 +19,6 @@
 #include "mail-storage-service.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 
 #define IS_STANDALONE() \
@@ -86,8 +85,6 @@ static void client_add_input(struct client *client, const buffer_t *buf)
 	output = client->output;
 	o_stream_ref(output);
 	o_stream_cork(output);
-	if (!IS_STANDALONE())
-		client_send_line(client, "+OK Logged in.");
 	(void)client_handle_input(client);
 	o_stream_uncork(output);
 	o_stream_unref(&output);
@@ -104,10 +101,13 @@ client_create_from_input(const struct mail_storage_service_input *input,
 	struct mail_user *mail_user;
 	struct client *client;
 	const struct pop3_settings *set;
+	const char *error;
 
 	if (mail_storage_service_lookup_next(storage_service, input,
 					     &user, &mail_user, error_r) <= 0) {
-		(void)write(fd_out, lookup_error_str, strlen(lookup_error_str));
+		if (write(fd_out, lookup_error_str, strlen(lookup_error_str)) < 0) {
+			/* ignored */
+		}
 		return -1;
 	}
 	restrict_access_allow_coredumps(TRUE);
@@ -117,8 +117,16 @@ client_create_from_input(const struct mail_storage_service_input *input,
 		verbose_proctitle = TRUE;
 
 	if (client_create(fd_in, fd_out, input->session_id,
-			  mail_user, user, set, &client) == 0)
+			  mail_user, user, set, &client) < 0)
+		return 0;
+	if (!IS_STANDALONE())
+		client_send_line(client, "+OK Logged in.");
+	if (client_init_mailbox(client, &error) == 0)
 		client_add_input(client, input_buf);
+	else {
+		i_error("%s", error);
+		client_destroy(client, error);
+	}
 	return 0;
 }
 
@@ -205,8 +213,9 @@ int main(int argc, char *argv[])
 	};
 	struct master_login_settings login_set;
 	enum master_service_flags service_flags = 0;
-	enum mail_storage_service_flags storage_service_flags = 0;
-	const char *username = NULL;
+	enum mail_storage_service_flags storage_service_flags =
+		MAIL_STORAGE_SERVICE_FLAG_AUTOEXPUNGE;
+	const char *username = NULL, *auth_socket_path = "auth-master";
 	int c;
 
 	memset(&login_set, 0, sizeof(login_set));
@@ -229,9 +238,12 @@ int main(int argc, char *argv[])
 	}
 
 	master_service = master_service_init("pop3", service_flags,
-					     &argc, &argv, "t:u:");
+					     &argc, &argv, "a:t:u:");
 	while ((c = master_getopt(master_service)) > 0) {
 		switch (c) {
+		case 'a':
+			auth_socket_path = optarg;
+			break;
 		case 't':
 			if (str_to_uint(optarg, &login_set.postlogin_timeout_secs) < 0 ||
 			    login_set.postlogin_timeout_secs == 0)
@@ -247,7 +259,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	login_set.auth_socket_path = t_abspath("auth-master");
+	login_set.auth_socket_path = t_abspath(auth_socket_path);
 	if (argv[optind] != NULL)
 		login_set.postlogin_socket_path = t_abspath(argv[optind]);
 	login_set.callback = login_client_connected;
@@ -275,7 +287,7 @@ int main(int argc, char *argv[])
 
 	if (io_loop_is_running(current_ioloop))
 		master_service_run(master_service, client_connected);
-	clients_destroy_all();
+	clients_destroy_all(storage_service);
 
 	if (master_login != NULL)
 		master_login_deinit(&master_login);

@@ -4,12 +4,19 @@
 #include "master-interface.h"
 #include "master-service.h"
 
+struct master_service_haproxy_conn;
+
 struct master_service_listener {
 	struct master_service *service;
-	int fd;
+	char *name;
+
+	/* settings */
 	bool ssl;
+	bool haproxy;
+
+	/* state */
+	int fd;	
 	struct io *io;
-	const char *name;
 };
 
 struct master_service {
@@ -28,10 +35,8 @@ struct master_service {
 	int config_fd;
 	int syslog_facility;
 
-	unsigned int socket_count, ssl_socket_count;
 	struct master_service_listener *listeners;
-	char **listener_names;
-	unsigned int listener_names_count;
+	unsigned int socket_count;
 
 	struct io *io_status_write, *io_status_error;
 	unsigned int service_count_left;
@@ -63,6 +68,8 @@ struct master_service {
 	struct ssl_iostream_context *ssl_ctx;
 	time_t ssl_params_last_refresh;
 
+	struct master_service_haproxy_conn *haproxy_conns;
+
 	unsigned int killed:1;
 	unsigned int stopping:1;
 	unsigned int keep_environment:1;
@@ -70,9 +77,10 @@ struct master_service {
 	unsigned int initial_status_sent:1;
 	unsigned int die_with_master:1;
 	unsigned int call_avail_overflow:1;
-	unsigned int config_path_is_default:1;
+	unsigned int config_path_changed_with_param:1;
 	unsigned int want_ssl_settings:1;
 	unsigned int ssl_ctx_initialized:1;
+	unsigned int config_path_from_master:1;
 };
 
 void master_service_io_listeners_add(struct master_service *service);
@@ -81,5 +89,14 @@ void master_service_close_config_fd(struct master_service *service);
 
 void master_service_io_listeners_remove(struct master_service *service);
 void master_service_ssl_io_listeners_remove(struct master_service *service);
+
+void master_service_client_connection_handled(struct master_service *service,
+					      struct master_service_connection *conn);
+void master_service_client_connection_callback(struct master_service *service,
+					       struct master_service_connection *conn);
+
+void master_service_haproxy_new(struct master_service *service,
+				struct master_service_connection *conn);
+void master_service_haproxy_abort(struct master_service *service);
 
 #endif

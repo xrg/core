@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -154,7 +154,7 @@ void mailbox_log_record_set_timestamp(struct mailbox_log_record *rec,
 
 time_t mailbox_log_record_get_timestamp(const struct mailbox_log_record *rec)
 {
-	return ((time_t)rec->timestamp[0] << 24) |
+	return (time_t)(rec->timestamp[0] << 24) |
 		((time_t)rec->timestamp[1] << 16) |
 		((time_t)rec->timestamp[2] << 8) |
 		(time_t)rec->timestamp[3];
@@ -276,8 +276,7 @@ mailbox_log_iter_next(struct mailbox_log_iter *iter)
 			(iter->count - iter->idx) * sizeof(iter->buf[0]);
 		i_error("Corrupted mailbox log %s at offset %"PRIuUOFF_T": "
 			"type=%d", iter->filepath, offset, rec->type);
-		if (unlink(iter->filepath) < 0)
-			i_error("unlink(%s) failed: %m", iter->filepath);
+		i_unlink(iter->filepath);
 		return NULL;
 	}
 	return rec;

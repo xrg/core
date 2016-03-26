@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -10,7 +10,6 @@
 #include "strescape.h"
 #include "var-expand.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <ctype.h>
 
@@ -19,7 +18,7 @@
 
 struct var_expand_context {
 	int offset;
-	unsigned int width;
+	int width;
 	bool zero_padding;
 };
 
@@ -51,7 +50,8 @@ m_str_hex(const char *str, struct var_expand_context *ctx ATTR_UNUSED)
 {
 	unsigned long long l;
 
-	l = strtoull(str, NULL, 10);
+	if (str_to_ullong(str, &l) < 0)
+		l = 0;
 	return t_strdup_printf("%llx", l);
 }
 
@@ -170,14 +170,20 @@ static const char *
 var_expand_func(const struct var_expand_func_table *func_table,
 		const char *key, const char *data, void *context)
 {
-	if (strcmp(key, "env") == 0)
-		return getenv(data);
+	const char *value;
+
+	if (strcmp(key, "env") == 0) {
+		value = getenv(data);
+		return value != NULL ? value : "";
+	}
 	if (func_table == NULL)
 		return NULL;
 
 	for (; func_table->key != NULL; func_table++) {
-		if (strcmp(func_table->key, key) == 0)
-			return func_table->func(data, context);
+		if (strcmp(func_table->key, key) == 0) {
+			value = func_table->func(data, context);
+			return value != NULL ? value : "";
+		}
 	}
 	return NULL;
 }
@@ -268,7 +274,8 @@ void var_expand_with_funcs(string_t *dest, const char *str,
 			}
 
 			if (*str == '.') {
-				ctx.offset = sign * (int)ctx.width;
+				ctx.offset = sign * ctx.width;
+				sign = 1;
 				ctx.width = 0;
 				str++;
 
@@ -280,11 +287,16 @@ void var_expand_with_funcs(string_t *dest, const char *str,
 					ctx.zero_padding = TRUE;
 					str++;
 				}
+				if (*str == '-') {
+					sign = -1;
+					str++;
+				}
 
 				while (*str >= '0' && *str <= '9') {
 					ctx.width = ctx.width*10 + (*str - '0');
 					str++;
 				}
+				ctx.width = sign * ctx.width;
 			}
 
                         modifier_count = 0;
@@ -350,11 +362,13 @@ void var_expand_with_funcs(string_t *dest, const char *str,
 				}
 				if (ctx.width == 0)
 					str_append(dest, var);
-				else if (!ctx.zero_padding)
+				else if (!ctx.zero_padding) {
+					if (ctx.width < 0)
+						ctx.width = strlen(var) - (-ctx.width);
 					str_append_n(dest, var, ctx.width);
-				else {
+				} else {
 					/* %05d -like padding. no truncation. */
-					size_t len = strlen(var);
+					int len = strlen(var);
 					while (len < ctx.width) {
 						str_append_c(dest, '0');
 						ctx.width--;
@@ -392,7 +406,7 @@ void var_get_key_range(const char *str, unsigned int *idx_r,
 
 	if (str[i] == '.') {
 		i++;
-		while (str[i] >= '0' && str[i] <= '9')
+		while ((str[i] >= '0' && str[i] <= '9') || str[i] == '-')
 			i++;
 	}
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "seq-range-array.h"
@@ -10,14 +10,12 @@
 #include "imap-fetch.h"
 #include "imap-sync.h"
 
-#include <stdlib.h>
 
 struct imap_select_context {
 	struct client_command_context *cmd;
 	struct mail_namespace *ns;
 	struct mailbox *box;
 
-	struct timeval start_time;
 	struct imap_fetch_context *fetch_ctx;
 
 	uint32_t qresync_uid_validity;
@@ -201,8 +199,6 @@ static void select_context_free(struct imap_select_context *ctx)
 static void cmd_select_finish(struct imap_select_context *ctx, int ret)
 {
 	const char *resp_code;
-	struct timeval end_time;
-	int time_msecs;
 
 	if (ret < 0) {
 		if (ctx->box != NULL)
@@ -211,13 +207,9 @@ static void cmd_select_finish(struct imap_select_context *ctx, int ret)
 	} else {
 		resp_code = mailbox_is_readonly(ctx->box) ?
 			"READ-ONLY" : "READ-WRITE";
-		if (gettimeofday(&end_time, NULL) < 0)
-			memset(&end_time, 0, sizeof(end_time));
-		time_msecs = timeval_diff_msecs(&end_time, &ctx->start_time);
 		client_send_tagline(ctx->cmd, t_strdup_printf(
-			"OK [%s] %s completed (%d.%03d secs).", resp_code,
-			ctx->cmd->client->mailbox_examined ? "Examine" : "Select",
-			time_msecs/1000, time_msecs%1000));
+			"OK [%s] %s completed", resp_code,
+			ctx->cmd->client->mailbox_examined ? "Examine" : "Select"));
 	}
 	select_context_free(ctx);
 }
@@ -233,10 +225,8 @@ static bool cmd_select_continue(struct client_command_context *cmd)
 	}
 
 	ret = imap_fetch_end(ctx->fetch_ctx);
-	if (ret < 0) {
-		client_send_storage_error(ctx->cmd,
-					  mailbox_get_storage(ctx->box));
-	}
+	if (ret < 0)
+		client_send_box_error(ctx->cmd, ctx->box);
 	imap_fetch_free(&ctx->fetch_ctx);
 	cmd_select_finish(ctx, ret);
 	return TRUE;
@@ -247,6 +237,7 @@ static int select_qresync(struct imap_select_context *ctx)
 	struct imap_fetch_context *fetch_ctx;
 	struct mail_search_args *search_args;
 	struct imap_fetch_qresync_args qresync_args;
+	int ret;
 
 	search_args = mail_search_build_init();
 	search_args->args = p_new(search_args->pool, struct mail_search_arg, 1);
@@ -282,10 +273,9 @@ static int select_qresync(struct imap_select_context *ctx)
 		ctx->cmd->context = ctx;
 		return 0;
 	}
-	if (imap_fetch_end(fetch_ctx) < 0)
-		return -1;
+	ret = imap_fetch_end(fetch_ctx);
 	imap_fetch_free(&fetch_ctx);
-	return 1;
+	return ret < 0 ? -1 : 1;
 }
 
 static int
@@ -302,8 +292,7 @@ select_open(struct imap_select_context *ctx, const char *mailbox, bool readonly)
 		flags |= MAILBOX_FLAG_DROP_RECENT;
 	ctx->box = mailbox_alloc(ctx->ns->list, mailbox, flags);
 	if (mailbox_open(ctx->box) < 0) {
-		client_send_storage_error(ctx->cmd,
-					  mailbox_get_storage(ctx->box));
+		client_send_box_error(ctx->cmd, ctx->box);
 		mailbox_free(&ctx->box);
 		return -1;
 	}
@@ -312,8 +301,7 @@ select_open(struct imap_select_context *ctx, const char *mailbox, bool readonly)
 		ret = mailbox_enable(ctx->box, client->enabled_features);
 	if (ret < 0 ||
 	    mailbox_sync(ctx->box, MAILBOX_SYNC_FLAG_FULL_READ) < 0) {
-		client_send_storage_error(ctx->cmd,
-					  mailbox_get_storage(ctx->box));
+		client_send_box_error(ctx->cmd, ctx->box);
 		return -1;
 	}
 	mailbox_get_open_status(ctx->box, STATUS_MESSAGES | STATUS_RECENT |
@@ -350,10 +338,11 @@ select_open(struct imap_select_context *ctx, const char *mailbox, bool readonly)
 			 t_strdup_printf("* OK [UIDNEXT %u] Predicted next UID",
 					 status.uidnext));
 
+	client->nonpermanent_modseqs = status.nonpermanent_modseqs;
 	if (status.nonpermanent_modseqs) {
 		client_send_line(client,
 				 "* OK [NOMODSEQ] No permanent modsequences");
-	} else {
+	} else if (!status.no_modseq_tracking) {
 		client_send_line(client,
 			t_strdup_printf("* OK [HIGHESTMODSEQ %llu] Highest",
 				(unsigned long long)status.highest_modseq));
@@ -361,10 +350,9 @@ select_open(struct imap_select_context *ctx, const char *mailbox, bool readonly)
 	}
 
 	if (ctx->qresync_uid_validity == status.uidvalidity &&
-	    status.uidvalidity != 0) {
+	    status.uidvalidity != 0 && !client->nonpermanent_modseqs) {
 		if ((ret = select_qresync(ctx)) < 0) {
-			client_send_storage_error(ctx->cmd,
-				mailbox_get_storage(ctx->box));
+			client_send_box_error(ctx->cmd, ctx->box);
 			return -1;
 		}
 	} else {
@@ -415,7 +403,6 @@ bool cmd_select_full(struct client_command_context *cmd, bool readonly)
 		client_send_tagline(cmd, error);
 		return TRUE;
 	}
-	(void)gettimeofday(&ctx->start_time, NULL);
 
 	if (imap_arg_get_list(&args[1], &list_args)) {
 		if (!select_parse_options(ctx, list_args)) {

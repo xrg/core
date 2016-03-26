@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "mail-storage.h"
@@ -13,6 +13,7 @@
 struct copy_cmd_context {
 	struct doveadm_mail_cmd_context ctx;
 
+	const char *source_username;
 	struct mail_storage_service_user *source_service_user;
 	struct mail_user *source_user;
 
@@ -71,13 +72,13 @@ cmd_copy_box(struct copy_cmd_context *ctx, struct mailbox *destbox,
 }
 
 static void
-cmd_copy_alloc_source_user(struct copy_cmd_context *ctx, const char *username)
+cmd_copy_alloc_source_user(struct copy_cmd_context *ctx)
 {
 	struct mail_storage_service_input input;
 	const char *error;
 
 	input = ctx->ctx.storage_service_input;
-	input.username = username;
+	input.username = ctx->source_username;
 
 	if (mail_storage_service_lookup_next(ctx->ctx.storage_service, &input,
 					     &ctx->source_service_user,
@@ -99,6 +100,9 @@ cmd_copy_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 	struct mailbox *destbox;
 	const struct mailbox_info *info;
 	int ret = 0;
+
+	if (ctx->source_username != NULL && ctx->source_user == NULL)
+		cmd_copy_alloc_source_user(ctx);
 
 	ns = mail_namespace_find(user->namespaces, ctx->destname);
 	destbox = mailbox_alloc(ns->list, ctx->destname, MAILBOX_FLAG_SAVEONLY);
@@ -146,13 +150,14 @@ static void cmd_copy_init(struct doveadm_mail_cmd_context *_ctx,
 		     MAIL_STORAGE_SERVICE_FLAG_USERDB_LOOKUP) == 0)
 			i_fatal("Use -u parameter to specify destination user");
 
-		cmd_copy_alloc_source_user(ctx, args[1]);
+		ctx->source_username = p_strdup(_ctx->pool, args[1]);
 		args += 2;
 	}
 
 	ctx->destname = p_strdup(ctx->ctx.pool, destname);
 	_ctx->search_args = doveadm_mail_build_search_args(args);
-	expunge_search_args_check(ctx->ctx.search_args, cmdname);
+	if (ctx->move)
+		expunge_search_args_check(ctx->ctx.search_args, cmdname);
 }
 
 static void cmd_copy_deinit(struct doveadm_mail_cmd_context *_ctx)
@@ -186,9 +191,28 @@ static struct doveadm_mail_cmd_context *cmd_move_alloc(void)
 	return &ctx->ctx;
 }
 
-struct doveadm_mail_cmd cmd_copy = {
-	cmd_copy_alloc, "copy", "<destination> [user <source user>] <search query>"
+struct doveadm_cmd_ver2 doveadm_cmd_copy_ver2 = {
+	.name = "copy",
+	.mail_cmd = cmd_copy_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "<destination> [user <source user>] <search query>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('\0', "destination-mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "source-type", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "source-user", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "query", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };
-struct doveadm_mail_cmd cmd_move = {
-	cmd_move_alloc, "move", "<destination> [user <source user>] <search query>"
+
+struct doveadm_cmd_ver2 doveadm_cmd_move_ver2 = {
+	.name = "move",
+	.mail_cmd = cmd_move_alloc,
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "<destination> [user <source user>] <search query>",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('\0', "destination-mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "source-type", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "source-user", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('\0', "query", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };

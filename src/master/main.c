@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "common.h"
 #include "ioloop.h"
@@ -10,8 +10,8 @@
 #include "hostpid.h"
 #include "abspath.h"
 #include "ipwd.h"
+#include "str.h"
 #include "execv-const.h"
-#include "mountpoint-list.h"
 #include "restrict-process-size.h"
 #include "master-instance.h"
 #include "master-service.h"
@@ -27,7 +27,6 @@
 #include "dovecot-version.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -143,11 +142,14 @@ master_fatal_callback(const struct failure_context *ctx,
 {
 	const char *path, *str;
 	va_list args2;
+	pid_t pid;
 	int fd;
-
+	
 	/* if we already forked a child process, this isn't fatal for the
 	   main process and there's no need to write the fatal file. */
-	if (getpid() == strtol(my_pid, NULL, 10)) {
+	if (str_to_pid(my_pid, &pid) < 0)
+		i_unreached();
+	if (getpid() == pid) {
 		/* write the error message to a file (we're chdired to
 		   base dir) */
 		path = t_strconcat(FATAL_FILENAME, NULL);
@@ -155,6 +157,7 @@ master_fatal_callback(const struct failure_context *ctx,
 		if (fd != -1) {
 			VA_COPY(args2, args);
 			str = t_strdup_vprintf(format, args2);
+			va_end(args2);
 			(void)write_full(fd, str, strlen(str));
 			i_close_fd(&fd);
 		}
@@ -173,6 +176,7 @@ startup_fatal_handler(const struct failure_context *ctx,
 	VA_COPY(args2, args);
 	fprintf(stderr, "%s%s\n", failure_log_type_prefixes[ctx->type],
 		t_strdup_vprintf(fmt, args2));
+	va_end(args2);
 	orig_fatal_callback(ctx, fmt, args);
 	abort();
 }
@@ -186,6 +190,7 @@ startup_error_handler(const struct failure_context *ctx,
 	VA_COPY(args2, args);
 	fprintf(stderr, "%s%s\n", failure_log_type_prefixes[ctx->type],
 		t_strdup_vprintf(fmt, args2));
+	va_end(args2);
 	orig_error_callback(ctx, fmt, args);
 }
 
@@ -210,9 +215,8 @@ static void fatal_log_check(const struct master_settings *set)
 			"information): %s\n", buf);
 	}
 
-	close(fd);
-	if (unlink(path) < 0)
-		i_error("unlink(%s) failed: %m", path);
+	i_close_fd(&fd);
+	i_unlink(path);
 }
 
 static bool pid_file_read(const char *path, pid_t *pid_r)
@@ -242,10 +246,13 @@ static bool pid_file_read(const char *path, pid_t *pid_r)
 		if (buf[ret-1] == '\n')
 			ret--;
 		buf[ret] = '\0';
-		*pid_r = atoi(buf);
-
-		found = !(*pid_r == getpid() ||
-			  (kill(*pid_r, 0) < 0 && errno == ESRCH));
+		if (str_to_pid(buf, pid_r) < 0) {
+			i_error("PID file contains invalid PID value");
+			found = FALSE;
+		} else {
+			found = !(*pid_r == getpid() ||
+				  (kill(*pid_r, 0) < 0 && errno == ESRCH));
+		}
 	}
 	i_close_fd(&fd);
 	return found;
@@ -282,47 +289,12 @@ static void create_config_symlink(const struct master_settings *set)
 	const char *base_config_path;
 
 	base_config_path = t_strconcat(set->base_dir, "/"PACKAGE".conf", NULL);
-	if (unlink(base_config_path) < 0 && errno != ENOENT)
-		i_error("unlink(%s) failed: %m", base_config_path);
+	i_unlink_if_exists(base_config_path);
 
 	if (symlink(services->config->config_file_path, base_config_path) < 0) {
 		i_error("symlink(%s, %s) failed: %m",
 			services->config->config_file_path, base_config_path);
 	}
-}
-
-static void mountpoints_warn_missing(struct mountpoint_list *mountpoints)
-{
-	struct mountpoint_list_iter *iter;
-	struct mountpoint_list_rec *rec;
-
-	/* warn about mountpoints that no longer exist */
-	iter = mountpoint_list_iter_init(mountpoints);
-	while ((rec = mountpoint_list_iter_next(iter)) != NULL) {
-		if (MOUNTPOINT_WRONGLY_NOT_MOUNTED(rec)) {
-			i_warning("%s is no longer mounted. "
-				  "See http://wiki2.dovecot.org/Mountpoints",
-				  rec->mount_path);
-		}
-	}
-	mountpoint_list_iter_deinit(&iter);
-}
-
-static void mountpoints_update(const struct master_settings *set)
-{
-	struct mountpoint_list *mountpoints;
-	const char *perm_path, *state_path;
-
-	perm_path = t_strconcat(set->state_dir, "/"MOUNTPOINT_LIST_FNAME, NULL);
-	state_path = t_strconcat(set->base_dir, "/"MOUNTPOINT_LIST_FNAME, NULL);
-	mountpoints = mountpoint_list_init(perm_path, state_path);
-
-	if (mountpoint_list_add_missing(mountpoints, MOUNTPOINT_STATE_DEFAULT,
-				mountpoint_list_default_ignore_prefixes,
-				mountpoint_list_default_ignore_types) == 0)
-		mountpoints_warn_missing(mountpoints);
-	(void)mountpoint_list_save(mountpoints);
-	mountpoint_list_deinit(&mountpoints);
 }
 
 static void instance_update_now(struct master_instance_list *list)
@@ -487,17 +459,25 @@ static void master_set_import_environment(const struct master_settings *set)
 	env_put(t_strconcat(DOVECOT_PRESERVE_ENVS_ENV"=", value, NULL));
 }
 
-static void main_log_startup(void)
+static void main_log_startup(char **protocols)
 {
 #define STARTUP_STRING PACKAGE_NAME" v"DOVECOT_VERSION_FULL" starting up"
+	string_t *str = t_str_new(128);
 	rlim_t core_limit;
+
+	str_append(str, STARTUP_STRING);
+	if (protocols[0] == NULL)
+		str_append(str, " without any protocols");
+	else {
+		str_printfa(str, " for %s",
+			    t_strarray_join((const char **)protocols, ", "));
+	}
 
 	core_dumps_disabled = restrict_get_core_limit(&core_limit) == 0 &&
 		core_limit == 0;
 	if (core_dumps_disabled)
-		i_info(STARTUP_STRING" (core dumps disabled)");
-	else
-		i_info(STARTUP_STRING);
+		str_append(str, " (core dumps disabled)");
+	i_info("%s", str_c(str));
 }
 
 static void master_set_process_limit(void)
@@ -529,7 +509,7 @@ static void main_init(const struct master_settings *set)
 	/* deny file access from everyone else except owner */
         (void)umask(0077);
 
-	main_log_startup();
+	main_log_startup(set->protocols_split);
 
 	lib_signals_init();
         lib_signals_ignore(SIGPIPE, TRUE);
@@ -545,7 +525,6 @@ static void main_init(const struct master_settings *set)
 
 	create_pid_file(pidfile_path);
 	create_config_symlink(set);
-	mountpoints_update(set);
 	instance_update(set);
 
 	services_monitor_start(services);
@@ -571,8 +550,7 @@ static void main_deinit(void)
 	global_dead_pipe_close();
 	services_destroy(services, TRUE);
 
-	if (unlink(pidfile_path) < 0)
-		i_error("unlink(%s) failed: %m", pidfile_path);
+	i_unlink(pidfile_path);
 	i_free(pidfile_path);
 
 	service_anvil_global_deinit();
@@ -647,9 +625,6 @@ static void print_build_options(void)
 #endif
 #ifdef IOLOOP_SELECT
 		" ioloop=select"
-#endif
-#ifdef IOLOOP_NOTIFY_DNOTIFY
-		" notify=dnotify"
 #endif
 #ifdef IOLOOP_NOTIFY_INOTIFY
 		" notify=inotify"
@@ -804,6 +779,7 @@ int main(int argc, char *argv[])
 			break;
 		}
 	}
+	i_assert(optind <= argc);
 
 	if (doveconf_arg != NULL) {
 		const char **args;
@@ -862,8 +838,9 @@ int main(int argc, char *argv[])
 			t_askpass("Give the password for SSL keys: ");
 	}
 
-	if (dup2(null_fd, STDIN_FILENO) < 0 ||
-	    dup2(null_fd, STDOUT_FILENO) < 0)
+	if (dup2(null_fd, STDIN_FILENO) < 0)
+		i_fatal("dup2(null_fd) failed: %m");
+	if (!foreground && dup2(null_fd, STDOUT_FILENO) < 0)
 		i_fatal("dup2(null_fd) failed: %m");
 
 	pidfile_path =

@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -234,6 +234,15 @@ mail_cache_header_fields_get_offset(struct mail_cache *cache,
 				"next_offset in field header loops");
 			return -1;
 		}
+		/* In Dovecot v2.2+ we don't try to use any holes,
+		   so next_offset must always be larger than current offset.
+		   also makes it easier to guarantee there aren't any loops
+		   (which we don't bother doing for old files) */
+		if (next_offset < offset && cache->hdr->minor_version != 0) {
+			mail_cache_set_corrupted(cache,
+				"next_offset in field header decreases");
+			return -1;
+		}
 		offset = next_offset;
 
 		if (cache->mmap_base != NULL || cache->map_with_read) {
@@ -328,8 +337,8 @@ int mail_cache_header_fields_read(struct mail_cache *cache)
 
 	/* check the fixed size of the header. name[] has to be checked
 	   separately */
-	if (field_hdr->size < sizeof(*field_hdr) +
-	    field_hdr->fields_count * (sizeof(uint32_t)*2 + 1 + 2)) {
+	if (field_hdr->fields_count > INT_MAX / MAIL_CACHE_FIELD_NAMES(1) ||
+	    field_hdr->size < MAIL_CACHE_FIELD_NAMES(field_hdr->fields_count)) {
 		mail_cache_set_corrupted(cache, "invalid field header size");
 		return -1;
 	}
@@ -356,6 +365,7 @@ int mail_cache_header_fields_read(struct mail_cache *cache)
 	names = CONST_PTR_OFFSET(field_hdr,
 		MAIL_CACHE_FIELD_NAMES(field_hdr->fields_count));
 	end = CONST_PTR_OFFSET(field_hdr, field_hdr->size);
+	i_assert(names <= end);
 
 	/* clear the old mapping */
 	for (i = 0; i < cache->fields_count; i++)
@@ -489,7 +499,7 @@ static int mail_cache_header_fields_update_locked(struct mail_cache *cache)
 	int ret = 0;
 
 	if (mail_cache_header_fields_read(cache) < 0 ||
-	    mail_cache_header_fields_get_offset(cache, &offset, FALSE) < 0)
+	    mail_cache_header_fields_get_offset(cache, &offset, NULL) < 0)
 		return -1;
 
 	buffer = buffer_create_dynamic(pool_datastack_create(), 256);
@@ -530,7 +540,7 @@ int mail_cache_header_fields_update(struct mail_cache *cache)
 		return ret;
 	}
 
-	if (mail_cache_lock(cache, FALSE) <= 0)
+	if (mail_cache_lock(cache) <= 0)
 		return -1;
 
 	T_BEGIN {
@@ -595,7 +605,7 @@ void mail_cache_header_fields_get(struct mail_cache *cache, buffer_t *dest)
 int mail_cache_header_fields_get_next_offset(struct mail_cache *cache,
 					     uint32_t *offset_r)
 {
-	if (mail_cache_header_fields_get_offset(cache, offset_r, FALSE) < 0)
+	if (mail_cache_header_fields_get_offset(cache, offset_r, NULL) < 0)
 		return -1;
 
 	if (*offset_r == 0) {

@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "llist.h"
@@ -10,7 +10,6 @@
 #include "dict-private.h"
 #include "dict-client.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -47,6 +46,7 @@ struct client_dict {
 	unsigned int connect_counter;
 	unsigned int transaction_id_counter;
 	unsigned int async_commits;
+	unsigned int iter_replies_skip;
 
 	unsigned int in_iteration:1;
 	unsigned int handshaked:1;
@@ -57,6 +57,7 @@ struct client_dict_iterate_context {
 
 	pool_t pool;
 	bool failed;
+	bool finished;
 };
 
 struct client_dict_transaction_context {
@@ -181,6 +182,7 @@ static int client_dict_send_query(struct client_dict *dict, const char *query)
 		if (o_stream_send_str(dict->output, query) < 0 ||
 		    o_stream_flush(dict->output) < 0) {
 			i_error("write(%s) failed: %m", dict->path);
+			client_dict_disconnect(dict);
 			return -1;
 		}
 	}
@@ -270,8 +272,10 @@ client_dict_finish_transaction(struct client_dict *dict,
 	/* the callback may call the dict code again, so remove this
 	   transaction before calling it */
 	i_assert(dict->async_commits > 0);
-	if (--dict->async_commits == 0)
-		io_remove(&dict->io);
+	if (--dict->async_commits == 0) {
+		if (dict->io != NULL)
+			io_remove(&dict->io);
+	}
 	DLLIST_REMOVE(&dict->transactions, ctx);
 
 	if (ctx->callback != NULL)
@@ -310,7 +314,8 @@ static ssize_t client_dict_read_timeout(struct client_dict *dict)
 	return ret;
 }
 
-static int client_dict_read_one_line(struct client_dict *dict, char **line_r)
+static int
+client_dict_read_one_line_real(struct client_dict *dict, char **line_r)
 {
 	unsigned int id;
 	char *line;
@@ -354,17 +359,39 @@ static int client_dict_read_one_line(struct client_dict *dict, char **line_r)
 		default:
 			i_error("dict-client: Invalid async commit line: %s",
 				line);
-			return 0;
+			return -1;
 		}
 		if (str_to_uint(line+2, &id) < 0) {
 			i_error("dict-client: Invalid ID");
-			return 0;
+			return -1;
 		}
 		client_dict_finish_transaction(dict, id, ret);
 		return 0;
 	}
+	if (dict->iter_replies_skip > 0) {
+		/* called aborted the iteration before finishing it.
+		   skip over the iteration reply */
+		if (*line == DICT_PROTOCOL_REPLY_OK)
+			return 0;
+		if (*line != '\0' && *line != DICT_PROTOCOL_REPLY_FAIL) {
+			i_error("dict-client: Invalid iteration reply line: %s",
+				line);
+			return -1;
+		}
+		dict->iter_replies_skip--;
+		return 0;
+	}
 	*line_r = line;
 	return 1;
+}
+
+static int client_dict_read_one_line(struct client_dict *dict, char **line_r)
+{
+	int ret;
+
+	if ((ret = client_dict_read_one_line_real(dict, line_r)) < 0)
+		client_dict_disconnect(dict);
+	return ret;
 }
 
 static bool client_dict_is_finished(struct client_dict *dict)
@@ -451,6 +478,7 @@ static void client_dict_disconnect(struct client_dict *dict)
 
 	dict->connect_counter++;
 	dict->handshaked = FALSE;
+	dict->iter_replies_skip = 0;
 
 	/* abort all pending async commits */
 	for (ctx = dict->transactions; ctx != NULL; ctx = next) {
@@ -477,9 +505,8 @@ static void client_dict_disconnect(struct client_dict *dict)
 
 static int
 client_dict_init(struct dict *driver, const char *uri,
-		 enum dict_data_type value_type, const char *username,
-		 const char *base_dir, struct dict **dict_r,
-		 const char **error_r)
+		 const struct dict_settings *set,
+		 struct dict **dict_r, const char **error_r)
 {
 	struct client_dict *dict;
 	const char *dest_uri;
@@ -496,17 +523,22 @@ client_dict_init(struct dict *driver, const char *uri,
 	dict = p_new(pool, struct client_dict, 1);
 	dict->pool = pool;
 	dict->dict = *driver;
-	dict->value_type = value_type;
-	dict->username = p_strdup(pool, username);
+	dict->value_type = set->value_type;
+	dict->username = p_strdup(pool, set->username);
 
 	dict->fd = -1;
 
-	if (*uri != ':') {
-		/* path given */
+	if (uri[0] == ':') {
+		/* default path */
+		dict->path = p_strconcat(pool, set->base_dir,
+				"/"DEFAULT_DICT_SERVER_SOCKET_FNAME, NULL);
+	} else if (uri[0] == '/') {
+		/* absolute path */
 		dict->path = p_strdup_until(pool, uri, dest_uri);
 	} else {
-		dict->path = p_strconcat(pool, base_dir,
-				"/"DEFAULT_DICT_SERVER_SOCKET_FNAME, NULL);
+		/* relative path to base_dir */
+		dict->path = p_strconcat(pool, set->base_dir, "/",
+				p_strdup_until(pool, uri, dest_uri), NULL);
 	}
 	dict->uri = p_strdup(pool, dest_uri + 1);
 	*dict_r = &dict->dict;
@@ -526,18 +558,22 @@ static int client_dict_wait(struct dict *_dict)
 {
 	struct client_dict *dict = (struct client_dict *)_dict;
 	char *line;
-	int ret = 0;
+	int ret;
 
 	if (!dict->handshaked)
 		return -1;
 
 	while (dict->async_commits > 0) {
-		if (client_dict_read_one_line(dict, &line) < 0) {
-			ret = -1;
-			break;
+		if ((ret = client_dict_read_one_line(dict, &line)) < 0)
+			return -1;
+
+		if (ret > 0) {
+			i_error("dict-client: Unexpected reply waiting waiting for async commits: %s", line);
+			client_dict_disconnect(dict);
+			return -1;
 		}
 	}
-	return ret;
+	return 0;
 }
 
 static int client_dict_lookup(struct dict *_dict, pool_t pool,
@@ -562,12 +598,19 @@ static int client_dict_lookup(struct dict *_dict, pool_t pool,
 	if (line == NULL)
 		return -1;
 
-	if (*line == DICT_PROTOCOL_REPLY_OK) {
+	switch (*line) {
+	case DICT_PROTOCOL_REPLY_OK:
 		*value_r = p_strdup(pool, dict_client_unescape(line + 1));
 		return 1;
-	} else {
+	case DICT_PROTOCOL_REPLY_NOTFOUND:
 		*value_r = NULL;
-		return *line == DICT_PROTOCOL_REPLY_NOTFOUND ? 0 : -1;
+		return 0;
+	case DICT_PROTOCOL_REPLY_FAIL:
+		return -1;
+	default:
+		i_error("dict-client: Invalid lookup '%s' reply: %s", key, line);
+		client_dict_disconnect(dict);
+		return -1;
 	}
 }
 
@@ -608,7 +651,7 @@ static bool client_dict_iterate(struct dict_iterate_context *_ctx,
 	struct client_dict_iterate_context *ctx =
 		(struct client_dict_iterate_context *)_ctx;
 	struct client_dict *dict = (struct client_dict *)_ctx->dict;
-	char *line, *value;
+	char *line, *key, *value;
 
 	if (ctx->failed)
 		return FALSE;
@@ -622,6 +665,7 @@ static bool client_dict_iterate(struct dict_iterate_context *_ctx,
 
 	if (*line == '\0') {
 		/* end of iteration */
+		ctx->finished = TRUE;
 		return FALSE;
 	}
 
@@ -630,24 +674,26 @@ static bool client_dict_iterate(struct dict_iterate_context *_ctx,
 
 	switch (*line) {
 	case DICT_PROTOCOL_REPLY_OK:
-		value = strchr(++line, '\t');
+		key = line+1;
+		value = strchr(key, '\t');
 		break;
 	case DICT_PROTOCOL_REPLY_FAIL:
 		ctx->failed = TRUE;
 		return FALSE;
 	default:
+		key = NULL;
 		value = NULL;
 		break;
 	}
 	if (value == NULL) {
 		/* broken protocol */
-		i_error("dict client (%s) sent broken reply", dict->path);
+		i_error("dict client (%s) sent broken iterate reply: %s", dict->path, line);
 		ctx->failed = TRUE;
 		return FALSE;
 	}
 	*value++ = '\0';
 
-	*key_r = p_strdup(ctx->pool, dict_client_unescape(line));
+	*key_r = p_strdup(ctx->pool, dict_client_unescape(key));
 	*value_r = p_strdup(ctx->pool, dict_client_unescape(value));
 	return TRUE;
 }
@@ -658,6 +704,9 @@ static int client_dict_iterate_deinit(struct dict_iterate_context *_ctx)
 	struct client_dict_iterate_context *ctx =
 		(struct client_dict_iterate_context *)_ctx;
 	int ret = ctx->failed ? -1 : 0;
+
+	if (!ctx->finished)
+		dict->iter_replies_skip++;
 
 	pool_unref(&ctx->pool);
 	i_free(ctx);
@@ -694,6 +743,10 @@ static void dict_async_input(struct client_dict *dict)
 
 	if (ret < 0)
 		io_remove(&dict->io);
+	else if (ret > 0) {
+		i_error("dict-client: Unexpected reply waiting waiting for async commits: %s", line);
+		client_dict_disconnect(dict);
+	}
 }
 
 static int
@@ -705,6 +758,7 @@ client_dict_transaction_commit(struct dict_transaction_context *_ctx,
 	struct client_dict_transaction_context *ctx =
 		(struct client_dict_transaction_context *)_ctx;
 	struct client_dict *dict = (struct client_dict *)_ctx->dict;
+	unsigned int id;
 	int ret = ctx->failed ? -1 : 1;
 
 	ctx->committed = TRUE;
@@ -730,12 +784,30 @@ client_dict_transaction_commit(struct dict_transaction_context *_ctx,
 			line = client_dict_read_line(dict);
 			if (line == NULL)
 				ret = -1;
-			else if (*line == DICT_PROTOCOL_REPLY_OK)
+			else switch (*line) {
+			case DICT_PROTOCOL_REPLY_OK:
 				ret = 1;
-			else if (*line == DICT_PROTOCOL_REPLY_NOTFOUND)
+				break;
+			case DICT_PROTOCOL_REPLY_NOTFOUND:
 				ret = 0;
-			else
+				break;
+			case DICT_PROTOCOL_REPLY_FAIL:
 				ret = -1;
+				break;
+			default:
+				i_error("dict-client: Invalid commit reply: %s", line);
+				client_dict_disconnect(dict);
+				line = NULL;
+				ret = -1;
+				break;
+			}
+			if (line != NULL &&
+			    (str_to_uint(line+1, &id) < 0 || ctx->id != id)) {
+				i_error("dict-client: Invalid commit reply, "
+					"expected id=%u: %s", ctx->id, line);
+				client_dict_disconnect(dict);
+				ret = -1;
+			}
 		}
 	} T_END;
 
@@ -851,6 +923,7 @@ struct dict dict_driver_client = {
 		client_dict_set,
 		client_dict_unset,
 		client_dict_append,
-		client_dict_atomic_inc
+		client_dict_atomic_inc,
+		NULL
 	}
 };

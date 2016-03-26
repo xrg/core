@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 /* note that everything here depends on uidlist file being locked the whole
    time. that's why we don't have any locking of our own, or that we do things
@@ -18,7 +18,6 @@
 #include "maildir-uidlist.h"
 #include "maildir-keywords.h"
 
-#include <stdlib.h>
 #include <sys/stat.h>
 #include <utime.h>
 
@@ -200,7 +199,7 @@ maildir_keywords_lookup(struct maildir_keywords *mk, const char *name,
 	void *value;
 
 	value = hash_table_lookup(mk->hash, name);
-	if (value == 0) {
+	if (value == NULL) {
 		if (mk->synced)
 			return 0;
 
@@ -209,7 +208,7 @@ maildir_keywords_lookup(struct maildir_keywords *mk, const char *name,
 		i_assert(mk->synced);
 
 		value = hash_table_lookup(mk->hash, name);
-		if (value == 0)
+		if (value == NULL)
 			return 0;
 	}
 
@@ -365,7 +364,7 @@ static int maildir_keywords_commit(struct maildir_keywords *mk)
 		return 0;
 
 	lock_path = t_strconcat(mk->path, ".lock", NULL);
-	(void)unlink(lock_path);
+	i_unlink_if_exists(lock_path);
 
 	perm = mailbox_get_permissions(&mk->mbox->box);
 	for (i = 0;; i++) {

@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ssl-proxy.h"
@@ -85,6 +85,8 @@ const char *ssl_proxy_get_cert_error(struct ssl_proxy *proxy ATTR_UNUSED)
 {
 	return "";
 }
+
+void ssl_proxy_destroy(struct ssl_proxy *proxy ATTR_UNUSED) {}
 
 void ssl_proxy_free(struct ssl_proxy **proxy ATTR_UNUSED) {}
 

@@ -50,6 +50,9 @@ struct imapc_storage_client {
 	struct imapc_client *client;
 
 	ARRAY(struct imapc_storage_event_callback) untagged_callbacks;
+
+	unsigned int auth_failed:1;
+	unsigned int destroying:1;
 };
 
 struct imapc_storage {
@@ -76,6 +79,10 @@ struct imapc_mail_cache {
 	buffer_t *buf;
 };
 
+struct imapc_fetch_request {
+	ARRAY(struct imapc_mail *) mails;
+};
+
 struct imapc_mailbox {
 	struct mailbox box;
 	struct imapc_storage *storage;
@@ -83,14 +90,23 @@ struct imapc_mailbox {
 
 	struct mail_index_transaction *delayed_sync_trans;
 	struct mail_index_view *sync_view, *delayed_sync_view;
+	struct mail_cache_view *delayed_sync_cache_view;
+	struct mail_cache_transaction_ctx *delayed_sync_cache_trans;
 	struct timeout *to_idle_check, *to_idle_delay;
 
-	ARRAY(struct imapc_mail *) fetch_mails;
+	ARRAY(struct imapc_fetch_request *) fetch_requests;
+	/* if non-empty, contains the latest FETCH command we're going to be
+	   sending soon (but still waiting to see if we can increase its
+	   UID range) */
+	string_t *pending_fetch_cmd;
+	struct imapc_fetch_request *pending_fetch_request;
+	struct timeout *to_pending_fetch_send;
 
 	ARRAY(struct imapc_mailbox_event_callback) untagged_callbacks;
 	ARRAY(struct imapc_mailbox_event_callback) resp_text_callbacks;
 
 	enum mail_flags permanent_flags;
+	uint32_t highest_nonrecent_uid;
 
 	ARRAY_TYPE(uint32_t) delayed_expunged_uids;
 	uint32_t sync_uid_validity;
@@ -100,6 +116,7 @@ struct imapc_mailbox {
 	uint32_t sync_next_rseq;
 	uint32_t exists_count;
 	uint32_t min_append_uid;
+	char *sync_gmail_pop3_search_tag;
 
 	/* keep the previous fetched message body cached,
 	   mainly for partial IMAP fetches */
@@ -109,6 +126,7 @@ struct imapc_mailbox {
 	struct imapc_sync_context *sync_ctx;
 
 	const char *guid_fetch_field_name;
+	struct imapc_search_context *search_ctx;
 
 	unsigned int selecting:1;
 	unsigned int syncing:1;
@@ -142,7 +160,8 @@ void imapc_transaction_save_commit_post(struct mail_save_context *ctx,
 					struct mail_index_transaction_commit_result *result);
 void imapc_transaction_save_rollback(struct mail_save_context *ctx);
 
-void imapc_storage_run(struct imapc_storage *storage);
+void imapc_mailbox_run(struct imapc_mailbox *mbox);
+void imapc_mailbox_run_nofetch(struct imapc_mailbox *mbox);
 void imapc_mail_cache_free(struct imapc_mail_cache *cache);
 int imapc_mailbox_select(struct imapc_mailbox *mbox);
 
@@ -160,6 +179,7 @@ int imapc_mailbox_commit_delayed_trans(struct imapc_mailbox *mbox,
 void imapc_mailbox_noop(struct imapc_mailbox *mbox);
 void imapc_mailbox_set_corrupted(struct imapc_mailbox *mbox,
 				 const char *reason, ...) ATTR_FORMAT(2, 3);
+const char *imapc_mailbox_get_remote_name(struct imapc_mailbox *mbox);
 
 void imapc_storage_client_register_untagged(struct imapc_storage_client *client,
 					    const char *name,

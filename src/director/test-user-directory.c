@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -7,7 +7,6 @@
 #include "user-directory.h"
 #include "test-common.h"
 
-#include <stdlib.h>
 
 #define USER_DIR_TIMEOUT 1000000
 

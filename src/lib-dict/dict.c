@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -52,32 +52,26 @@ void dict_driver_unregister(struct dict *driver)
 		array_free(&dict_drivers);
 }
 
-void dict_drivers_register_builtin(void)
-{
-	dict_driver_register(&dict_driver_client);
-	dict_driver_register(&dict_driver_file);
-	dict_driver_register(&dict_driver_memcached);
-	dict_driver_register(&dict_driver_memcached_ascii);
-	dict_driver_register(&dict_driver_redis);
-}
-
-void dict_drivers_unregister_builtin(void)
-{
-	dict_driver_unregister(&dict_driver_client);
-	dict_driver_unregister(&dict_driver_file);
-	dict_driver_unregister(&dict_driver_memcached);
-	dict_driver_unregister(&dict_driver_memcached_ascii);
-	dict_driver_unregister(&dict_driver_redis);
-}
-
 int dict_init(const char *uri, enum dict_data_type value_type,
 	      const char *username, const char *base_dir, struct dict **dict_r,
 	      const char **error_r)
 {
+	struct dict_settings set;
+
+	memset(&set, 0, sizeof(set));
+	set.value_type = value_type;
+	set.username = username;
+	set.base_dir = base_dir;
+	return dict_init_full(uri, &set, dict_r, error_r);
+}
+
+int dict_init_full(const char *uri, const struct dict_settings *set,
+		   struct dict **dict_r, const char **error_r)
+{
 	struct dict *dict;
 	const char *p, *name, *error;
 
-	i_assert(username != NULL);
+	i_assert(set->username != NULL);
 
 	p = strchr(uri, ':');
 	if (p == NULL) {
@@ -92,8 +86,7 @@ int dict_init(const char *uri, enum dict_data_type value_type,
 		*error_r = t_strdup_printf("Unknown dict module: %s", name);
 		return -1;
 	}
-	if (dict->v.init(dict, p+1, value_type, username, base_dir,
-			 dict_r, &error) < 0) {
+	if (dict->v.init(dict, p+1, set, dict_r, &error) < 0) {
 		*error_r = t_strdup_printf("dict %s: %s", name, error);
 		return -1;
 	}
@@ -124,6 +117,23 @@ int dict_lookup(struct dict *dict, pool_t pool, const char *key,
 {
 	i_assert(dict_key_prefix_is_valid(key));
 	return dict->v.lookup(dict, pool, key, value_r);
+}
+
+void dict_lookup_async(struct dict *dict, const char *key,
+		       dict_lookup_callback_t *callback, void *context)
+{
+	if (dict->v.lookup_async == NULL) {
+		struct dict_lookup_result result;
+
+		memset(&result, 0, sizeof(result));
+		result.ret = dict_lookup(dict, pool_datastack_create(),
+					 key, &result.value);
+		if (result.ret < 0)
+			result.error = "Lookup failed";
+		callback(&result, context);
+		return;
+	}
+	dict->v.lookup_async(dict, key, callback, context);
 }
 
 struct dict_iterate_context *
@@ -159,6 +169,19 @@ bool dict_iterate(struct dict_iterate_context *ctx,
 {
 	return ctx == &dict_iter_unsupported ? FALSE :
 		ctx->dict->v.iterate(ctx, key_r, value_r);
+}
+
+void dict_iterate_set_async_callback(struct dict_iterate_context *ctx,
+				     dict_iterate_callback_t *callback,
+				     void *context)
+{
+	ctx->async_callback = callback;
+	ctx->async_context = context;
+}
+
+bool dict_iterate_has_more(struct dict_iterate_context *ctx)
+{
+	return ctx->has_more;
 }
 
 int dict_iterate_deinit(struct dict_iterate_context **_ctx)

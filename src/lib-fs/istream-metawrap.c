@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "istream-private.h"
@@ -92,13 +92,15 @@ static int i_stream_metawrap_stat(struct istream_private *stream, bool exact)
 	const struct stat *st;
 	int ret;
 
-	if (i_stream_stat(stream->parent, exact, &st) < 0)
+	if (i_stream_stat(stream->parent, exact, &st) < 0) {
+		stream->istream.stream_errno = stream->parent->stream_errno;
 		return -1;
+	}
 	stream->statbuf = *st;
 
 	if (mstream->in_metadata) {
 		ret = i_stream_read(&stream->istream);
-		if (ret < 0)
+		if (ret < 0 && stream->istream.stream_errno != 0)
 			return -1;
 		if (ret == 0) {
 			stream->statbuf.st_size = -1;

@@ -1,14 +1,12 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "hash.h"
 #include "str.h"
-#include "doveadm-settings.h"
 #include "mailbox-list-private.h"
 #include "dsync-mailbox-tree-private.h"
 
-#include <stdlib.h>
 
 struct dsync_mailbox_tree_iter {
 	struct dsync_mailbox_tree *tree;
@@ -67,7 +65,7 @@ dsync_mailbox_tree_lookup(struct dsync_mailbox_tree *tree,
 		const char *const *path;
 
 		path = t_strsplit(full_name, tree->sep_str);
-		for (; *path != '\0' && node != NULL; path++)
+		for (; *path != NULL && node != NULL; path++)
 			node = dsync_mailbox_node_find(node->first_child, *path);
 	} T_END;
 	return node;
@@ -106,14 +104,14 @@ dsync_mailbox_tree_get(struct dsync_mailbox_tree *tree, const char *full_name)
 
 		/* find the existing part */
 		path = t_strsplit(full_name, tree->sep_str);
-		for (; *path != '\0'; path++) {
+		for (; *path != NULL; path++) {
 			parent = node;
 			node = dsync_mailbox_node_find(node->first_child, *path);
 			if (node == NULL)
 				break;
 		}
 		/* create the rest */
-		for (; *path != '\0'; path++) {
+		for (; *path != NULL; path++) {
 			node = p_new(tree->pool, struct dsync_mailbox_node, 1);
 			node->name = p_strdup(tree->pool, *path);
 			node->ns = parent->ns;
@@ -139,13 +137,19 @@ const char *dsync_mailbox_node_get_full_name(const struct dsync_mailbox_tree *tr
 					     const struct dsync_mailbox_node *node)
 {
 	string_t *str = t_str_new(128);
+	dsync_mailbox_node_append_full_name(str, tree, node);
+	return str_c(str);
+}
 
+void dsync_mailbox_node_append_full_name(string_t *str,
+					 const struct dsync_mailbox_tree *tree,
+					 const struct dsync_mailbox_node *node)
+{
 	i_assert(node->parent != NULL);
 
 	node_get_full_name_recurse(tree, node, str);
 	/* remove the trailing separator */
 	str_truncate(str, str_len(str)-1);
-	return str_c(str);
 }
 
 void dsync_mailbox_node_copy_data(struct dsync_mailbox_node *dest,
@@ -494,4 +498,28 @@ bool dsync_mailbox_trees_equal(struct dsync_mailbox_tree *tree1,
 		ret = dsync_mailbox_branches_equal(&tree1->root, &tree2->root);
 	} T_END;
 	return ret;
+}
+
+const char *dsync_mailbox_node_to_string(const struct dsync_mailbox_node *node)
+{
+	return t_strdup_printf("guid=%s uid_validity=%u uid_next=%u subs=%s last_change=%ld last_subs=%ld",
+			       guid_128_to_string(node->mailbox_guid),
+			       node->uid_validity, node->uid_next,
+			       node->subscribed ? "yes" : "no",
+			       (long)node->last_renamed_or_created,
+			       (long)node->last_subscription_change);
+}
+
+const char *
+dsync_mailbox_delete_type_to_string(enum dsync_mailbox_delete_type type)
+{
+	switch (type) {
+	case DSYNC_MAILBOX_DELETE_TYPE_MAILBOX:
+		return "mailbox";
+	case DSYNC_MAILBOX_DELETE_TYPE_DIR:
+		return "dir";
+	case DSYNC_MAILBOX_DELETE_TYPE_UNSUBSCRIBE:
+		return "unsubscribe";
+	}
+	return t_strdup_printf("unknown #%u", type);
 }

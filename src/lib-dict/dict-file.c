@@ -1,9 +1,13 @@
-/* Copyright (c) 2008-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2008-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "hash.h"
+#include "str.h"
+#include "strescape.h"
+#include "home-expand.h"
 #include "mkdir-parents.h"
+#include "eacces-error.h"
 #include "file-lock.h"
 #include "file-dotlock.h"
 #include "nfs-workarounds.h"
@@ -13,7 +17,6 @@
 #include "dict-private.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -54,13 +57,11 @@ static struct dotlock_settings file_dict_dotlock_settings = {
 
 static int
 file_dict_init(struct dict *driver, const char *uri,
-	       enum dict_data_type value_type ATTR_UNUSED,
-	       const char *username ATTR_UNUSED,
-	       const char *base_dir ATTR_UNUSED, struct dict **dict_r,
-	       const char **error_r)
+	       const struct dict_settings *set,
+	       struct dict **dict_r, const char **error_r)
 {
 	struct file_dict *dict;
-	const char *p;
+	const char *p, *path;
 
 	dict = i_new(struct file_dict, 1);
 	dict->lock_method = FILE_LOCK_METHOD_DOTLOCK;
@@ -68,20 +69,21 @@ file_dict_init(struct dict *driver, const char *uri,
 	p = strchr(uri, ':');
 	if (p == NULL) {
 		/* no parameters */
-		dict->path = i_strdup(uri);
+		path = uri;
 	} else {
-		dict->path = i_strdup_until(uri, p++);
+		path = t_strdup_until(uri, p++);
 		if (strcmp(p, "lock=fcntl") == 0)
 			dict->lock_method = FILE_LOCK_METHOD_FCNTL;
 		else if (strcmp(p, "lock=flock") == 0)
 			dict->lock_method = FILE_LOCK_METHOD_FLOCK;
 		else {
 			*error_r = t_strdup_printf("Invalid parameter: %s", p+1);
-			i_free(dict->path);
 			i_free(dict);
 			return -1;
 		}
 	}
+	dict->path = set->home_dir == NULL ? i_strdup(path) :
+		i_strdup(home_expand_tilde(path, set->home_dir));
 	dict->dict = *driver;
 	dict->hash_pool = pool_alloconly_create("file dict", 1024);
 	hash_table_create(&dict->hash, dict->hash_pool, 0, str_hash, strcmp);
@@ -111,7 +113,11 @@ static bool file_dict_need_refresh(struct file_dict *dict)
 	if (dict->fd == -1)
 		return TRUE;
 
-	nfs_flush_file_handle_cache(dict->path);
+	/* Disable NFS flushing for now since it can cause unnecessary
+	   problems and there's no easy way for us to know here if
+	   mail_nfs_storage=yes. In any case it's pretty much an unsupported
+	   setting nowadays. */
+	/*nfs_flush_file_handle_cache(dict->path);*/
 	if (nfs_safe_stat(dict->path, &st1) < 0) {
 		i_error("stat(%s) failed: %m", dict->path);
 		return FALSE;
@@ -148,7 +154,10 @@ static int file_dict_open_latest(struct file_dict *dict)
 	if (dict->fd == -1) {
 		if (errno == ENOENT)
 			return 0;
-		i_error("open(%s) failed: %m", dict->path);
+		if (errno == EACCES)
+			i_error("%s", eacces_error_get("open", dict->path));
+		else
+			i_error("open(%s) failed: %m", dict->path);
 		return -1;
 	}
 	dict->refreshed = FALSE;
@@ -173,12 +182,12 @@ static int file_dict_refresh(struct file_dict *dict)
 
 		while ((key = i_stream_read_next_line(input)) != NULL) {
 			/* strdup() before the second read */
-			key = p_strdup(dict->hash_pool, key);
+			key = str_tabunescape(p_strdup(dict->hash_pool, key));
 
 			if ((value = i_stream_read_next_line(input)) == NULL)
 				break;
 
-			value = p_strdup(dict->hash_pool, value);
+			value = str_tabunescape(p_strdup(dict->hash_pool, value));
 			hash_table_insert(dict->hash, key, value);
 		}
 		i_stream_destroy(&input);
@@ -255,9 +264,15 @@ static bool file_dict_iterate(struct dict_iterate_context *_ctx,
 		if (path == NULL)
 			continue;
 
-		if ((ctx->flags & DICT_ITERATE_FLAG_RECURSE) == 0 &&
-		    strchr(key + path->len, '/') != NULL)
-			continue;
+		if ((ctx->flags & DICT_ITERATE_FLAG_RECURSE) != 0) {
+			/* match everything */
+		} else if ((ctx->flags & DICT_ITERATE_FLAG_EXACT_KEY) != 0) {
+			if (key[path->len] != '\0')
+				continue;
+		} else {
+			if (strchr(key + path->len, '/') != NULL)
+				continue;
+		}
 
 		*key_r = key;
 		*value_r = value;
@@ -317,8 +332,9 @@ static void file_dict_apply_changes(struct dict_transaction_memory_context *ctx,
 				*atomic_inc_not_found_r = TRUE;
 				break;
 			}
-			diff = strtoll(old_value, NULL, 10) +
-				change->value.diff;
+			if (str_to_llong(old_value, &diff) < 0)
+				i_unreached();
+			diff +=	change->value.diff;
 			tmp = t_strdup_printf("%lld", diff);
 			new_len = strlen(tmp);
 			if (old_value == NULL || new_len > strlen(old_value))
@@ -433,7 +449,10 @@ static int file_dict_mkdir(struct file_dict *dict)
 	path = t_strdup_until(dict->path, p);
 
 	if (stat_first_parent(path, &root, &st) < 0) {
-		i_error("stat(%s) failed: %m", root);
+		if (errno == EACCES)
+			i_error("%s", eacces_error_get("stat", root));
+		else
+			i_error("stat(%s) failed: %m", root);
 		return -1;
 	}
 	if ((st.st_mode & S_ISGID) != 0) {
@@ -441,8 +460,11 @@ static int file_dict_mkdir(struct file_dict *dict)
 		mode = st.st_mode;
 	}
 
-	if (mkdir_parents(path, mode) < 0) {
-		i_error("mkdir_parents(%s) failed: %m", path);
+	if (mkdir_parents(path, mode) < 0 && errno != EEXIST) {
+		if (errno == EACCES)
+			i_error("%s", eacces_error_get("mkdir_parents", path));
+		else
+			i_error("mkdir_parents(%s) failed: %m", path);
 		return -1;
 	}
 	return 0;
@@ -465,7 +487,10 @@ file_dict_lock(struct file_dict *dict, struct file_lock **lock_r)
 			dict->fd = open(dict->path, O_CREAT | O_RDWR, 0600);
 		}
 		if (dict->fd == -1) {
-			i_error("creat(%s) failed: %m", dict->path);
+			if (errno == EACCES)
+				i_error("%s", eacces_error_get("creat", dict->path));
+			else
+				i_error("creat(%s) failed: %m", dict->path);
 			return -1;
 		}
 		(void)fd_copy_parent_dir_permissions(dict->path, dict->fd,
@@ -497,6 +522,7 @@ static int file_dict_write_changes(struct dict_transaction_memory_context *ctx,
 	struct hash_iterate_context *iter;
 	struct ostream *output;
 	char *key, *value;
+	string_t *str;
 	int fd = -1;
 
 	*atomic_inc_not_found_r = FALSE;
@@ -554,11 +580,14 @@ static int file_dict_write_changes(struct dict_transaction_memory_context *ctx,
 	output = o_stream_create_fd(fd, 0, FALSE);
 	o_stream_cork(output);
 	iter = hash_table_iterate_init(dict->hash);
+	str = t_str_new(256);
 	while (hash_table_iterate(iter, dict->hash, &key, &value)) {
-		o_stream_nsend_str(output, key);
-		o_stream_nsend(output, "\n", 1);
-		o_stream_nsend_str(output, value);
-		o_stream_nsend(output, "\n", 1);
+		str_truncate(str, 0);
+		str_append_tabescaped(str, key);
+		str_append_c(str, '\n');
+		str_append_tabescaped(str, value);
+		str_append_c(str, '\n');
+		o_stream_nsend(output, str_data(str), str_len(str));
 	}
 	hash_table_iterate_deinit(&iter);
 
@@ -633,6 +662,7 @@ struct dict dict_driver_file = {
 		dict_transaction_memory_set,
 		dict_transaction_memory_unset,
 		dict_transaction_memory_append,
-		dict_transaction_memory_atomic_inc
+		dict_transaction_memory_atomic_inc,
+		NULL
 	}
 };

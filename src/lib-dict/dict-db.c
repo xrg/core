@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2016 Dovecot authors, see the included COPYING file */
 
 /* FIXME: BDB isn't being used correctly/safely. */
 
@@ -6,7 +6,6 @@
 #include "dict-private.h"
 
 #ifdef BUILD_DB
-#include <stdlib.h>
 #include <db.h>
 
 struct db_dict {

@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -8,7 +8,6 @@
 #include "imap-urlauth-worker-settings.h"
 
 #include <stddef.h>
-#include <stdlib.h>
 #include <unistd.h>
 
 /* <settings checks> */
@@ -19,7 +18,7 @@ static struct file_listener_settings *imap_urlauth_worker_unix_listeners[] = {
 	&imap_urlauth_worker_unix_listeners_array[0]
 };
 static buffer_t imap_urlauth_worker_unix_listeners_buf = {
-	imap_urlauth_worker_unix_listeners, sizeof(imap_urlauth_worker_unix_listeners), { 0, }
+	imap_urlauth_worker_unix_listeners, sizeof(imap_urlauth_worker_unix_listeners), { NULL, }
 };
 /* </settings checks> */
 
@@ -57,7 +56,7 @@ static const struct setting_define imap_urlauth_worker_setting_defines[] = {
 	DEF(SET_BOOL, verbose_proctitle),
 
 	DEF(SET_STR, imap_urlauth_host),
-	DEF(SET_UINT, imap_urlauth_port),
+	DEF(SET_IN_PORT, imap_urlauth_port),
 
 	SETTING_DEFINE_LIST_END
 };

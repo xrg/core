@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "array.h"
@@ -15,7 +15,6 @@
 #include "imap-fetch.h"
 #include "imap-util.h"
 
-#include <stdlib.h>
 #include <ctype.h>
 
 #define BODY_NIL_REPLY \
@@ -403,6 +402,7 @@ static int imap_fetch_flush_buffer(struct imap_fetch_context *ctx)
 		len--;
 		ctx->state.cur_first = FALSE;
 	}
+	ctx->state.cur_flushed = TRUE;
 
 	if (o_stream_send(ctx->client->output, data, len) < 0)
 		return -1;
@@ -483,6 +483,7 @@ static int imap_fetch_more_int(struct imap_fetch_context *ctx, bool cancel)
 			str_printfa(state->cur_str, "* %u FETCH (",
 				    state->cur_mail->seq);
 			state->cur_first = TRUE;
+			state->cur_flushed = FALSE;
 			state->line_finished = FALSE;
 		}
 
@@ -591,7 +592,17 @@ int imap_fetch_end(struct imap_fetch_context *ctx)
 
 	if (ctx->state.fetching) {
 		ctx->state.fetching = FALSE;
-		if (!state->line_finished) {
+		if (!state->line_finished &&
+		    (!state->cur_first || state->cur_flushed)) {
+			if (state->cur_first) {
+				/* we've flushed an empty "FETCH (" reply so
+				   far. we can't take it back, but RFC 3501
+				   doesn't allow returning empty "FETCH ()"
+				   either, so just add the current message's
+				   UID there. */
+				str_printfa(ctx->state.cur_str, "UID %u ",
+					    state->cur_mail->uid);
+			}
 			if (imap_fetch_flush_buffer(ctx) < 0)
 				state->failed = TRUE;
 			if (o_stream_send(ctx->client->output, ")\r\n", 3) < 0)
@@ -804,6 +815,10 @@ static int fetch_modseq(struct imap_fetch_context *ctx, struct mail *mail,
 
 bool imap_fetch_modseq_init(struct imap_fetch_init_context *ctx)
 {
+	if (ctx->fetch_ctx->client->nonpermanent_modseqs) {
+		ctx->error = "FETCH MODSEQ can't be used with non-permanent modseqs";
+		return FALSE;
+	}
 	(void)client_enable(ctx->fetch_ctx->client, MAILBOX_FEATURE_CONDSTORE);
 	imap_fetch_add_handler(ctx, IMAP_FETCH_HANDLER_FLAG_BUFFERED,
 			       NULL, fetch_modseq, NULL);
@@ -875,8 +890,11 @@ static bool fetch_x_mailbox_init(struct imap_fetch_init_context *ctx)
 static int fetch_x_real_uid(struct imap_fetch_context *ctx, struct mail *mail,
 			    void *context ATTR_UNUSED)
 {
-	str_printfa(ctx->state.cur_str, "X-REAL-UID %u ",
-		    mail_get_real_mail(mail)->uid);
+	struct mail *real_mail;
+
+	if (mail_get_backend_mail(mail, &real_mail) < 0)
+		return -1;
+	str_printfa(ctx->state.cur_str, "X-REAL-UID %u ", real_mail->uid);
 	return 1;
 }
 

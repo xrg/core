@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "buffer.h"
@@ -14,7 +14,6 @@
 #include "imap-msgpart.h"
 #include "imap-fetch.h"
 
-#include <stdlib.h>
 #include <ctype.h>
 #include <unistd.h>
 
@@ -27,17 +26,24 @@ struct imap_fetch_body_data {
 	unsigned int binary_size:1;
 };
 
-static void fetch_read_error(struct imap_fetch_context *ctx)
+static void fetch_read_error(struct imap_fetch_context *ctx,
+			     const char **disconnect_reason_r)
 {
 	struct imap_fetch_state *state = &ctx->state;
 
-	errno = state->cur_input->stream_errno;
+	if (state->cur_input->stream_errno == ENOENT) {
+		if (state->cur_mail->expunged) {
+			*disconnect_reason_r = "Mail expunged while it was being FETCHed";
+			return;
+		}
+	}
 	mail_storage_set_critical(state->cur_mail->box->storage,
 		"read(%s) failed: %s (FETCH %s for mailbox %s UID %u)",
 		i_stream_get_name(state->cur_input),
 		i_stream_get_error(state->cur_input),
 		state->cur_human_name,
 		mailbox_get_vname(state->cur_mail->box), state->cur_mail->uid);
+	*disconnect_reason_r = "FETCH read() failed";
 }
 
 static const char *get_body_name(const struct imap_fetch_body_data *body)
@@ -85,34 +91,35 @@ static string_t *get_prefix(struct imap_fetch_state *state,
 static int fetch_stream_continue(struct imap_fetch_context *ctx)
 {
 	struct imap_fetch_state *state = &ctx->state;
+	const char *disconnect_reason;
 	off_t ret;
 
 	o_stream_set_max_buffer_size(ctx->client->output, 0);
 	ret = o_stream_send_istream(ctx->client->output, state->cur_input);
 	o_stream_set_max_buffer_size(ctx->client->output, (size_t)-1);
 
-	if (ret > 0)
+	if (ret > 0) {
 		state->cur_offset += ret;
+		if (ctx->state.cur_stats_sizep != NULL)
+			*ctx->state.cur_stats_sizep += ret;
+	}
 
 	if (state->cur_offset != state->cur_size) {
 		/* unfinished */
 		if (state->cur_input->stream_errno != 0) {
-			fetch_read_error(ctx);
-			client_disconnect(ctx->client, "FETCH failed");
+			fetch_read_error(ctx, &disconnect_reason);
+			client_disconnect(ctx->client, disconnect_reason);
 			return -1;
 		}
 		if (!i_stream_have_bytes_left(state->cur_input)) {
 			/* Input stream gave less data than expected */
-			i_error("read(%s): FETCH %s for mailbox %s UID %u "
-				"got too little data: "
+			mail_set_cache_corrupted_reason(state->cur_mail,
+				state->cur_size_field, t_strdup_printf(
+				"read(%s): FETCH %s got too little data: "
 				"%"PRIuUOFF_T" vs %"PRIuUOFF_T,
 				i_stream_get_name(state->cur_input),
 				state->cur_human_name,
-				mailbox_get_vname(state->cur_mail->box),
-				state->cur_mail->uid,
-				state->cur_offset, state->cur_size);
-			mail_set_cache_corrupted(state->cur_mail,
-						 state->cur_size_field);
+				state->cur_offset, state->cur_size));
 			client_disconnect(ctx->client, "FETCH failed");
 			return -1;
 		}
@@ -152,6 +159,18 @@ get_body_human_name(pool_t pool, struct imap_fetch_body_data *body)
 	return p_strdup(pool, str_c(str));
 }
 
+static void fetch_state_update_stats(struct imap_fetch_context *ctx,
+				     const struct imap_msgpart *msgpart)
+{
+	if (!imap_msgpart_contains_body(msgpart)) {
+		ctx->client->fetch_hdr_count++;
+		ctx->state.cur_stats_sizep = &ctx->client->fetch_hdr_bytes;
+	} else {
+		ctx->client->fetch_body_count++;
+		ctx->state.cur_stats_sizep = &ctx->client->fetch_body_bytes;
+	}
+}
+
 static int fetch_body_msgpart(struct imap_fetch_context *ctx, struct mail *mail,
 			      struct imap_fetch_body_data *body)
 {
@@ -163,21 +182,14 @@ static int fetch_body_msgpart(struct imap_fetch_context *ctx, struct mail *mail,
 		return 1;
 	}
 
-	if (imap_msgpart_open(mail, body->msgpart, &result) < 0) {
-		if (!body->binary ||
-		    mailbox_get_last_mail_error(mail->box) != MAIL_ERROR_INVALIDDATA)
-			return -1;
-		/* tried to do BINARY fetch for a MIME part with broken
-		   content */
-		str = get_prefix(&ctx->state, body, (uoff_t)-1, FALSE);
-		o_stream_nsend(ctx->client->output, str_data(str), str_len(str));
-		return 1;
-	}
+	if (imap_msgpart_open(mail, body->msgpart, &result) < 0)
+		return -1;
 	ctx->state.cur_input = result.input;
 	ctx->state.cur_size = result.size;
 	ctx->state.cur_size_field = result.size_field;
 	ctx->state.cur_human_name = get_body_human_name(ctx->ctx_pool, body);
 
+	fetch_state_update_stats(ctx, body->msgpart);
 	str = get_prefix(&ctx->state, body, ctx->state.cur_size,
 			 result.binary_decoded_input_has_nuls);
 	o_stream_nsend(ctx->client->output, str_data(str), str_len(str));
@@ -197,13 +209,8 @@ static int fetch_binary_size(struct imap_fetch_context *ctx, struct mail *mail,
 		return 1;
 	}
 
-	if (imap_msgpart_size(mail, body->msgpart, &size) < 0) {
-		if (mailbox_get_last_mail_error(mail->box) != MAIL_ERROR_INVALIDDATA)
-			return -1;
-		/* tried to do BINARY.SIZE fetch for a MIME part with broken
-		   content */
-		size = 0;
-	}
+	if (imap_msgpart_size(mail, body->msgpart, &size) < 0)
+		return -1;
 
 	str = t_str_new(128);
 	if (ctx->state.cur_first)
@@ -221,19 +228,7 @@ static int fetch_binary_size(struct imap_fetch_context *ctx, struct mail *mail,
    becomes too big and wraps. */
 static int read_uoff_t(const char **p, uoff_t *value)
 {
-	uoff_t prev;
-
-	*value = 0;
-	while (**p >= '0' && **p <= '9') {
-		prev = *value;
-		*value = *value * 10 + (**p - '0');
-
-		if (*value < prev)
-			return -1;
-
-		(*p)++;
-	}
-	return 0;
+	return str_parse_uoff(*p, value, p);
 }
 
 static int
@@ -363,6 +358,7 @@ bool imap_fetch_body_section_init(struct imap_fetch_init_context *ctx)
 	}
 	ctx->fetch_ctx->fetch_data |=
 		imap_msgpart_get_fetch_data(body->msgpart);
+	imap_msgpart_get_wanted_headers(body->msgpart, &ctx->fetch_ctx->all_headers);
 
 	if (body_parse_partial(body, p, &error) < 0) {
 		ctx->error = p_strdup_printf(ctx->pool,
@@ -429,7 +425,7 @@ bool imap_fetch_binary_init(struct imap_fetch_init_context *ctx)
 	}
 	if (imap_msgpart_parse(body->section, &body->msgpart) < 0) {
 		ctx->error = "Invalid BINARY[..] section";
-		return -1;
+		return FALSE;
 	}
 	imap_msgpart_set_decode_to_binary(body->msgpart);
 	ctx->fetch_ctx->fetch_data |=
@@ -494,6 +490,7 @@ fetch_rfc822(struct imap_fetch_context *ctx, struct mail *mail,
 	const char *str;
 
 	msgpart = imap_msgpart_full();
+	fetch_state_update_stats(ctx, msgpart);
 	if (fetch_and_free_msgpart(ctx, mail, &msgpart) < 0)
 		return -1;
 
@@ -516,6 +513,7 @@ fetch_rfc822_header(struct imap_fetch_context *ctx,
 	const char *str;
 
 	msgpart = imap_msgpart_header();
+	fetch_state_update_stats(ctx, msgpart);
 	if (fetch_and_free_msgpart(ctx, mail, &msgpart) < 0)
 		return -1;
 
@@ -538,6 +536,7 @@ fetch_rfc822_text(struct imap_fetch_context *ctx, struct mail *mail,
 	const char *str;
 
 	msgpart = imap_msgpart_body();
+	fetch_state_update_stats(ctx, msgpart);
 	if (fetch_and_free_msgpart(ctx, mail, &msgpart) < 0)
 		return -1;
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -45,12 +45,6 @@ uint32_t imapc_msgmap_rseq_to_uid(struct imapc_msgmap *msgmap, uint32_t rseq)
 
 	uidp = array_idx(&msgmap->uids, rseq-1);
 	return *uidp;
-}
-
-static int uint32_cmp(const uint32_t *p1, const uint32_t *p2)
-{
-	return *p1 < *p2 ? -1 :
-		(*p1 > *p2 ? 1 : 0);
 }
 
 bool imapc_msgmap_uid_to_rseq(struct imapc_msgmap *msgmap,

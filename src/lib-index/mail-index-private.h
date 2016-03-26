@@ -37,6 +37,9 @@ struct mail_index_sync_map_ctx;
 #define MAIL_INDEX_MAP_IDX(map, idx) \
 	((struct mail_index_record *) \
 	 PTR_OFFSET((map)->rec_map->records, (idx) * (map)->hdr.record_size))
+#define MAIL_INDEX_REC_AT_SEQ(map, seq)					\
+	((struct mail_index_record *)					\
+	 PTR_OFFSET((map)->rec_map->records, ((seq)-1) * (map)->hdr.record_size))
 
 #define MAIL_TRANSACTION_FLAG_UPDATE_IS_INTERNAL(u) \
 	((((u)->add_flags | (u)->remove_flags) & MAIL_INDEX_FLAGS_MASK) == 0 && \
@@ -185,12 +188,9 @@ struct mail_index {
 
 	/* last_read_log_file_* contains the seq/offsets we last read from
 	   the main index file's headers. these are used to figure out when
-	   the main index file should be updated, and if we can update it
-	   by writing on top of it or if we need to recreate it. */
+	   the main index file should be updated. */
 	uint32_t last_read_log_file_seq;
-	uint32_t last_read_log_file_head_offset;
 	uint32_t last_read_log_file_tail_offset;
-	struct stat last_read_stat;
 
 	/* transaction log head seq/offset when we last fscked */
 	uint32_t fsck_log_head_file_seq;
@@ -199,13 +199,8 @@ struct mail_index {
 	/* syncing will update this if non-NULL */
 	struct mail_index_transaction_commit_result *sync_commit_result;
 
-	int lock_type;
-	unsigned int lock_id_counter;
 	enum file_lock_method lock_method;
 	unsigned int max_lock_timeout_secs;
-
-	struct file_lock *file_lock;
-	struct dotlock *dotlock;
 
 	pool_t keywords_pool;
 	ARRAY_TYPE(keywords) keywords;
@@ -214,7 +209,7 @@ struct mail_index {
 	uint32_t keywords_ext_id;
 	uint32_t modseq_ext_id;
 
-	unsigned int view_count;
+	struct mail_index_view *views;
 
 	/* Module-specific contexts. */
 	ARRAY(union mail_index_module_context *) module_contexts;
@@ -256,7 +251,8 @@ void mail_index_register_sync_lost_handler(struct mail_index *index,
 void mail_index_unregister_sync_lost_handler(struct mail_index *index,
 					mail_index_sync_lost_handler_t *cb);
 
-int mail_index_create_tmp_file(struct mail_index *index, const char **path_r);
+int mail_index_create_tmp_file(struct mail_index *index,
+			       const char *path_prefix, const char **path_r);
 
 int mail_index_try_open_only(struct mail_index *index);
 void mail_index_close_file(struct mail_index *index);
@@ -308,10 +304,16 @@ void mail_index_map_lookup_seq_range(struct mail_index_map *map,
 				     uint32_t *first_seq_r,
 				     uint32_t *last_seq_r);
 
-int mail_index_map_check_header(struct mail_index_map *map);
+/* Returns 1 on success, 0 on non-critical errors we want to silently fix,
+   -1 if map isn't usable. The caller is responsible for logging the errors
+   if -1 is returned. */
+int mail_index_map_check_header(struct mail_index_map *map,
+				const char **error_r);
+/* Returns 1 if header is usable, 0 or -1 if not. The caller should log an
+   error if -1 is returned, but not if 0 is returned. */
 bool mail_index_check_header_compat(struct mail_index *index,
 				    const struct mail_index_header *hdr,
-				    uoff_t file_size);
+				    uoff_t file_size, const char **error_r);
 int mail_index_map_parse_extensions(struct mail_index_map *map);
 int mail_index_map_parse_keywords(struct mail_index_map *map);
 

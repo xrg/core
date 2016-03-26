@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "ostream.h"
@@ -8,7 +8,6 @@
 #include "imap-search-args.h"
 #include "mail-search.h"
 
-#include <stdlib.h>
 
 static const char *all_macro[] = {
 	"FLAGS", "INTERNALDATE", "RFC822.SIZE", "ENVELOPE", NULL
@@ -111,6 +110,11 @@ fetch_parse_modifier(struct imap_fetch_context *ctx,
 	uint64_t modseq;
 
 	if (strcmp(name, "CHANGEDSINCE") == 0) {
+		if (cmd->client->nonpermanent_modseqs) {
+			client_send_command_error(cmd,
+				"FETCH CHANGEDSINCE can't be used with non-permanent modseqs");
+			return FALSE;
+		}
 		if (!imap_arg_get_atom(*args, &str) ||
 		    str_to_uint64(str, &modseq) < 0) {
 			client_send_command_error(cmd,
@@ -168,6 +172,11 @@ fetch_parse_modifiers(struct imap_fetch_context *ctx,
 	return TRUE;
 }
 
+static bool cmd_fetch_finished(struct client_command_context *cmd ATTR_UNUSED)
+{
+	return TRUE;
+}
+
 static bool cmd_fetch_finish(struct imap_fetch_context *ctx,
 			     struct client_command_context *cmd)
 {
@@ -188,13 +197,22 @@ static bool cmd_fetch_finish(struct imap_fetch_context *ctx,
 		const char *errstr;
 
 		if (cmd->client->output->closed) {
-			client_disconnect(cmd->client, "Disconnected");
-			return TRUE;
+			/* If we're canceling we need to finish this command
+			   or we'll assert crash. But normally we want to
+			   return FALSE so that the disconnect message logs
+			   about this fetch command and that these latest
+			   output bytes are included in it (which wouldn't
+			   happen if we called client_disconnect() here
+			   directly). */
+			cmd->func = cmd_fetch_finished;
+			return cmd->cancel;
 		}
 
 		errstr = mailbox_get_last_error(cmd->client->mailbox, &error);
-		if (error == MAIL_ERROR_CONVERSION) {
-			/* BINARY found unsupported Content-Transfer-Encoding */
+		if (error == MAIL_ERROR_CONVERSION ||
+		    error == MAIL_ERROR_INVALIDDATA) {
+			/* a) BINARY found unsupported Content-Transfer-Encoding
+			   b) Content was invalid */
 			tagged_reply = t_strdup_printf(
 				"NO ["IMAP_RESP_CODE_UNKNOWN_CTE"] %s", errstr);
 		} else {

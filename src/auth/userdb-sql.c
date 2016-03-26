@@ -1,17 +1,13 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "userdb.h"
 
 #ifdef USERDB_SQL
 
-#include "str.h"
-#include "strescape.h"
-#include "var-expand.h"
 #include "auth-cache.h"
 #include "db-sql.h"
 
-#include <stdlib.h>
 #include <string.h>
 
 struct sql_userdb_module {
@@ -42,8 +38,6 @@ sql_query_get_result(struct sql_result *result,
 	const char *name, *value;
 	unsigned int i, fields_count;
 
-	auth_request_init_userdb_reply(auth_request);
-
 	fields_count = sql_result_get_fields_count(result);
 	for (i = 0; i < fields_count; i++) {
 		name = sql_result_get_field_name(result, i);
@@ -71,11 +65,11 @@ static void sql_query_callback(struct sql_result *sql_result,
 		db_sql_success(module->conn);
 	if (ret < 0) {
 		if (!module->conn->default_user_query) {
-			auth_request_log_error(auth_request, "sql",
+			auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 				"User query failed: %s",
 				sql_result_get_error(sql_result));
 		} else {
-			auth_request_log_error(auth_request, "sql",
+			auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 				"User query failed: %s "
 				"(using built-in default user_query: %s)",
 				sql_result_get_error(sql_result),
@@ -83,7 +77,7 @@ static void sql_query_callback(struct sql_result *sql_result,
 		}
 	} else if (ret == 0) {
 		result = USERDB_RESULT_USER_UNKNOWN;
-		auth_request_log_unknown_user(auth_request, "sql");
+		auth_request_log_unknown_user(auth_request, AUTH_SUBSYS_DB);
 	} else {
 		sql_query_get_result(sql_result, auth_request);
 		result = USERDB_RESULT_OK;
@@ -111,21 +105,19 @@ static void userdb_sql_lookup(struct auth_request *auth_request,
 	struct sql_userdb_module *module =
 		(struct sql_userdb_module *)_module;
 	struct userdb_sql_request *sql_request;
-	string_t *query;
+	const char *query;
 
-	query = t_str_new(512);
-	var_expand(query, module->conn->set.user_query,
-		   auth_request_get_var_expand_table(auth_request,
-						     userdb_sql_escape));
+	query = t_auth_request_var_expand(module->conn->set.user_query,
+		   	auth_request, userdb_sql_escape);
 
 	auth_request_ref(auth_request);
 	sql_request = i_new(struct userdb_sql_request, 1);
 	sql_request->callback = callback;
 	sql_request->auth_request = auth_request;
 
-	auth_request_log_debug(auth_request, "sql", "%s", str_c(query));
+	auth_request_log_debug(auth_request, AUTH_SUBSYS_DB, "%s", query);
 
-	sql_query(module->conn->db, str_c(query),
+	sql_query(module->conn->db, query,
 		  sql_query_callback, sql_request);
 }
 
@@ -149,12 +141,10 @@ userdb_sql_iterate_init(struct auth_request *auth_request,
 	struct sql_userdb_module *module =
 		(struct sql_userdb_module *)_module;
 	struct sql_userdb_iterate_context *ctx;
-	string_t *query;
+	const char *query;
 
-	query = t_str_new(512);
-	var_expand(query, module->conn->set.iterate_query,
-		   auth_request_get_var_expand_table(auth_request,
-						     userdb_sql_escape));
+	query = t_auth_request_var_expand(module->conn->set.iterate_query,
+		   auth_request, userdb_sql_escape);
 
 	ctx = i_new(struct sql_userdb_iterate_context, 1);
 	ctx->ctx.auth_request = auth_request;
@@ -162,9 +152,9 @@ userdb_sql_iterate_init(struct auth_request *auth_request,
 	ctx->ctx.context = context;
 	auth_request_ref(auth_request);
 
-	sql_query(module->conn->db, str_c(query),
+	sql_query(module->conn->db, query,
 		  sql_iter_query_callback, ctx);
-	auth_request_log_debug(auth_request, "sql", "%s", str_c(query));
+	auth_request_log_debug(auth_request, AUTH_SUBSYS_DB, "%s", query);
 	return &ctx->ctx;
 }
 
@@ -267,7 +257,7 @@ userdb_sql_preinit(pool_t pool, const char *args)
 	module = p_new(pool, struct sql_userdb_module, 1);
 	module->conn = db_sql_init(args, TRUE);
 
-	module->module.cache_key =
+	module->module.default_cache_key =
 		auth_cache_parse_key(pool, module->conn->set.user_query);
 	return &module->module;
 }

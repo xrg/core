@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -10,7 +10,6 @@
 #include "master-interface.h"
 #include "master-service.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -78,14 +77,18 @@ static bool client_exec_script(struct master_service_connection *conn)
 	/* Input contains:
 
 	   VERSION .. <lf>
-	   [timeout=<timeout>]
-	   <noreply> | "-" <lf>
+	   [alarm=<secs> <lf>]
+	   "noreply" | "-" (or anything really) <lf>
 
 	   arg 1 <lf>
 	   arg 2 <lf>
 	   ...
 	   <lf>
 	   DATA
+
+	   This is quite a horrible protocol. If alarm is specified, it MUST be
+	   before "noreply". If "noreply" isn't given, something other string
+	   (typically "-") must be given which is eaten away.
 	*/		
 	alarm(SCRIPT_READ_TIMEOUT_SECS);
 	scanpos = 1;
@@ -140,7 +143,10 @@ static bool client_exec_script(struct master_service_connection *conn)
 	script_verify_version(*args); args++;
 	if (*args != NULL) {
 		if (strncmp(*args, "alarm=", 6) == 0) {
-			alarm(atoi(*args + 6));
+			unsigned int seconds;
+			if (str_to_uint(*args + 6, &seconds) < 0)
+				i_fatal("invalid alarm option");
+			alarm(seconds);
 			args++;
 		}
 		if (strcmp(*args, "noreply") == 0) {

@@ -9,7 +9,8 @@ struct fts_parser_vfuncs {
 				       const char *content_type,
 				       const char *content_disposition);
 	void (*more)(struct fts_parser *parser, struct message_block *block);
-	void (*deinit)(struct fts_parser *parser);
+	int (*deinit)(struct fts_parser *parser);
+	void (*unload)(void);
 };
 
 struct fts_parser {
@@ -19,6 +20,7 @@ struct fts_parser {
 
 extern struct fts_parser_vfuncs fts_parser_html;
 extern struct fts_parser_vfuncs fts_parser_script;
+extern struct fts_parser_vfuncs fts_parser_tika;
 
 bool fts_parser_init(struct mail_user *user,
 		     const char *content_type, const char *content_disposition,
@@ -29,6 +31,8 @@ struct fts_parser *fts_parser_text_init(void);
    finished, it's still called with incoming size=0 while the parser increases
    it to non-zero. */
 void fts_parser_more(struct fts_parser *parser, struct message_block *block);
-void fts_parser_deinit(struct fts_parser **parser);
+int fts_parser_deinit(struct fts_parser **parser);
+
+void fts_parsers_unload(void);
 
 #endif

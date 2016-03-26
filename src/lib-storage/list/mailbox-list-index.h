@@ -27,6 +27,8 @@
 #include "mail-storage.h"
 #include "mailbox-list-private.h"
 
+#include <sys/time.h>
+
 #define MAILBOX_LIST_INDEX_HIERARHCY_SEP '~'
 #define MAILBOX_LIST_INDEX_PREFIX "dovecot.list.index"
 
@@ -34,6 +36,7 @@
 	MODULE_CONTEXT(obj, mailbox_list_index_module)
 
 struct mail_index_view;
+struct mailbox_index_vsize;
 
 /* stored in mail_index_record.flags: */
 enum mailbox_list_index_flags {
@@ -86,12 +89,15 @@ struct mailbox_list_index {
 	const char *path;
 	struct mail_index *index;
 	uint32_t ext_id, msgs_ext_id, hmodseq_ext_id, subs_hdr_ext_id;
+	uint32_t vsize_ext_id, first_saved_ext_id;
+	struct timeval last_refresh_timeval;
 
 	pool_t mailbox_pool;
 	/* uin32_t id => name */
 	HASH_TABLE(void *, char *) mailbox_names;
 	uint32_t highest_name_id;
 
+	struct mailbox_list_index_sync_context *sync_ctx;
 	uint32_t sync_log_file_seq;
 	uoff_t sync_log_file_offset;
 	uint32_t sync_stamp;
@@ -106,6 +112,7 @@ struct mailbox_list_index {
 	unsigned int syncing:1;
 	unsigned int updating_status:1;
 	unsigned int has_backing_store:1;
+	unsigned int index_last_check_changed:1;
 };
 
 struct mailbox_list_index_iterate_context {
@@ -136,9 +143,14 @@ void mailbox_list_index_node_get_path(const struct mailbox_list_index_node *node
 void mailbox_list_index_node_unlink(struct mailbox_list_index *ilist,
 				    struct mailbox_list_index_node *node);
 
+int mailbox_list_index_index_open(struct mailbox_list *list);
 bool mailbox_list_index_need_refresh(struct mailbox_list_index *ilist,
 				     struct mail_index_view *view);
+/* Refresh the index, but only if it hasn't been refreshed "recently"
+   (= within this same ioloop run) */
 int mailbox_list_index_refresh(struct mailbox_list *list);
+/* Refresh the index regardless of when the last refresh was done. */
+int mailbox_list_index_refresh_force(struct mailbox_list *list);
 void mailbox_list_index_refresh_later(struct mailbox_list *list);
 
 struct mailbox_list_index_node *
@@ -160,7 +172,8 @@ bool mailbox_list_index_status(struct mailbox_list *list,
 			       struct mail_index_view *view,
 			       uint32_t seq, enum mailbox_status_items items,
 			       struct mailbox_status *status_r,
-			       uint8_t *mailbox_guid);
+			       uint8_t *mailbox_guid,
+			       struct mailbox_index_vsize *vsize_r);
 void mailbox_list_index_status_set_info_flags(struct mailbox *box, uint32_t uid,
 					      enum mailbox_info_flags *flags);
 void mailbox_list_index_update_mailbox_index(struct mailbox *box,

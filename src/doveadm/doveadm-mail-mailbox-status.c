@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -129,6 +129,8 @@ status_mailbox(struct status_cmd_context *ctx, const struct mailbox_info *info)
 	box = doveadm_mailbox_find(ctx->ctx.cur_mail_user, info->vname);
 	if (mailbox_get_status(box, ctx->status_items, &status) < 0 ||
 	    mailbox_get_metadata(box, ctx->metadata_items, &metadata) < 0) {
+		i_error("Mailbox %s: Failed to lookup mailbox status: %s",
+			mailbox_get_vname(box), mailbox_get_last_error(box, NULL));
 		doveadm_mail_failed_mailbox(&ctx->ctx, box);
 		mailbox_free(&box);
 		return -1;
@@ -212,7 +214,8 @@ static void cmd_mailbox_status_deinit(struct doveadm_mail_cmd_context *_ctx)
 {
 	struct status_cmd_context *ctx = (struct status_cmd_context *)_ctx;
 
-	mail_search_args_unref(&ctx->search_args);
+	if (ctx->search_args != NULL)
+		mail_search_args_unref(&ctx->search_args);
 }
 
 static bool
@@ -223,6 +226,8 @@ cmd_mailbox_status_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
 	switch (c) {
 	case 't':
 		ctx->total_sum = TRUE;
+		break;
+	case 'f':
 		break;
 	default:
 		return FALSE;
@@ -244,7 +249,15 @@ static struct doveadm_mail_cmd_context *cmd_mailbox_status_alloc(void)
 	return &ctx->ctx;
 }
 
-struct doveadm_mail_cmd cmd_mailbox_status = {
-	cmd_mailbox_status_alloc, "mailbox status",
-	"[-t] <fields> <mailbox mask> [...]"
+struct doveadm_cmd_ver2 doveadm_cmd_mailbox_status_ver2 = {
+        .name = "mailbox status",
+        .mail_cmd = cmd_mailbox_status_alloc,
+        .usage = DOVEADM_CMD_MAIL_USAGE_PREFIX"<fields> <mailbox> [...]",
+DOVEADM_CMD_PARAMS_START
+DOVEADM_CMD_MAIL_COMMON
+DOVEADM_CMD_PARAM('t', "total-sum", CMD_PARAM_BOOL, 0)
+DOVEADM_CMD_PARAM('f', "field", CMD_PARAM_ARRAY, 0)
+DOVEADM_CMD_PARAM('\0', "fieldstr", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL | CMD_PARAM_FLAG_DO_NOT_EXPOSE) /* FIXME: horrible hack, remove me when possible */
+DOVEADM_CMD_PARAM('\0', "mailbox-mask", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMS_END
 };

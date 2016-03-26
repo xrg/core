@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "str.h"
@@ -283,8 +283,7 @@ bool cmd_thread(struct client_command_context *cmd)
 		ret = imap_thread_orderedsubject(cmd, sargs);
 	mail_search_args_unref(&sargs);
 	if (ret < 0) {
-		client_send_storage_error(cmd,
-			mailbox_get_storage(client->mailbox));
+		client_send_box_error(cmd, client->mailbox);
 		return TRUE;
 	}
 

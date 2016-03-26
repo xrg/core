@@ -19,7 +19,7 @@
 	(sizeof(arr) / sizeof((arr)[0]))
 
 #define MEM_ALIGN(size) \
-	(((size) + MEM_ALIGN_SIZE-1) & ~((unsigned int) MEM_ALIGN_SIZE-1))
+	(((size) + MEM_ALIGN_SIZE-1) & ~((size_t) MEM_ALIGN_SIZE-1))
 
 #define PTR_OFFSET(ptr, offset) \
 	((void *) (((unsigned char *) (ptr)) + (offset)))
@@ -140,9 +140,15 @@
 #  define ATTR_HOT
 #  define ATTR_COLD
 #endif
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 9)
+/* GCC 4.9 and later */
+#  define ATTR_RETURNS_NONNULL __attribute__((returns_nonnull))
+#else
+#  define ATTR_RETURNS_NONNULL
+#endif
 
 /* Macros to provide type safety for callback functions' context parameters */
-#if (__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ > 3))
+#if ((__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ > 3)) && defined(HAVE_TYPEOF))
 #  define CALLBACK_TYPECHECK(callback, type) \
 	(COMPILE_ERROR_IF_TRUE(!__builtin_types_compatible_p( \
 		typeof(&callback), type)) ? 1 : 0)
@@ -153,6 +159,11 @@
 #if (__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ > 0)) && !defined(__cplusplus)
 #  define COMPILE_ERROR_IF_TRUE(condition) \
 	(sizeof(char[1 - 2 * !!(condition)]) - 1)
+#else
+#  define COMPILE_ERROR_IF_TRUE(condition) 0
+#endif
+
+#if (__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ > 0)) && !defined(__cplusplus) && defined(HAVE_TYPEOF)
 #  define COMPILE_ERROR_IF_TYPES_NOT_COMPATIBLE(_a, _b) \
 	COMPILE_ERROR_IF_TRUE( \
 		!__builtin_types_compatible_p(typeof(_a), typeof(_b)))
@@ -161,7 +172,6 @@
 		!__builtin_types_compatible_p(typeof(_a1), typeof(_b)) && \
 		!__builtin_types_compatible_p(typeof(_a2), typeof(_b)))
 #else
-#  define COMPILE_ERROR_IF_TRUE(condition) 0
 #  define COMPILE_ERROR_IF_TYPES_NOT_COMPATIBLE(_a, _b) 0
 #  define COMPILE_ERROR_IF_TYPES2_NOT_COMPATIBLE(_a1, _a2, _b) 0
 #endif
@@ -199,6 +209,7 @@
 #endif
 
 #define i_close_fd(fd) STMT_START {  \
+	i_assert(*fd != -1); \
 	if (unlikely(close_keep_errno(fd) < 0)) \
 		i_error("close(%d[%s:%d]) failed: %m", \
 			*(fd), __FILE__, __LINE__); \

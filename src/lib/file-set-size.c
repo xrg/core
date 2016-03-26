@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #ifdef HAVE_CONFIG_H
 #  include "config.h"
@@ -14,7 +14,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#ifdef HAVE_LINUX_FALLOC_H
+#if defined(HAVE_LINUX_FALLOC_H) && !defined(FALLOC_FL_KEEP_SIZE)
+/* Legacy Linux does not have the FALLOC_FL_* flags under fcntl.h */
 #  include <linux/falloc.h>
 #endif
 

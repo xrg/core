@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "mail-storage.h"
@@ -8,7 +8,6 @@
 #include "imap-parser.h"
 #include "imap-seqset.h"
 
-#include <stdlib.h>
 
 struct search_build_data {
 	pool_t pool;

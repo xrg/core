@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -12,7 +12,6 @@
 #include "replicator-queue.h"
 #include "replicator-settings.h"
 
-#define REPLICATOR_AUTH_SERVICE_NAME "replicator"
 #define REPLICATOR_DB_DUMP_INTERVAL_MSECS (1000*60*15)
 /* if syncing fails, try again in 5 minutes */
 #define REPLICATOR_FAILURE_RESYNC_INTERVAL_SECS (60*5)
@@ -28,36 +27,16 @@ static void client_connected(struct master_service_connection *conn)
 {
 	master_service_client_connection_accept(conn);
 	if (strcmp(conn->name, "replicator-doveadm") == 0)
-		doveadm_connection_create(queue, conn->fd);
+		doveadm_connection_create(brain, conn->fd);
 	else
 		(void)notify_connection_create(conn->fd, queue);
 }
 
 static void replication_add_users(struct replicator_queue *queue)
 {
-	struct auth_master_connection *auth_conn;
-	struct auth_master_user_list_ctx *ctx;
-	struct auth_user_info user_info;
-	struct replicator_user *user;
-	const char *path, *username;
+	const char *path;
 
-	auth_conn = auth_master_init(set->auth_socket_path,
-				     AUTH_MASTER_FLAG_NO_IDLE_TIMEOUT);
-
-	memset(&user_info, 0, sizeof(user_info));
-	user_info.service = REPLICATOR_AUTH_SERVICE_NAME;
-
-	/* add all users into replication queue, so that we can start doing
-	   full syncs for everyone whose state can't be found */
-	ctx = auth_master_user_list_init(auth_conn, "", &user_info);
-	while ((username = auth_master_user_list_next(ctx)) != NULL) {
-		user = replicator_queue_add(queue, username,
-					    REPLICATION_PRIORITY_NONE);
-		user->last_update = 0;
-	}
-	if (auth_master_user_list_deinit(&ctx) < 0)
-		i_error("listing users failed, can't replicate existing data");
-	auth_master_deinit(&auth_conn);
+	replicator_queue_add_auth_users(queue, set->auth_socket_path, "*", 0);
 
 	/* add updates from replicator db, if it exists */
 	path = t_strconcat(service_set->state_dir, "/"REPLICATOR_DB_FNAME, NULL);
@@ -70,7 +49,7 @@ replicator_dump_timeout(void *context ATTR_UNUSED)
 	const char *path;
 
 	path = t_strconcat(service_set->state_dir, "/"REPLICATOR_DB_FNAME, NULL);
-	(void)replicator_queue_import(queue, path);
+	(void)replicator_queue_export(queue, path);
 }
 
 static void main_init(void)
@@ -125,9 +104,11 @@ int main(int argc, char *argv[])
 
 	restrict_access_by_env(NULL, FALSE);
 	restrict_access_allow_coredumps(TRUE);
+	/* finish init before we get list of users from auth, because that
+	   can take long enough for master process to kill us otherwise. */
+	master_service_init_finish(master_service);
 
 	main_init();
-	master_service_init_finish(master_service);
 	master_service_run(master_service, client_connected);
 	main_deinit();
 

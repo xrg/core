@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 /* kludge a bit to remove _FILE_OFFSET_BITS definition from config.h.
    It's required to be able to include sys/sendfile.h with Linux. */
@@ -116,7 +116,7 @@ ssize_t safe_sendfile(int out_fd, int in_fd, uoff_t *offset, size_t count)
 		if (errno == EINVAL) {
 			/* most likely trying to read past EOF */
 			ret = 0;
-		} else if (errno == EAFNOSUPPORT) {
+		} else if (errno == EAFNOSUPPORT || errno == EOPNOTSUPP) {
 			/* not supported, return Linux-like EINVAL so caller
 			   sees only consistent errnos. */
 			errno = EINVAL;
@@ -127,6 +127,7 @@ ssize_t safe_sendfile(int out_fd, int in_fd, uoff_t *offset, size_t count)
 		}
 	}
 	*offset = (uoff_t)s_offset;
+	i_assert(ret < 0 || (size_t)ret <= count);
 	return ret;
 }
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -8,7 +8,6 @@
 #include "mail-search-parser.h"
 #include "mail-search-build.h"
 
-#include <stdlib.h>
 
 static int mail_search_build_list(struct mail_search_build_context *ctx,
 				  struct mail_search_arg **arg_r);
@@ -146,9 +145,8 @@ int mail_search_build(struct mail_search_register *reg,
 	*args_r = NULL;
 	*error_r = NULL;
 
-	args = mail_search_build_init();
-
 	memset(&ctx, 0, sizeof(ctx));
+	ctx.args = args = mail_search_build_init();
 	ctx.pool = args->pool;
 	ctx.reg = reg;
 	ctx.parser = parser;
@@ -230,7 +228,7 @@ int mail_search_build_get_utf8(struct mail_search_build_context *ctx,
 		string_t *utf8 = t_str_new(128);
 		enum charset_result result;
 
-		if (charset_to_utf8_str(ctx->charset, 0,
+		if (charset_to_utf8_str(ctx->charset, NULL,
 					input, utf8, &result) < 0) {
 			/* unknown charset */
 			ctx->_error = "Unknown charset";

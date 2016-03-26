@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -13,7 +13,6 @@
 #include "doveadm-dump.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <time.h>
 
 struct index_vsize_header {
@@ -52,6 +51,25 @@ struct mdbox_mail_index_record {
 struct obox_mail_index_record {
 	unsigned char guid[GUID_128_SIZE];
 	unsigned char oid[GUID_128_SIZE];
+};
+struct mobox_mail_index_header {
+	uint32_t rebuild_count;
+	uint32_t map_uid_validity;
+	uint8_t unused[4];
+	guid_128_t mailbox_guid;
+};
+struct mobox_mail_index_record {
+	uint32_t map_uid;
+	uint32_t save_date;
+};
+struct mobox_map_mail_index_header {
+	uint32_t rebuild_count;
+};
+
+struct mobox_map_mail_index_record {
+	uint32_t offset;
+	uint32_t size;
+	guid_128_t oid;
 };
 struct mailbox_list_index_record {
 	uint32_t name_id;
@@ -184,6 +202,19 @@ static void dump_extension_header(struct mail_index *index,
 		printf(" - mailbox_guid .. = %s\n",
 		       guid_128_to_string(hdr->mailbox_guid));
 		printf(" - flags ......... = 0x%x\n", hdr->flags);
+	} else if (strcmp(ext->name, "mobox-hdr") == 0) {
+		const struct mobox_mail_index_header *hdr = data;
+
+		printf("header\n");
+		printf(" - rebuild_count    .. = %u\n", hdr->rebuild_count);
+		printf(" - map_uid_validity .. = %u\n", hdr->map_uid_validity);
+		printf(" - mailbox_guid ...... = %s\n",
+		       guid_128_to_string(hdr->mailbox_guid));
+	} else if (strcmp(ext->name, "mobox-map") == 0) {
+		const struct mobox_map_mail_index_header *hdr = data;
+
+		printf("header\n");
+		printf(" - rebuild_count    .. = %u\n", hdr->rebuild_count);
 	} else if (strcmp(ext->name, "modseq") == 0) {
 		const struct mail_index_modseq_header *hdr = data;
 
@@ -445,6 +476,7 @@ static void dump_cache(struct mail_cache_view *cache_view, unsigned int seq)
 				memcpy(&value, data, sizeof(value));
 				str_printfa(str, "%llu ", (unsigned long long)value);
 			}
+			/* fall through */
 		case MAIL_CACHE_FIELD_VARIABLE_SIZE:
 		case MAIL_CACHE_FIELD_BITMASK:
 			str_printfa(str, "(%s)", binary_to_hex(data, size));
@@ -579,6 +611,15 @@ static void dump_record(struct mail_index_view *view, unsigned int seq)
 			const struct obox_mail_index_record *orec = data;
 			printf("                   : guid = %s\n", guid_128_to_string(orec->guid));
 			printf("                   : oid  = %s\n", guid_128_to_string(orec->oid));
+		} else if (strcmp(ext[i].name, "mobox") == 0) {
+			const struct mobox_mail_index_record *orec = data;
+			printf("                   : map_uid   = %u\n", orec->map_uid);
+			printf("                   : save_date = %u (%s)\n", orec->save_date, unixdate2str(orec->save_date));
+		} else if (strcmp(ext[i].name, "mobox-map") == 0) {
+			const struct mobox_map_mail_index_record *orec = data;
+			printf("                   : offset = %u\n", orec->offset);
+			printf("                   : size   = %u\n", orec->size);
+			printf("                   : oid    = %s\n", guid_128_to_string(orec->oid));
 		} else if (strcmp(ext[i].name, "list") == 0) {
 			const struct mailbox_list_index_record *lrec = data;
 			printf("                   : name_id      = %u\n", lrec->name_id);
@@ -626,8 +667,10 @@ static void cmd_dump_index(int argc ATTR_UNUSED, char *argv[])
 	if (index == NULL ||
 	    mail_index_open(index, MAIL_INDEX_OPEN_FLAG_READONLY) <= 0)
 		i_fatal("Couldn't open index %s", argv[1]);
-	if (argv[2] != NULL)
-		uid = atoi(argv[2]);
+	if (argv[2] != NULL) {
+		if (str_to_uint(argv[2], &uid) < 0)
+			i_fatal("Invalid uid number %s", argv[2]);
+	}
 
 	view = mail_index_view_open(index);
 	cache_view = mail_cache_view_open(index->cache, view);

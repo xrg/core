@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2016 Dovecot authors, see the included COPYING file */
 
 /* FIXME: If we don't have permission to change flags/keywords, the changes
    should still be stored temporarily for this session. However most clients
@@ -111,6 +111,14 @@ static void acl_mailbox_copy_acls_from_parent(struct mailbox *box)
 	acl_object_deinit(&parent_aclobj);
 }
 
+static bool mailbox_is_autocreated(struct mailbox *box)
+{
+	if (box->inbox_user)
+		return TRUE;
+	return box->set != NULL &&
+		strcmp(box->set->autocreate, MAILBOX_SET_AUTO_NO) != 0;
+}
+
 static int
 acl_mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 		   bool directory)
@@ -118,9 +126,15 @@ acl_mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 	struct acl_mailbox *abox = ACL_CONTEXT(box);
 	int ret;
 
-	/* we're looking up CREATE permission from our parent's rights */
-	ret = acl_mailbox_list_have_right(box->list, box->name, TRUE,
-					  ACL_STORAGE_RIGHT_CREATE, NULL);
+	if (!mailbox_is_autocreated(box)) {
+		/* we're looking up CREATE permission from our parent's rights */
+		ret = acl_mailbox_list_have_right(box->list, box->name, TRUE,
+						  ACL_STORAGE_RIGHT_CREATE, NULL);
+	} else {
+		/* mailbox is autocreated, so we need to treat it as if it
+		   already exists. ignore the "create" ACL here. */
+		ret = 1;
+	}
 	if (ret <= 0) {
 		if (ret < 0) {
 			mail_storage_set_internal_error(box->storage);
@@ -184,12 +198,7 @@ acl_mailbox_delete(struct mailbox *box)
 		return -1;
 	}
 
-	/* deletion might internally open the mailbox. let it succeed even if
-	   we don't have READ permission. */
-	abox->skip_acl_checks = TRUE;
-	ret = abox->module_ctx.super.delete_box(box);
-	abox->skip_acl_checks = FALSE;
-	return ret;
+	return abox->module_ctx.super.delete_box(box);
 }
 
 static int
@@ -500,6 +509,8 @@ static int acl_mailbox_open_check_acl(struct mailbox *box)
 	if ((box->flags & MAILBOX_FLAG_SAVEONLY) != 0) {
 		open_right = (box->flags & MAILBOX_FLAG_POST_SESSION) != 0 ?
 			ACL_STORAGE_RIGHT_POST : ACL_STORAGE_RIGHT_INSERT;
+	} else if (box->deleting) {
+		open_right = ACL_STORAGE_RIGHT_DELETE;
 	} else {
 		open_right = ACL_STORAGE_RIGHT_READ;
 	}
@@ -561,17 +572,17 @@ void acl_mailbox_allocated(struct mailbox *box)
 	struct acl_mailbox_list *alist = ACL_LIST_CONTEXT(box->list);
 	struct mailbox_vfuncs *v = box->vlast;
 	struct acl_mailbox *abox;
+	bool ignore_acls = (box->flags & MAILBOX_FLAG_IGNORE_ACLS) != 0;
 
 	if (alist == NULL) {
 		/* ACLs disabled */
 		return;
 	}
 
-	if (box->list->ns->type == MAIL_NAMESPACE_TYPE_SHARED &&
-	    (box->list->ns->flags & NAMESPACE_FLAG_AUTOCREATED) == 0) {
+	if (mail_namespace_is_shared_user_root(box->list->ns)) {
 		/* this is the root shared namespace, which itself doesn't
 		   have any existing mailboxes. */
-		return;
+		ignore_acls = TRUE;
 	}
 
 	abox = p_new(box->pool, struct acl_mailbox, 1);
@@ -583,7 +594,7 @@ void acl_mailbox_allocated(struct mailbox *box)
 						 mailbox_get_name(box));
 
 	v->free = acl_mailbox_free;
-	if ((box->flags & MAILBOX_FLAG_IGNORE_ACLS) == 0) {
+	if (!ignore_acls) {
 		abox->acl_enabled = TRUE;
 		v->is_readonly = acl_is_readonly;
 		v->exists = acl_mailbox_exists;

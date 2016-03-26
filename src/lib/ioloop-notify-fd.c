@@ -1,10 +1,10 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop-private.h"
 #include "ioloop-notify-fd.h"
 
-#if defined(IOLOOP_NOTIFY_DNOTIFY) || defined(IOLOOP_NOTIFY_INOTIFY)
+#if defined(IOLOOP_NOTIFY_INOTIFY)
 
 struct io *io_notify_fd_add(struct ioloop_notify_fd_context *ctx, int fd,
 			    io_callback_t *callback, void *context)

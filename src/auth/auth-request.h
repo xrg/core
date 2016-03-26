@@ -6,6 +6,7 @@
 #include "mech.h"
 #include "userdb.h"
 #include "passdb.h"
+#include "auth-request-var-expand.h"
 
 #define AUTH_REQUEST_USER_KEY_IGNORE " "
 
@@ -20,10 +21,6 @@ enum auth_request_state {
 
 	AUTH_REQUEST_STATE_MAX
 };
-
-typedef const char *
-auth_request_escape_func_t(const char *string,
-			   const struct auth_request *auth_request);
 
 struct auth_request {
 	int refcount;
@@ -64,6 +61,8 @@ struct auth_request {
         struct auth_passdb *passdb;
         struct auth_userdb *userdb;
 
+	struct stats *stats;
+
 	/* passdb lookups have a handler, userdb lookups don't */
 	struct auth_request_handler *handler;
         struct auth_master_connection *master;
@@ -76,7 +75,7 @@ struct auth_request {
 
 	const char *service, *mech_name, *session_id;
 	struct ip_addr local_ip, remote_ip, real_local_ip, real_remote_ip;
-	unsigned int local_port, remote_port, real_local_port, real_remote_port;
+	in_port_t local_port, remote_port, real_local_port, real_remote_port;
 
 	struct timeout *to_abort, *to_penalty;
 	unsigned int last_penalty;
@@ -89,7 +88,9 @@ struct auth_request {
 		set_credentials_callback_t *set_credentials;
                 userdb_callback_t *userdb;
 	} private_callback;
-        const char *credentials_scheme;
+	const char *credentials_scheme;
+	const unsigned char *delayed_credentials;
+	size_t delayed_credentials_size;
 
 	void *context;
 
@@ -108,6 +109,7 @@ struct auth_request {
 	unsigned int no_penalty:1;
 	unsigned int valid_client_cert:1;
 	unsigned int cert_username:1;
+	unsigned int request_auth_token:1;
 
 	/* success/failure states: */
 	unsigned int successful:1;
@@ -123,16 +125,22 @@ struct auth_request {
 	unsigned int prefer_plain_credentials:1;
 	unsigned int in_delayed_failure_queue:1;
 	unsigned int removed_from_handler:1;
-	unsigned int snapshot_has_userdb_reply:1;
+	unsigned int snapshot_have_userdb_prefetch_set:1;
 	/* each passdb lookup can update the current success-status using the
 	   result_* rules. the authentication succeeds only if this is TRUE
 	   at the end. mechanisms that don't require passdb, but do a passdb
 	   lookup anyway (e.g. GSSAPI) need to set this to TRUE by default. */
 	unsigned int passdb_success:1;
+	/* userdb equivalent of passdb_success */
+	unsigned int userdb_success:1;
 	/* the last userdb lookup failed either due to "tempfail" extra field
 	   or because one of the returned uid/gid fields couldn't be translated
 	   to a number */
-	unsigned int userdb_lookup_failed:1;
+	unsigned int userdb_lookup_tempfailed:1;
+	/* userdb_* fields have been set by the passdb lookup, userdb prefetch
+	   will work. */
+	unsigned int userdb_prefetch_set:1;
+	unsigned int stats_sent:1;
 
 	/* ... mechanism specific data ... */
 };
@@ -140,12 +148,10 @@ struct auth_request {
 typedef void auth_request_proxy_cb_t(bool success, struct auth_request *);
 
 extern unsigned int auth_request_state_count[AUTH_REQUEST_STATE_MAX];
-#define AUTH_REQUEST_VAR_TAB_USER_IDX 0
-#define AUTH_REQUEST_VAR_TAB_USERNAME_IDX 1
-#define AUTH_REQUEST_VAR_TAB_DOMAIN_IDX 2
-#define AUTH_REQUEST_VAR_TAB_COUNT 25
-extern const struct var_expand_table
-auth_request_var_expand_static_tab[AUTH_REQUEST_VAR_TAB_COUNT+1];
+
+extern const char auth_default_subsystems[2];
+#define AUTH_SUBSYS_DB &auth_default_subsystems[0]
+#define AUTH_SUBSYS_MECH &auth_default_subsystems[1]
 
 struct auth_request *
 auth_request_new(const struct mech_module *mech);
@@ -221,17 +227,6 @@ int auth_request_password_verify(struct auth_request *request,
 				 const char *plain_password,
 				 const char *crypted_password,
 				 const char *scheme, const char *subsystem);
-
-const struct var_expand_table *
-auth_request_get_var_expand_table(const struct auth_request *auth_request,
-				  auth_request_escape_func_t *escape_func)
-	ATTR_NULL(2);
-struct var_expand_table *
-auth_request_get_var_expand_table_full(const struct auth_request *auth_request,
-				       auth_request_escape_func_t *escape_func,
-				       unsigned int *count) ATTR_NULL(2);
-const char *auth_request_str_escape(const char *string,
-				    const struct auth_request *request);
 
 void auth_request_log_debug(struct auth_request *auth_request,
 			    const char *subsystem,

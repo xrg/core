@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -14,11 +14,6 @@
 #define DSYNC_FAIL_TIMEOUT_MSECS (1000*5)
 #define DOVEADM_HANDSHAKE "VERSION\tdoveadm-server\t1\t0\n"
 
-/* normally there shouldn't be any need for locking, since replicator doesn't
-   start dsync in parallel for the same user. we'll do locking just in case
-   anyway */
-#define DSYNC_LOCK_TIMEOUT_SECS 30
-
 struct dsync_client {
 	char *path;
 	int fd;
@@ -27,7 +22,10 @@ struct dsync_client {
 	struct ostream *output;
 	struct timeout *to;
 
+	char *dsync_params;
+	char *username;
 	char *state;
+	enum dsync_type sync_type;
 	dsync_callback_t *callback;
 	void *context;
 
@@ -36,13 +34,15 @@ struct dsync_client {
 	unsigned int cmd_sent:1;
 };
 
-struct dsync_client *dsync_client_init(const char *path)
+struct dsync_client *
+dsync_client_init(const char *path, const char *dsync_params)
 {
 	struct dsync_client *client;
 
 	client = i_new(struct dsync_client, 1);
 	client->path = i_strdup(path);
 	client->fd = -1;
+	client->dsync_params = i_strdup(dsync_params);
 	return client;
 }
 
@@ -71,6 +71,7 @@ static void dsync_close(struct dsync_client *client)
 	client->cmd_sent = FALSE;
 	client->handshaked = FALSE;
 	i_free_and_null(client->state);
+	i_free_and_null(client->username);
 
 	if (client->fd == -1)
 		return;
@@ -97,6 +98,7 @@ void dsync_client_deinit(struct dsync_client **_client)
 	*_client = NULL;
 
 	dsync_disconnect(client);
+	i_free(client->dsync_params);
 	i_free(client->path);
 	i_free(client);
 }
@@ -190,13 +192,22 @@ void dsync_client_sync(struct dsync_client *client,
 		       dsync_callback_t *callback, void *context)
 {
 	string_t *cmd;
+	unsigned int pos;
+	char *p;
 
 	i_assert(callback != NULL);
 	i_assert(!dsync_client_is_busy(client));
 
+	client->username = i_strdup(username);
 	client->cmd_sent = TRUE;
 	client->callback = callback;
 	client->context = context;
+	if (full)
+		client->sync_type = DSYNC_TYPE_FULL;
+	else if (state != NULL && state[0] != '\0')
+		client->sync_type = DSYNC_TYPE_INCREMENTAL;
+	else
+		client->sync_type = DSYNC_TYPE_NORMAL;
 
 	if (dsync_connect(client) < 0) {
 		i_assert(client->to == NULL);
@@ -207,10 +218,20 @@ void dsync_client_sync(struct dsync_client *client,
 		cmd = t_str_new(256);
 		str_append_c(cmd, '\t');
 		str_append_tabescaped(cmd, username);
-		str_printfa(cmd, "\tsync\t-d\t-N\t-l\t%u", DSYNC_LOCK_TIMEOUT_SECS);
+		str_append(cmd, "\tsync\t");
+		pos = str_len(cmd);
+		/* insert the parameters. we can do it simply by converting
+		   spaces into tabs, it's unlikely we'll ever need anything
+		   more complex here. */
+		str_append(cmd, client->dsync_params);
+		p = str_c_modifiable(cmd) + pos;
+		for (; *p != '\0'; p++) {
+			if (*p == ' ')
+				*p = '\t';
+		}
 		if (full)
 			str_append(cmd, "\t-f");
-		str_append(cmd, "\t-U\t-s\t");
+		str_append(cmd, "\t-s\t");
 		if (state != NULL)
 			str_append(cmd, state);
 		str_append_c(cmd, '\n');
@@ -221,4 +242,32 @@ void dsync_client_sync(struct dsync_client *client,
 bool dsync_client_is_busy(struct dsync_client *client)
 {
 	return client->cmd_sent;
+}
+
+const char *dsync_client_get_username(struct dsync_client *conn)
+{
+	return conn->username;
+}
+
+enum dsync_type dsync_client_get_type(struct dsync_client *conn)
+{
+	return conn->sync_type;
+}
+
+const char *dsync_client_get_state(struct dsync_client *conn)
+{
+	if (conn->fd == -1) {
+		if (conn->last_connect_failure == 0)
+			return "Not connected";
+		return t_strdup_printf("Failed to connect to '%s' - last attempt %ld secs ago", conn->path,
+				       (long)(ioloop_time - conn->last_connect_failure));
+	}
+	if (!dsync_client_is_busy(conn))
+		return "Idle";
+	if (!conn->handshaked)
+		return "Waiting for handshake";
+	if (conn->state == NULL)
+		return "Waiting for dsync to finish";
+	else
+		return "Waiting for dsync to finish (second line)";
 }

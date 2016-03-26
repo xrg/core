@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2008-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -6,7 +6,6 @@
 #include "rfc822-parser.h"
 #include "rfc2231-parser.h"
 
-#include <stdlib.h>
 
 struct rfc2231_parameter {
 	const char *key, *value;

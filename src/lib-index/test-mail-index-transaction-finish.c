@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -7,7 +7,6 @@
 #include "mail-index-modseq.h"
 #include "mail-index-transaction-private.h"
 
-#include <stdlib.h>
 
 static struct mail_index_record recs[20];
 static uint64_t modseqs[N_ELEMENTS(recs)];
@@ -152,6 +151,7 @@ static void test_mail_index_transaction_finish_check_conflicts(void)
 	test_assert(conflicts[1].seq1 == 8 && conflicts[1].seq2 == 8);
 
 	test_end();
+	array_free(t->conflict_seqs);
 }
 
 static void test_mail_index_transaction_finish_modseq_updates(void)

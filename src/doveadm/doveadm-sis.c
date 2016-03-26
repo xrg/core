@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -45,7 +45,7 @@ file_contents_equal(const char *path1, const char *path2, ino_t *path2_inode_r)
 		return -1;
 	}
 	fd2 = open(path2, O_RDONLY);
-	if (fd1 == -1) {
+	if (fd2 == -1) {
 		if (errno != ENOENT)
 			i_error("open(%s) failed: %m", path2);
 		i_close_fd(&fd1);
@@ -118,14 +118,12 @@ hardlink_replace(const char *src, const char *dest, ino_t src_inode)
 		return -1;
 	}
 	if (st.st_ino != src_inode) {
-		if (unlink(tmppath) < 0)
-			i_error("unlink(%s) failed: %m", tmppath);
+		i_unlink(tmppath);
 		return 0;
 	}
 	if (rename(tmppath, dest) < 0) {
 		i_error("rename(%s, %s) failed: %m", src, tmppath);
-		if (unlink(tmppath) < 0)
-			i_error("unlink(%s) failed: %m", tmppath);
+		i_unlink(tmppath);
 		return -1;
 	}
 	return 1;
@@ -258,10 +256,8 @@ static void cmd_sis_deduplicate(int argc, char *argv[])
 		T_BEGIN {
 			ret = sis_try_deduplicate(rootdir, d->d_name);
 		} T_END;
-		if (ret == 0) {
-			if (unlink(str_c(path)) < 0)
-				i_error("unlink(%s) failed: %m", str_c(path));
-		}
+		if (ret == 0)
+			i_unlink(str_c(path));
 	}
 	if (closedir(dir) < 0)
 		i_error("closedir(%s) failed: %m", queuedir);

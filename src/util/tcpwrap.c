@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -7,7 +7,6 @@
 #include "restrict-access.h"
 #include "master-service.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <syslog.h>
 #include <tcpd.h>

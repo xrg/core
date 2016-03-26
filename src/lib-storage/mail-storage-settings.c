@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -35,6 +35,8 @@ static const struct setting_define mail_storage_setting_defines[] = {
 	DEF(SET_STR, mail_cache_fields),
 	DEF(SET_STR, mail_always_cache_fields),
 	DEF(SET_STR, mail_never_cache_fields),
+	DEF(SET_STR, mail_server_comment),
+	DEF(SET_STR, mail_server_admin),
 	DEF(SET_UINT, mail_cache_min_mail_count),
 	DEF(SET_TIME, mailbox_idle_check_interval),
 	DEF(SET_UINT, mail_max_keyword_length),
@@ -47,6 +49,7 @@ static const struct setting_define mail_storage_setting_defines[] = {
 	DEF(SET_BOOL, mail_nfs_storage),
 	DEF(SET_BOOL, mail_nfs_index),
 	DEF(SET_BOOL, mailbox_list_index),
+	DEF(SET_BOOL, mailbox_list_index_very_dirty_syncs),
 	DEF(SET_BOOL, mail_debug),
 	DEF(SET_BOOL, mail_full_filesystem_access),
 	DEF(SET_BOOL, maildir_stat_dirs),
@@ -72,6 +75,8 @@ const struct mail_storage_settings mail_storage_default_settings = {
 	.mail_cache_fields = "flags",
 	.mail_always_cache_fields = "",
 	.mail_never_cache_fields = "imap.envelope",
+	.mail_server_comment = "",
+	.mail_server_admin = "",
 	.mail_cache_min_mail_count = 0,
 	.mailbox_idle_check_interval = 30,
 	.mail_max_keyword_length = 50,
@@ -84,6 +89,7 @@ const struct mail_storage_settings mail_storage_default_settings = {
 	.mail_nfs_storage = FALSE,
 	.mail_nfs_index = FALSE,
 	.mailbox_list_index = FALSE,
+	.mailbox_list_index_very_dirty_syncs = FALSE,
 	.mail_debug = FALSE,
 	.mail_full_filesystem_access = FALSE,
 	.maildir_stat_dirs = FALSE,
@@ -119,6 +125,8 @@ static const struct setting_define mailbox_setting_defines[] = {
 	{ SET_ENUM, "auto", offsetof(struct mailbox_settings, autocreate), NULL } ,
 	DEF(SET_STR, special_use),
 	DEF(SET_STR, driver),
+	DEF(SET_STR, comment),
+	DEF(SET_TIME, autoexpunge),
 
 	SETTING_DEFINE_LIST_END
 };
@@ -129,7 +137,9 @@ const struct mailbox_settings mailbox_default_settings = {
 		MAILBOX_SET_AUTO_CREATE":"
 		MAILBOX_SET_AUTO_SUBSCRIBE,
 	.special_use = "",
-	.driver = ""
+	.driver = "",
+	.comment = "",
+	.autoexpunge = 0
 };
 
 const struct setting_parser_info mailbox_setting_parser_info = {
@@ -169,6 +179,7 @@ static const struct setting_define mail_namespace_setting_defines[] = {
 	DEF(SET_BOOL, subscriptions),
 	DEF(SET_BOOL, ignore_on_failure),
 	DEF(SET_BOOL, disabled),
+	DEF(SET_UINT, order),
 
 	DEFLIST_UNIQUE(mailboxes, "mailbox", &mailbox_setting_parser_info),
 
@@ -189,6 +200,7 @@ const struct mail_namespace_settings mail_namespace_default_settings = {
 	.subscriptions = TRUE,
 	.ignore_on_failure = FALSE,
 	.disabled = FALSE,
+	.order = 0,
 
 	.mailboxes = ARRAY_INIT
 };
@@ -320,7 +332,7 @@ mail_storage_get_dynamic_parsers(pool_t pool)
 	unsigned int i, j, count;
 
 	storages = array_get(&mail_storage_classes, &count);
-	parsers = p_new(pool, struct dynamic_settings_parser, count + 1);
+	parsers = p_new(pool, struct dynamic_settings_parser, 1 + count + 1);
 	parsers[0].name = MAIL_STORAGE_SET_DRIVER_NAME;
 	parsers[0].info = &mail_storage_setting_parser_info;
 
@@ -332,6 +344,7 @@ mail_storage_get_dynamic_parsers(pool_t pool)
 		parsers[j].info = storages[i]->v.get_setting_parser_info();
 		j++;
 	}
+	parsers[j].name = NULL;
 	return parsers;
 }
 
@@ -439,6 +452,9 @@ static bool mail_storage_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 		return FALSE;
 	}
 #endif
+
+	// FIXME: check set->mail_server_admin syntax (RFC 5464, Section 6.2.2)
+
 	return TRUE;
 }
 

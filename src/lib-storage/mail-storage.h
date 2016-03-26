@@ -10,6 +10,7 @@ struct message_size;
 #include "mail-error.h"
 #include "mail-namespace.h"
 #include "mailbox-list.h"
+#include "mailbox-attribute.h"
 
 /* If some operation is taking long, call notify_ok every n seconds. */
 #define MAIL_STORAGE_STAYALIVE_SECS 15
@@ -89,10 +90,13 @@ enum mailbox_metadata_items {
 	MAILBOX_METADATA_VIRTUAL_SIZE		= 0x02,
 	MAILBOX_METADATA_CACHE_FIELDS		= 0x04,
 	MAILBOX_METADATA_PRECACHE_FIELDS	= 0x08,
-	MAILBOX_METADATA_BACKEND_NAMESPACE	= 0x10
+	MAILBOX_METADATA_BACKEND_NAMESPACE	= 0x10,
+	MAILBOX_METADATA_PHYSICAL_SIZE		= 0x20,
+	MAILBOX_METADATA_FIRST_SAVE_DATE	= 0x40
 	/* metadata items that require mailbox to be synced at least once. */
 #define MAILBOX_METADATA_SYNC_ITEMS \
-	(MAILBOX_METADATA_VIRTUAL_SIZE)
+	(MAILBOX_METADATA_VIRTUAL_SIZE | MAILBOX_METADATA_PHYSICAL_SIZE | \
+	 MAILBOX_METADATA_FIRST_SAVE_DATE)
 };
 
 enum mailbox_search_result_flags {
@@ -148,13 +152,15 @@ enum mail_fetch_field {
 	MAIL_FETCH_IMAP_ENVELOPE	= 0x00004000,
 	MAIL_FETCH_FROM_ENVELOPE	= 0x00008000,
 	MAIL_FETCH_HEADER_MD5		= 0x00010000,
-	MAIL_FETCH_UIDL_FILE_NAME	= 0x00020000,
+	MAIL_FETCH_STORAGE_ID		= 0x00020000,
+#define MAIL_FETCH_UIDL_FILE_NAME MAIL_FETCH_STORAGE_ID /* FIXME: remove in v2.3 */
 	MAIL_FETCH_UIDL_BACKEND		= 0x00040000,
 	MAIL_FETCH_MAILBOX_NAME		= 0x00080000,
 	MAIL_FETCH_SEARCH_RELEVANCY	= 0x00100000,
 	MAIL_FETCH_GUID			= 0x00200000,
 	MAIL_FETCH_POP3_ORDER		= 0x00400000,
-	MAIL_FETCH_REFCOUNT		= 0x00800000
+	MAIL_FETCH_REFCOUNT		= 0x00800000,
+	MAIL_FETCH_BODY_SNIPPET		= 0x01000000
 };
 
 enum mailbox_transaction_flags {
@@ -173,7 +179,11 @@ enum mailbox_transaction_flags {
 	MAILBOX_TRANSACTION_FLAG_NO_CACHE_DEC	= 0x10,
 	/* Sync transaction describes changes to mailbox that already happened
 	   to another mailbox with whom we're syncing with (dsync) */
-	MAILBOX_TRANSACTION_FLAG_SYNC		= 0x20
+	MAILBOX_TRANSACTION_FLAG_SYNC		= 0x20,
+	/* Don't trigger any notifications for this transaction. This
+	   especially means the notify plugin. This would normally be used only
+	   with _FLAG_SYNC. */
+	MAILBOX_TRANSACTION_FLAG_NO_NOTIFY	= 0x40
 };
 
 enum mailbox_sync_flags {
@@ -202,42 +212,6 @@ enum mailbox_sync_type {
 	MAILBOX_SYNC_TYPE_EXPUNGE	= 0x01,
 	MAILBOX_SYNC_TYPE_FLAGS		= 0x02,
 	MAILBOX_SYNC_TYPE_MODSEQ	= 0x04
-};
-
-/* RFC 5464 specifies that this is vendor/<vendor-token>/. The registered
-   vendor-tokens always begin with "vendor." so there's some redundancy.. */
-#define MAILBOX_ATTRIBUTE_PREFIX_DOVECOT "vendor/vendor.dovecot/"
-/* Prefix used for attributes reserved for Dovecot's internal use. Normal
-   users cannot access these in any way. */
-#define MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT \
-	MAILBOX_ATTRIBUTE_PREFIX_DOVECOT"pvt/"
-/* Prefix used for server attributes in INBOX. INBOX deletion won't delete
-   any attributes under this prefix. */
-#define MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT_SERVER \
-	MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT"server/"
-
-enum mail_attribute_type {
-	MAIL_ATTRIBUTE_TYPE_PRIVATE,
-	MAIL_ATTRIBUTE_TYPE_SHARED
-};
-enum mail_attribute_value_flags {
-	MAIL_ATTRIBUTE_VALUE_FLAG_READONLY	= 0x01,
-	MAIL_ATTRIBUTE_VALUE_FLAG_INT_STREAMS	= 0x02
-};
-
-struct mail_attribute_value {
-	/* mailbox_attribute_set() can set either value or value_stream.
-	   mailbox_attribute_get() returns only values, but
-	   mailbox_attribute_get_stream() may return either value or
-	   value_stream. The caller must unreference the returned streams. */
-	const char *value;
-	struct istream *value_stream;
-
-	/* Last time the attribute was changed (0 = unknown). This may be
-	   returned even for values that don't exist anymore. */
-	time_t last_change;
-
-	enum mail_attribute_value_flags flags;
 };
 
 struct message_part;
@@ -277,11 +251,16 @@ struct mailbox_status {
 	unsigned int allow_new_keywords:1;
 	/* Modseqs aren't permanent (index is in memory) (STATUS_HIGHESTMODSEQ) */
 	unsigned int nonpermanent_modseqs:1;
+	/* Modseq tracking has never been enabled for this mailbox
+	   yet. (STATUS_HIGHESTMODSEQ) */
+	unsigned int no_modseq_tracking:1;
 
 	/* Messages have GUIDs (always set) */
 	unsigned int have_guids:1;
 	/* mailbox_save_set_guid() works (always set) */
 	unsigned int have_save_guids:1;
+	/* GUIDs are always 128bit (always set) */
+	unsigned int have_only_guid128:1;
 };
 
 struct mailbox_cache_field {
@@ -296,10 +275,17 @@ struct mailbox_metadata {
 	guid_128_t guid;
 	/* sum of virtual size of all messages in mailbox */
 	uint64_t virtual_size;
+	/* sum of physical size of all messages in mailbox */
+	uint64_t physical_size;
+	/* timestamp of when the first message was saved.
+	   (time_t)-1 if there are no mails in the mailbox. */
+	time_t first_save_date;
+
 	/* Fields that have "temp" or "yes" caching decision. */
 	const ARRAY_TYPE(mailbox_cache_field) *cache_fields;
 	/* Fields that should be precached */
 	enum mail_fetch_field precache_fields;
+
 	/* imapc backend returns this based on the remote NAMESPACE reply,
 	   while currently other backends return "" and type the same as the
 	   mailbox's real namespace type */
@@ -455,6 +441,12 @@ mailbox_get_last_error(struct mailbox *box, enum mail_error *error_r)
 /* Wrapper for mail_storage_get_last_error(); */
 enum mail_error mailbox_get_last_mail_error(struct mailbox *box);
 
+/* Save the last error until it's popped. This is useful for cases where the
+   storage has already failed, but the cleanup code path changes the error to
+   something else unwanted. */
+void mail_storage_last_error_push(struct mail_storage *storage);
+void mail_storage_last_error_pop(struct mail_storage *storage);
+
 /* Returns TRUE if mailboxes are files. */
 bool mail_storage_is_mailbox_file(struct mail_storage *storage) ATTR_PURE;
 
@@ -489,6 +481,11 @@ bool mailbox_equals(const struct mailbox *box1,
 /* Returns TRUE if the mailbox is user's INBOX or another user's shared INBOX */
 bool mailbox_is_any_inbox(struct mailbox *box);
 
+/* Change mailbox_verify_create_name() to not verify new mailbox name
+   restrictions (but still check that it's a valid existing name). This is
+   mainly used by dsync to make sure the sync works even though the original
+   name isn't valid anymore. */
+void mailbox_skip_create_name_restrictions(struct mailbox *box, bool set);
 /* Returns -1 if mailbox_create() is guaranteed to fail because the mailbox
    name is invalid, 0 not. The error message contains a reason. */
 int mailbox_verify_create_name(struct mailbox *box);
@@ -535,7 +532,7 @@ const struct mail_storage_settings *
 mailbox_get_settings(struct mailbox *box) ATTR_PURE;
 /* Returns the mailbox's settings, or NULL if there are none. */
 const struct mailbox_settings *
-mailbox_settings_find(struct mail_user *user, const char *vname);
+mailbox_settings_find(struct mail_namespace *ns, const char *vname);
 
 /* Returns the (virtual) name of the given mailbox. */
 const char *mailbox_get_vname(const struct mailbox *box) ATTR_PURE;
@@ -570,36 +567,6 @@ int mailbox_get_metadata(struct mailbox *box, enum mailbox_metadata_items items,
 /* Returns a mask of flags that are private to user in this mailbox
    (as opposed to flags shared between users). */
 enum mail_flags mailbox_get_private_flags_mask(struct mailbox *box);
-
-/* Set mailbox attribute key to value. The key should be compatible with
-   IMAP METADATA, so for Dovecot-specific keys use
-   MAILBOX_ATTRIBUTE_PREFIX_DOVECOT. */
-int mailbox_attribute_set(struct mailbox_transaction_context *t,
-			  enum mail_attribute_type type, const char *key,
-			  const struct mail_attribute_value *value);
-/* Delete mailbox attribute key. This is just a wrapper to
-   mailbox_attribute_set() with value->value=NULL. */
-int mailbox_attribute_unset(struct mailbox_transaction_context *t,
-			    enum mail_attribute_type type, const char *key);
-/* Returns value for mailbox attribute key. Returns 1 if value was returned,
-   0 if value wasn't found (set to NULL), -1 if error */
-int mailbox_attribute_get(struct mailbox_transaction_context *t,
-			  enum mail_attribute_type type, const char *key,
-			  struct mail_attribute_value *value_r);
-/* Same as mailbox_attribute_get(), but the returned value may be either an
-   input stream or a string. */
-int mailbox_attribute_get_stream(struct mailbox_transaction_context *t,
-				 enum mail_attribute_type type, const char *key,
-				 struct mail_attribute_value *value_r);
-
-/* Iterate through mailbox attributes of the given type. The prefix can be used
-   to restrict what attributes are returned. */
-struct mailbox_attribute_iter *
-mailbox_attribute_iter_init(struct mailbox *box, enum mail_attribute_type type,
-			    const char *prefix);
-/* Returns the attribute key or NULL if there are no more attributes. */
-const char *mailbox_attribute_iter_next(struct mailbox_attribute_iter *iter);
-int mailbox_attribute_iter_deinit(struct mailbox_attribute_iter **iter);
 
 /* Synchronize the mailbox. */
 struct mailbox_sync_context *
@@ -714,8 +681,9 @@ void mailbox_search_result_sync(struct mail_search_result *result,
 				ARRAY_TYPE(seq_range) *removed_uids,
 				ARRAY_TYPE(seq_range) *added_uids);
 
-/* Build mail_keywords from NULL-terminated keywords list.
-   Returns 0 if successful, -1 if there are invalid keywords (error is set). */
+/* Build mail_keywords from NULL-terminated keywords list. Any duplicate
+   keywords are removed. Returns 0 if successful, -1 if there are invalid
+   keywords (error is set). */
 int mailbox_keywords_create(struct mailbox *box, const char *const keywords[],
 			    struct mail_keywords **keywords_r);
 /* Like mailbox_keywords_create(), except ignore invalid keywords. */
@@ -870,7 +838,10 @@ int mail_get_headers(struct mail *mail, const char *field,
    Do not use for structured fields (see mail_get_first_header_utf8()). */
 int mail_get_headers_utf8(struct mail *mail, const char *field,
 			  const char *const **value_r);
-/* Returns stream containing specified headers. */
+/* Returns stream containing specified headers. The returned stream will be
+   automatically freed when the mail is closed, or when another
+   mail_get_header_stream() call is made (so you can't have multiple header
+   streams open at the same time). */
 int mail_get_header_stream(struct mail *mail,
 			   struct mailbox_header_lookup_ctx *headers,
 			   struct istream **stream_r);
@@ -901,6 +872,9 @@ int mail_get_special(struct mail *mail, enum mail_fetch_field field,
 		     const char **value_r);
 /* Returns the mail for the physical message. Normally this is the mail itself,
    but in virtual mailboxes it points to the backend mailbox. */
+int mail_get_backend_mail(struct mail *mail, struct mail **real_mail_r);
+/* FIXME: For backwards compatibility for now, use mail_get_backend_mail()
+   instead. */
 struct mail *mail_get_real_mail(struct mail *mail);
 
 /* Update message flags. */
@@ -923,10 +897,18 @@ void mail_expunge(struct mail *mail);
 void mail_precache(struct mail *mail);
 /* Mark a cached field corrupted and have it recalculated. */
 void mail_set_cache_corrupted(struct mail *mail, enum mail_fetch_field field);
+void mail_set_cache_corrupted_reason(struct mail *mail,
+				     enum mail_fetch_field field,
+				     const char *reason);
 
 /* Return 128 bit GUID using input string. If guid is already 128 bit hex
    encoded, it's returned as-is. Otherwise SHA1 sum is taken and its last
    128 bits are returned. */
 void mail_generate_guid_128_hash(const char *guid, guid_128_t guid_128_r);
+
+/* Parse a human-writable string into a timestamp. Returns 0 and timestamp on
+   success, -1 if the string couldn't be parsed. Currently supported string
+   formats: yyyy-mm-dd, imap date, unix timestamp, interval (e.g. n days). */
+int mail_parse_human_timestamp(const char *str, time_t *timestamp_r);
 
 #endif

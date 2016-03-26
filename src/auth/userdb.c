@@ -1,13 +1,10 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "array.h"
 #include "ipwd.h"
 #include "auth-worker-server.h"
-#include "userdb-template.h"
 #include "userdb.h"
-
-#include <stdlib.h>
 
 static ARRAY(struct userdb_module_interface *) userdb_interfaces;
 static ARRAY(struct userdb_module *) userdb_modules;
@@ -76,7 +73,7 @@ uid_t userdb_parse_uid(struct auth_request *request, const char *str)
 		return (uid_t)-1;
 	case 0:
 		if (request != NULL) {
-			auth_request_log_error(request, "userdb",
+			auth_request_log_error(request, AUTH_SUBSYS_DB,
 					       "Invalid UID value '%s'", str);
 		}
 		return (uid_t)-1;
@@ -102,7 +99,7 @@ gid_t userdb_parse_gid(struct auth_request *request, const char *str)
 		return (gid_t)-1;
 	case 0:
 		if (request != NULL) {
-			auth_request_log_error(request, "userdb",
+			auth_request_log_error(request, AUTH_SUBSYS_DB,
 					       "Invalid GID value '%s'", str);
 		}
 		return (gid_t)-1;
@@ -165,13 +162,6 @@ userdb_preinit(pool_t pool, const struct auth_userdb_settings *set)
 	userdb->id = ++auth_userdb_id;
 	userdb->iface = iface;
 	userdb->args = p_strdup(pool, set->args);
-
-	userdb->default_fields_tmpl =
-		userdb_template_build(pool, set->driver,
-				      set->default_fields);
-	userdb->override_fields_tmpl =
-		userdb_template_build(pool, set->driver,
-				      set->override_fields);
 
 	array_append(&userdb_modules, &userdb, 1);
 	return userdb;

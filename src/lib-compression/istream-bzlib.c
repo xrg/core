@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 
@@ -266,8 +266,10 @@ i_stream_bzlib_stat(struct istream_private *stream, bool exact)
 	const struct stat *st;
 	size_t size;
 
-	if (i_stream_stat(stream->parent, exact, &st) < 0)
+	if (i_stream_stat(stream->parent, exact, &st) < 0) {
+		stream->istream.stream_errno = stream->parent->stream_errno;
 		return -1;
+	}
 	stream->statbuf = *st;
 
 	/* when exact=FALSE always return the parent stat's size, even if we

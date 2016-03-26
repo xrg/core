@@ -1,12 +1,11 @@
 /*
  * SCRAM-SHA-1 SASL authentication, see RFC-5802
  *
- * Copyright (c) 2011-2012 Florian Zeitz <florob@babelmonkeys.de>
+ * Copyright (c) 2011-2016 Florian Zeitz <florob@babelmonkeys.de>
  *
  * This software is released under the MIT license.
  */
 
-#include <stdlib.h>
 #include <limits.h>
 
 #include "auth-common.h"
@@ -264,7 +263,7 @@ static void credentials_callback(enum passdb_result result,
 		if (scram_sha1_scheme_parse(credentials, size, &iter_count,
 					    &salt, request->stored_key,
 					    request->server_key, &error) < 0) {
-			auth_request_log_info(auth_request, "scram-sha-1",
+			auth_request_log_info(auth_request, AUTH_SUBSYS_MECH,
 					      "%s", error);
 			auth_request_fail(auth_request);
 			break;
@@ -367,8 +366,7 @@ static void mech_scram_sha1_auth_continue(struct auth_request *auth_request,
 		if (parse_scram_client_final(request, data, data_size,
 					     &error)) {
 			if (!verify_credentials(request)) {
-				auth_request_log_info(auth_request,
-						      "scram-sha-1",
+				auth_request_log_info(auth_request, AUTH_SUBSYS_MECH,
 						      "password mismatch");
 			} else {
 				server_final_message =
@@ -382,7 +380,7 @@ static void mech_scram_sha1_auth_continue(struct auth_request *auth_request,
 	}
 
 	if (error != NULL)
-		auth_request_log_info(auth_request, "scram-sha-1", "%s", error);
+		auth_request_log_info(auth_request, AUTH_SUBSYS_MECH, "%s", error);
 	auth_request_fail(auth_request);
 }
 
@@ -391,7 +389,7 @@ static struct auth_request *mech_scram_sha1_auth_new(void)
 	struct scram_auth_request *request;
 	pool_t pool;
 
-	pool = pool_alloconly_create("scram_sha1_auth_request", 2048);
+	pool = pool_alloconly_create(MEMPOOL_GROWING"scram_sha1_auth_request", 2048);
 	request = p_new(pool, struct scram_auth_request, 1);
 	request->pool = pool;
 

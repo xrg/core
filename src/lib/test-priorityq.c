@@ -1,9 +1,8 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "test-lib.h"
 #include "priorityq.h"
 
-#include <stdlib.h>
 
 struct pq_test_item {
 	struct priorityq_item item;

@@ -9,6 +9,7 @@
 #  define MAILBOX_LIST_NAME_MAX_LENGTH 4096
 #endif
 
+struct fs;
 struct mail_namespace;
 struct mail_storage;
 struct mailbox_list;
@@ -58,6 +59,7 @@ enum mailbox_info_flags {
 	MAILBOX_SPECIALUSE_SENT		= 0x00200000,
 	MAILBOX_SPECIALUSE_TRASH	= 0x00400000,
 	MAILBOX_SPECIALUSE_IMPORTANT	= 0x00800000,
+#define MAILBOX_SPECIALUSE_MASK		  0x00ff0000
 
 	/* Internally used by lib-storage: */
 	MAILBOX_SELECT			= 0x20000000,
@@ -125,6 +127,10 @@ struct mailbox_list_settings {
 	bool utf8;
 	/* Don't check/create the alt-dir symlink. */
 	bool alt_dir_nocheck;
+	/* Use maildir_name also for index/control directories. This should
+	   have been the default since the beginning, but for backwards
+	   compatibility it had to be made an option. */
+	bool index_control_use_maildir_name;
 };
 
 struct mailbox_permissions {
@@ -252,5 +258,13 @@ int mailbox_list_delete_symlink(struct mailbox_list *list, const char *name);
 const char * ATTR_NOWARN_UNUSED_RESULT
 mailbox_list_get_last_error(struct mailbox_list *list,
 			    enum mail_error *error_r);
+
+/* Create a fs based on the settings in the given mailbox_list. */
+int mailbox_list_init_fs(struct mailbox_list *list, const char *driver,
+			 const char *args, const char *root_dir,
+			 struct fs **fs_r, const char **error_r);
+/* Return mailbox_list that was used to create the fs via
+   mailbox_list_init_fs(). */
+struct mailbox_list *mailbox_list_fs_get_list(struct fs *fs);
 
 #endif

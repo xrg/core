@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -17,7 +17,6 @@
 #include "dbox-file.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -112,6 +111,7 @@ static int dbox_file_parse_header(struct dbox_file *file, const char *line)
 	file->msg_header_size = 0;
 
 	for (tmp = t_strsplit(line, " "); *tmp != NULL; tmp++) {
+		uintmax_t time;
 		key = **tmp;
 		value = *tmp + 1;
 
@@ -119,10 +119,17 @@ static int dbox_file_parse_header(struct dbox_file *file, const char *line)
 		case DBOX_HEADER_OLDV1_APPEND_OFFSET:
 			break;
 		case DBOX_HEADER_MSG_HEADER_SIZE:
-			file->msg_header_size = strtoul(value, NULL, 16);
+			if (str_to_uint_hex(value, &file->msg_header_size) < 0) {
+				dbox_file_set_corrupted(file, "Invalid message header size");
+				return -1;
+			}
 			break;
 		case DBOX_HEADER_CREATE_STAMP:
-			file->create_time = strtoul(value, NULL, 16);
+			if (str_to_uintmax_hex(value, &time) < 0) {
+				dbox_file_set_corrupted(file, "Invalid create time stamp");
+				return -1;
+			}
+			file->create_time = (time_t)time;
 			break;
 		}
 		pos += strlen(value) + 2;
@@ -197,7 +204,7 @@ static int dbox_file_open_fd(struct dbox_file *file, bool try_altpath)
 static int dbox_file_open_full(struct dbox_file *file, bool try_altpath,
 			       bool *notfound_r)
 {
-	int ret;
+	int ret, fd;
 
 	*notfound_r = FALSE;
 	if (file->input != NULL)
@@ -215,7 +222,10 @@ static int dbox_file_open_full(struct dbox_file *file, bool try_altpath,
 		}
 	}
 
-	file->input = i_stream_create_fd(file->fd, DBOX_READ_BLOCK_SIZE, TRUE);
+	/* we're manually checking at dbox_file_close() if we need to close the
+	   fd or not. */
+	fd = file->fd;
+	file->input = i_stream_create_fd_autoclose(&fd, DBOX_READ_BLOCK_SIZE);
 	i_stream_set_name(file->input, file->cur_path);
 	i_stream_set_init_buffer_size(file->input, DBOX_READ_BLOCK_SIZE);
 	return dbox_file_read_header(file);
@@ -552,7 +562,10 @@ int dbox_file_append_flush(struct dbox_file_append_context *ctx)
 			dbox_file_set_syscall_error(ctx->file, "ftruncate()");
 			return -1;
 		}
-		o_stream_seek(ctx->output, ctx->last_checkpoint_offset);
+		if (o_stream_seek(ctx->output, ctx->last_checkpoint_offset) < 0) {
+			dbox_file_set_syscall_error(ctx->file, "lseek()");
+			return -1;
+		}
 	}
 
 	if (storage->set->parsed_fsync_mode != FSYNC_MODE_NEVER) {
@@ -729,17 +742,20 @@ const char *dbox_file_metadata_get(struct dbox_file *file,
 uoff_t dbox_file_get_plaintext_size(struct dbox_file *file)
 {
 	const char *value;
+	uintmax_t size;
 
 	i_assert(file->metadata_read_offset == file->cur_offset);
 
 	/* see if we have it in metadata */
 	value = dbox_file_metadata_get(file, DBOX_METADATA_PHYSICAL_SIZE);
-	if (value != NULL)
-		return strtoul(value, NULL, 16);
-	else {
+	if (value == NULL ||
+	    str_to_uintmax_hex(value, &size) < 0 ||
+	    size > (uoff_t)-1) {
 		/* no. that means we can use the size in the header */
 		return file->cur_physical_size;
 	}
+
+	return (uoff_t)size;
 }
 
 void dbox_msg_header_fill(struct dbox_message_header *dbox_msg_hdr,

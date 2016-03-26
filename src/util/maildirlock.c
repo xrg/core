@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2008-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "lib-signals.h"
@@ -8,7 +8,6 @@
 #include "index/maildir/maildir-uidlist.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
 
@@ -67,7 +66,7 @@ int main(int argc, const char *argv[])
 	lib_signals_set_handler(SIGTERM, LIBSIG_FLAG_DELAYED, sig_die, NULL);
 
 	if (pid != 0) {
-		close(fd[1]);
+		i_close_fd(&fd[1]);
 		ret = read(fd[0], &c, 1);
 		if (ret < 0) {
 			i_error("read(pipe) failed: %m");
@@ -84,9 +83,11 @@ int main(int argc, const char *argv[])
 
 	/* child process - stdout has to be closed so that caller knows when
 	   to stop reading it. */
-	dup2(STDERR_FILENO, STDOUT_FILENO);
+	if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0)
+		i_fatal("dup2() failed: %m");
 
-	timeout = strtoul(argv[2], NULL, 10);
+	if (str_to_uint(argv[2], &timeout) < 0)
+		i_fatal("Invalid timeout value: %s", argv[2]);
 	if (maildir_lock(argv[1], timeout, &dotlock) <= 0)
 		return 1;
 

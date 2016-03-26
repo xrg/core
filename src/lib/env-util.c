@@ -1,10 +1,9 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "env-util.h"
 
-#include <stdlib.h>
 #ifdef __APPLE__
 #  include <crt_externs.h>
 #endif

@@ -27,8 +27,9 @@ enum connection_disconnect_reason {
 
 struct connection_vfuncs {
 	void (*destroy)(struct connection *conn);
-	/* For UNIX socket clients this gets called immediately with
-	   success=TRUE, for IP connections it gets called later:
+	/* For UNIX socket clients this gets called immediately (unless
+	   delayed_unix_client_connected_callback=TRUE) with success=TRUE,
+	   for IP connections it gets called later:
 
 	   If connect() fails, sets success=FALSE and errno. Streams aren't
 	   initialized in that situation either. destroy() is called after
@@ -57,6 +58,14 @@ struct connection_settings {
 
 	bool client;
 	bool dont_send_version;
+	/* Don't call client_connected() immediately on
+	   connection_client_connect() with UNIX sockets. This is mainly
+	   to make the functionality identical with inet sockets, which may
+	   simplify the calling code. */
+	bool delayed_unix_client_connected_callback;
+	/* If connect() to UNIX socket fails with EAGAIN, retry for this many
+	   milliseconds before giving up (0 = try once) */
+	unsigned int unix_client_connect_msecs;
 };
 
 struct connection {
@@ -74,7 +83,7 @@ struct connection {
 
 	/* for IP client: */
 	struct ip_addr ip;
-	unsigned int port;
+	in_port_t port;
 
 	/* received minor version */
 	unsigned int minor_version;
@@ -97,9 +106,12 @@ void connection_init_server(struct connection_list *list,
 			    int fd_in, int fd_out);
 void connection_init_client_ip(struct connection_list *list,
 			       struct connection *conn,
-			       const struct ip_addr *ip, unsigned int port);
+			       const struct ip_addr *ip, in_port_t port);
 void connection_init_client_unix(struct connection_list *list,
 				 struct connection *conn, const char *path);
+void connection_init_from_streams(struct connection_list *list,
+			    struct connection *conn, const char *name,
+			    struct istream *input, struct ostream *output);
 
 int connection_client_connect(struct connection *conn);
 

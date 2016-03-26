@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2009-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "passdb.h"
@@ -13,7 +13,7 @@ mech_external_auth_continue(struct auth_request *request,
 
 	authzid = t_strndup(data, data_size);
 	if (request->user == NULL) {
-		auth_request_log_info(request, "external",
+		auth_request_log_info(request, AUTH_SUBSYS_MECH,
 				      "username not known");
 		auth_request_fail(request);
 		return;
@@ -22,7 +22,7 @@ mech_external_auth_continue(struct auth_request *request,
 	/* this call is done simply to put the username through translation
 	   settings */
 	if (!auth_request_set_username(request, "", &error)) {
-		auth_request_log_info(request, "external",
+		auth_request_log_info(request, AUTH_SUBSYS_MECH,
 				      "Invalid username");
 		auth_request_fail(request);
 		return;
@@ -31,7 +31,7 @@ mech_external_auth_continue(struct auth_request *request,
 	if (*authzid != '\0' &&
 	    !auth_request_set_login_username(request, authzid, &error)) {
 		/* invalid login username */
-		auth_request_log_info(request, "plain",
+		auth_request_log_info(request, AUTH_SUBSYS_MECH,
 				      "login user: %s", error);
 		auth_request_fail(request);
 	} else {
@@ -45,7 +45,7 @@ static struct auth_request *mech_external_auth_new(void)
         struct auth_request *request;
 	pool_t pool;
 
-	pool = pool_alloconly_create("external_auth_request", 2048);
+	pool = pool_alloconly_create(MEMPOOL_GROWING"external_auth_request", 2048);
 	request = p_new(pool, struct auth_request, 1);
 	request->pool = pool;
 	return request;

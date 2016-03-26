@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "lib-signals.h"
@@ -273,19 +273,24 @@ static bool auth_cache_node_is_user(struct auth_cache_node *node,
 	const char *data = node->data;
 	unsigned int username_len;
 
-	/* The cache nodes begin with "P"/"U", passdb/userdb ID, "/" and
-	   then usually followed by the username. It's too much trouble to
-	   keep track of all the cache keys, so we'll just match it as if it
-	   was the username. If e.g. '%n' is used in the cache key instead of
-	   '%u', it means that cache entries can be removed only when @domain
-	   isn't in the username parameter. */
+	/* The cache nodes begin with "P"/"U", passdb/userdb ID, optional
+	   "+" master user, "\t" and then usually followed by the username.
+	   It's too much trouble to keep track of all the cache keys, so we'll
+	   just match it as if it was the username. If e.g. '%n' is used in the
+	   cache key instead of '%u', it means that cache entries can be
+	   removed only when @domain isn't in the username parameter. */
 	if (*data != 'P' && *data != 'U')
 		return FALSE;
 	data++;
 
 	while (*data >= '0' && *data <= '9')
 		data++;
-	if (*data != '/')
+	if (*data == '+') {
+		/* skip over +master_user */
+		while (*data != '\t' && *data != '\0')
+			data++;
+	}
+	if (*data != '\t')
 		return FALSE;
 	data++;
 
@@ -339,7 +344,9 @@ auth_request_expand_cache_key(const struct auth_request *request,
 
 	/* Uniquely identify the request's passdb/userdb with the P/U prefix
 	   and by "%!", which expands to the passdb/userdb ID number. */
-	key = t_strconcat(request->userdb_lookup ? "U" : "P", "%!/", key, NULL);
+	key = t_strconcat(request->userdb_lookup ? "U" : "P", "%!",
+			  request->master_user == NULL ? "" : "+%{master_user}",
+			  "\t", key, NULL);
 
 	str = t_str_new(256);
 	var_expand(str, key,
@@ -366,7 +373,6 @@ auth_cache_lookup(struct auth_cache *cache, const struct auth_request *request,
 		cache->miss_count++;
 		return NULL;
 	}
-	cache->hit_count++;
 
 	value = node->data + strlen(node->data) + 1;
 	ttl_secs = *value == '\0' ? cache->neg_ttl_secs : cache->ttl_secs;
@@ -374,6 +380,7 @@ auth_cache_lookup(struct auth_cache *cache, const struct auth_request *request,
 	now = time(NULL);
 	if (node->created < now - (time_t)ttl_secs) {
 		/* TTL expired */
+		cache->miss_count++;
 		*expired_r = TRUE;
 	} else {
 		/* move to head */
@@ -381,6 +388,7 @@ auth_cache_lookup(struct auth_cache *cache, const struct auth_request *request,
 			auth_cache_node_unlink(cache, node);
 			auth_cache_node_link_head(cache, node);
 		}
+		cache->hit_count++;
 	}
 	if (node->created < now - (time_t)cache->neg_ttl_secs)
 		*neg_expired_r = TRUE;
@@ -407,7 +415,8 @@ void auth_cache_insert(struct auth_cache *cache, struct auth_request *request,
 	   a master user login */
 	current_username = request->user;
 	if (request->translated_username != NULL &&
-	    request->requested_login_user == NULL)
+	    request->requested_login_user == NULL &&
+	    request->master_user == NULL)
 		request->user = t_strdup_noconst(request->translated_username);
 
 	key = auth_request_expand_cache_key(request, key);

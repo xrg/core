@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -52,12 +52,8 @@ static void mail_transaction_log_2_unlink_old(struct mail_transaction_log *log)
 	}
 
 	if (st.st_mtime + MAIL_TRANSACTION_LOG2_STALE_SECS <= ioloop_time &&
-	    !log->index->readonly) {
-		if (unlink(log->filepath2) < 0 && errno != ENOENT) {
-			mail_index_set_error(log->index,
-				"unlink(%s) failed: %m", log->filepath2);
-		}
-	}
+	    !log->index->readonly)
+		i_unlink_if_exists(log->filepath2);
 }
 
 int mail_transaction_log_open(struct mail_transaction_log *log)
@@ -210,10 +206,9 @@ void mail_transaction_logs_clean(struct mail_transaction_log *log)
 
 		mail_transaction_log_file_free(&file);
 	}
-	/* if we still have locked files with refcount=0, unlock them */
+	/* sanity check: we shouldn't have locked refcount=0 files */
 	for (; file != NULL; file = file->next) {
-		if (file->locked && file->refcount == 0)
-			mail_transaction_log_file_unlock(file);
+		i_assert(!file->locked || file->refcount > 0);
 	}
 	i_assert(log->head == NULL || log->files != NULL);
 }
@@ -234,6 +229,7 @@ int mail_transaction_log_rotate(struct mail_transaction_log *log, bool reset)
 	struct mail_transaction_log_file *file;
 	const char *path = log->head->filepath;
 	struct stat st;
+	int ret;
 
 	i_assert(log->head->locked);
 
@@ -259,16 +255,29 @@ int mail_transaction_log_rotate(struct mail_transaction_log *log, bool reset)
 		file->last_mtime = st.st_mtime;
 		file->last_size = st.st_size;
 
-		if (mail_transaction_log_file_create(file, reset) < 0) {
+		if ((ret = mail_transaction_log_file_create(file, reset)) < 0) {
 			mail_transaction_log_file_free(&file);
 			return -1;
 		}
+		if (ret == 0) {
+			mail_index_set_error(log->index,
+				"Transaction log %s was recreated while we had it locked - "
+				"locking is broken (lock_method=%s)", path,
+				file_lock_method_to_str(log->index->lock_method));
+			mail_transaction_log_file_free(&file);
+			return -1;
+		}
+		i_assert(file->locked);
 	}
 
 	if (--log->head->refcount == 0)
 		mail_transaction_logs_clean(log);
-	else
-		mail_transaction_log_file_unlock(log->head);
+	else {
+		/* the newly created log file is already locked */
+		mail_transaction_log_file_unlock(log->head,
+			!log->index->log_sync_locked ? "rotating" :
+			"rotating while syncing");
+	}
 	mail_transaction_log_set_head(log, file);
 	return 0;
 }
@@ -412,7 +421,8 @@ int mail_transaction_log_find_file(struct mail_transaction_log *log,
 	return 1;
 }
 
-int mail_transaction_log_lock_head(struct mail_transaction_log *log)
+int mail_transaction_log_lock_head(struct mail_transaction_log *log,
+				   const char *lock_reason)
 {
 	struct mail_transaction_log_file *file;
 	time_t lock_wait_started, lock_secs = 0;
@@ -446,6 +456,8 @@ int mail_transaction_log_lock_head(struct mail_transaction_log *log)
 		file->refcount++;
 		ret = mail_transaction_log_refresh(log, TRUE);
 		if (--file->refcount == 0) {
+			mail_transaction_log_file_unlock(file, t_strdup_printf(
+				"trying to lock head for %s", lock_reason));
 			mail_transaction_logs_clean(log);
 			file = NULL;
 		}
@@ -457,17 +469,18 @@ int mail_transaction_log_lock_head(struct mail_transaction_log *log)
 			break;
 		}
 
-		if (file != NULL)
-			mail_transaction_log_file_unlock(file);
-
+		if (file != NULL) {
+			mail_transaction_log_file_unlock(file, t_strdup_printf(
+				"trying to lock head for %s", lock_reason));
+		}
 		if (ret < 0)
 			break;
 
 		/* try again */
 	}
 	if (lock_secs > MAIL_TRANSACTION_LOG_LOCK_WARN_SECS) {
-		i_warning("Locking transaction log file %s took %ld seconds",
-			  log->head->filepath, (long)lock_secs);
+		i_warning("Locking transaction log file %s took %ld seconds (%s)",
+			  log->head->filepath, (long)lock_secs, lock_reason);
 	}
 
 	i_assert(ret < 0 || log->head != NULL);
@@ -475,17 +488,19 @@ int mail_transaction_log_lock_head(struct mail_transaction_log *log)
 }
 
 int mail_transaction_log_sync_lock(struct mail_transaction_log *log,
+				   const char *lock_reason,
 				   uint32_t *file_seq_r, uoff_t *file_offset_r)
 {
 	i_assert(!log->index->log_sync_locked);
 
-	if (mail_transaction_log_lock_head(log) < 0)
+	if (mail_transaction_log_lock_head(log, lock_reason) < 0)
 		return -1;
 
 	/* update sync_offset */
 	if (mail_transaction_log_file_map(log->head, log->head->sync_offset,
 					  (uoff_t)-1) <= 0) {
-		mail_transaction_log_file_unlock(log->head);
+		mail_transaction_log_file_unlock(log->head, t_strdup_printf(
+			"%s - map failed", lock_reason));
 		return -1;
 	}
 
@@ -495,12 +510,13 @@ int mail_transaction_log_sync_lock(struct mail_transaction_log *log,
 	return 0;
 }
 
-void mail_transaction_log_sync_unlock(struct mail_transaction_log *log)
+void mail_transaction_log_sync_unlock(struct mail_transaction_log *log,
+				      const char *lock_reason)
 {
 	i_assert(log->index->log_sync_locked);
 
 	log->index->log_sync_locked = FALSE;
-	mail_transaction_log_file_unlock(log->head);
+	mail_transaction_log_file_unlock(log->head, lock_reason);
 }
 
 void mail_transaction_log_get_head(struct mail_transaction_log *log,

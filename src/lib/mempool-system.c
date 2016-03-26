@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 /* @UNSAFE: whole file */
 
@@ -6,7 +6,6 @@
 #include "safe-memset.h"
 #include "mempool.h"
 
-#include <stdlib.h>
 #ifndef HAVE_MALLOC_USABLE_SIZE
 /* no extra includes needed */
 #elif defined (HAVE_MALLOC_NP_H)
@@ -73,6 +72,9 @@ static void pool_system_unref(pool_t *pool ATTR_UNUSED)
 static void *pool_system_malloc(pool_t pool ATTR_UNUSED, size_t size)
 {
 	void *mem;
+#ifdef DEBUG
+	int old_errno = errno;
+#endif
 
 	if (unlikely(size == 0 || size > SSIZE_T_MAX))
 		i_panic("Trying to allocate %"PRIuSIZE_T" bytes", size);
@@ -86,17 +88,28 @@ static void *pool_system_malloc(pool_t pool ATTR_UNUSED, size_t size)
 		i_fatal_status(FATAL_OUTOFMEM, "pool_system_malloc(%"PRIuSIZE_T
 			       "): Out of memory", size);
 	}
+#ifdef DEBUG
+	/* we rely on errno not changing. it shouldn't. */
+	i_assert(errno == old_errno);
+#endif
 	return mem;
 }
 
 static void pool_system_free(pool_t pool ATTR_UNUSED,
 			     void *mem ATTR_UNUSED)
 {
+#ifdef DEBUG
+	int old_errno = errno;
+#endif
 #if !defined(USE_GC) && defined(HAVE_MALLOC_USABLE_SIZE) && defined(DEBUG)
 	safe_memset(mem, CLEAR_CHR, malloc_usable_size(mem));
 #endif
 #ifndef USE_GC
 	free(mem);
+#endif
+#ifdef DEBUG
+	/* we rely on errno not changing. it shouldn't. */
+	i_assert(errno == old_errno);
 #endif
 }
 
@@ -122,11 +135,11 @@ static void *pool_system_realloc(pool_t pool ATTR_UNUSED, void *mem,
 	}
 
 	if (old_size < new_size) {
-                /* clear new data */
+		/* clear new data */
 		memset((char *) mem + old_size, 0, new_size - old_size);
 	}
 
-        return mem;
+	return mem;
 }
 
 static void ATTR_NORETURN

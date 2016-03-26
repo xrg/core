@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "ioloop.h"
@@ -17,7 +17,6 @@
 #include "auth-master-connection.h"
 #include "auth-request-handler.h"
 
-#include <stdlib.h>
 
 #define AUTH_FAILURE_DELAY_CHECK_MSECS 500
 
@@ -166,17 +165,21 @@ auth_str_add_keyvalue(string_t *dest, const char *key, const char *value)
 static void
 auth_str_append_extra_fields(struct auth_request *request, string_t *dest)
 {
-	if (auth_fields_is_empty(request->extra_fields))
-		return;
+	if (!auth_fields_is_empty(request->extra_fields)) {
+		str_append_c(dest, '\t');
+		auth_fields_append(request->extra_fields, dest,
+				   AUTH_FIELD_FLAG_HIDDEN, 0);
+	}
 
-	str_append_c(dest, '\t');
-	auth_fields_append(request->extra_fields, dest,
-			   AUTH_FIELD_FLAG_HIDDEN, 0);
-
-	if (strcmp(request->original_username, request->user) != 0) {
+	if (request->original_username != NULL &&
+	    null_strcmp(request->original_username, request->user) != 0 &&
+	    !auth_fields_exists(request->extra_fields, "original_user")) {
 		auth_str_add_keyvalue(dest, "original_user",
 				      request->original_username);
 	}
+	if (request->master_user != NULL &&
+	    !auth_fields_exists(request->extra_fields, "auth_user"))
+		auth_str_add_keyvalue(dest, "auth_user", request->master_user);
 
 	if (!request->auth_only &&
 	    auth_fields_exists(request->extra_fields, "proxy")) {
@@ -271,6 +274,8 @@ static void
 auth_request_handler_reply_failure_finish(struct auth_request *request)
 {
 	string_t *str = t_str_new(128);
+
+	auth_fields_remove(request->extra_fields, "nologin");
 
 	str_printfa(str, "FAIL\t%u", request->id);
 	if (request->user != NULL)
@@ -389,7 +394,7 @@ static void auth_request_handler_auth_fail(struct auth_request_handler *handler,
 {
 	string_t *str = t_str_new(128);
 
-	auth_request_log_info(request, request->mech->mech_name, "%s", reason);
+	auth_request_log_info(request, AUTH_SUBSYS_MECH, "%s", reason);
 
 	str_printfa(str, "FAIL\t%u\treason=", request->id);
 	str_append_tabescaped(str, reason);
@@ -404,12 +409,12 @@ static void auth_request_timeout(struct auth_request *request)
 
 	if (request->state != AUTH_REQUEST_STATE_MECH_CONTINUE) {
 		/* client's fault */
-		auth_request_log_error(request, request->mech->mech_name,
+		auth_request_log_error(request, AUTH_SUBSYS_MECH,
 			"Request %u.%u timed out after %u secs, state=%d",
 			request->handler->client_pid, request->id,
 			secs, request->state);
 	} else if (request->set->verbose) {
-		auth_request_log_info(request, request->mech->mech_name,
+		auth_request_log_info(request, AUTH_SUBSYS_MECH,
 			"Request timed out waiting for client to continue authentication "
 			"(%u secs)", secs);
 	}
@@ -469,8 +474,9 @@ bool auth_request_handler_auth_begin(struct auth_request_handler *handler,
 				handler->client_pid, str_sanitize(list[1], MAX_MECH_NAME_LEN));
 			return FALSE;
 		}
-	} else {		 
-		mech = mech_module_find(list[1]);
+	} else {
+		struct auth *auth_default = auth_default_service();
+		mech = mech_register_find(auth_default->reg, list[1]);
 		if (mech == NULL) {
 			/* unsupported mechanism */
 			i_error("BUG: Authentication client %u requested unsupported "
@@ -621,6 +627,44 @@ bool auth_request_handler_auth_continue(struct auth_request_handler *handler,
 	return TRUE;
 }
 
+static void auth_str_append_userdb_extra_fields(struct auth_request *request,
+						string_t *dest)
+{
+	str_append_c(dest, '\t');
+	auth_fields_append(request->userdb_reply, dest,
+			   AUTH_FIELD_FLAG_HIDDEN, 0);
+
+	if (request->master_user != NULL &&
+	    !auth_fields_exists(request->userdb_reply, "master_user")) {
+		auth_str_add_keyvalue(dest, "master_user",
+				      request->master_user);
+	}
+	if (*request->set->anonymous_username != '\0' &&
+	    strcmp(request->user, request->set->anonymous_username) == 0) {
+		/* this is an anonymous login, either via ANONYMOUS
+		   SASL mechanism or simply logging in as the anonymous
+		   user via another mechanism */
+		str_append(dest, "\tanonymous");
+	}
+	/* generate auth_token when master service provided session_pid */
+	if (request->request_auth_token &&
+	    request->session_pid != (pid_t)-1) {
+		const char *auth_token =
+			auth_token_get(request->service,
+				       dec2str(request->session_pid),
+				       request->user,
+				       request->session_id);
+		auth_str_add_keyvalue(dest, "auth_token", auth_token);
+	}
+	if (request->master_user != NULL) {
+		auth_str_add_keyvalue(dest, "auth_user", request->master_user);
+	} else if (request->original_username != NULL &&
+		   strcmp(request->original_username, request->user) != 0) {
+		auth_str_add_keyvalue(dest, "auth_user",
+				      request->original_username);
+	}
+}
+
 static void userdb_callback(enum userdb_result result,
 			    struct auth_request *request)
 {
@@ -632,14 +676,14 @@ static void userdb_callback(enum userdb_result result,
 
 	auth_request_set_state(request, AUTH_REQUEST_STATE_FINISHED);
 
-	if (request->userdb_lookup_failed)
+	if (request->userdb_lookup_tempfailed)
 		result = USERDB_RESULT_INTERNAL_FAILURE;
 
 	str = t_str_new(128);
 	switch (result) {
 	case USERDB_RESULT_INTERNAL_FAILURE:
 		str_printfa(str, "FAIL\t%u", request->id);
-		if (request->userdb_lookup_failed) {
+		if (request->userdb_lookup_tempfailed) {
 			value = auth_fields_find(request->userdb_reply, "reason");
 			if (value != NULL)
 				auth_str_add_keyvalue(str, "reason", value);
@@ -651,32 +695,7 @@ static void userdb_callback(enum userdb_result result,
 	case USERDB_RESULT_OK:
 		str_printfa(str, "USER\t%u\t", request->id);
 		str_append_tabescaped(str, request->user);
-		str_append_c(str, '\t');
-		auth_fields_append(request->userdb_reply, str,
-				   AUTH_FIELD_FLAG_HIDDEN, 0);
-
-		if (request->master_user != NULL &&
-		    !auth_fields_exists(request->userdb_reply, "master_user")) {
-			auth_str_add_keyvalue(str, "master_user",
-					      request->master_user);
-		}
-		if (*request->set->anonymous_username != '\0' &&
-		    strcmp(request->user,
-			   request->set->anonymous_username) == 0) {
-			/* this is an anonymous login, either via ANONYMOUS
-			   SASL mechanism or simply logging in as the anonymous
-			   user via another mechanism */
-			str_append(str, "\tanonymous");
-		}
-		/* generate auth_token when master service provided session_pid */
-		if (request->session_pid != (pid_t)-1) {
-			const char *auth_token =
-				auth_token_get(request->service,
-					       dec2str(request->session_pid),
-					       request->user,
-					       request->session_id);
-			auth_str_add_keyvalue(str, "auth_token", auth_token);
-		}
+		auth_str_append_userdb_extra_fields(request, str);
 		break;
 	}
 	handler->master_callback(str_c(str), request->master);

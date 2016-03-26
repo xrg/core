@@ -1,10 +1,11 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "safe-memset.h"
 #include "dsasl-client-private.h"
 
+static int init_refcount = 0;
 static ARRAY(const struct dsasl_client_mech *) dsasl_mechanisms = ARRAY_INIT;
 
 static const struct dsasl_client_mech *
@@ -35,6 +36,12 @@ const char *dsasl_client_mech_get_name(const struct dsasl_client_mech *mech)
 
 void dsasl_client_mech_register(const struct dsasl_client_mech *mech)
 {
+	unsigned int idx;
+
+	if (dsasl_client_mech_find_idx(mech->name, &idx) != NULL) {
+		/* allow plugins to override the default mechanisms */
+		array_delete(&dsasl_mechanisms, idx, 1);
+	}
 	array_append(&dsasl_mechanisms, &mech, 1);
 }
 
@@ -93,12 +100,18 @@ int dsasl_client_output(struct dsasl_client *client,
 
 void dsasl_clients_init(void)
 {
+	if (init_refcount++ > 0)
+		return;
+
 	i_array_init(&dsasl_mechanisms, 8);
+	dsasl_client_mech_register(&dsasl_client_mech_external);
 	dsasl_client_mech_register(&dsasl_client_mech_plain);
 	dsasl_client_mech_register(&dsasl_client_mech_login);
 }
 
 void dsasl_clients_deinit(void)
 {
+	if (--init_refcount > 0)
+		return;
 	array_free(&dsasl_mechanisms);
 }

@@ -22,7 +22,9 @@ lib01_acl_plugin_la_SOURCES = \
 	acl-backend.c \
 	acl-backend-vfile.c \
 	acl-backend-vfile-acllist.c \
+	acl-backend-vfile-update.c \
 	acl-cache.c \
+	acl-global-file.c \
 	acl-lookup-dict.c \
 	acl-mailbox.c \
 	acl-mailbox-list.c \
@@ -31,13 +33,17 @@ lib01_acl_plugin_la_SOURCES = \
 	acl-storage.c
 
 noinst_HEADERS = \
+	acl-backend-vfile.h \
+	acl-shared-storage.h
+
+pkginc_libdir=$(pkgincludedir)
+pkginc_lib_HEADERS = \
 	acl-api.h \
 	acl-api-private.h \
-	acl-backend-vfile.h \
 	acl-cache.h \
+	acl-global-file.h \
 	acl-lookup-dict.h \
 	acl-plugin.h \
-	acl-shared-storage.h \
 	acl-storage.h
 
 doveadm_module_LTLIBRARIES = \

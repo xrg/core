@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -241,6 +241,9 @@ void worker_connection_request(struct worker_connection *conn,
 		str_append_tabescaped(str, request->username);
 		str_append_c(str, '\t');
 		str_append_tabescaped(str, request->mailbox);
+		str_append_c(str, '\t');
+		if (request->session_id != NULL)
+			str_append_tabescaped(str, request->session_id);
 		str_printfa(str, "\t%u\t", request->max_recent_msgs);
 		if (request->index)
 			str_append_c(str, 'i');

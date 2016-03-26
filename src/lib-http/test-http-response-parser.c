@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "test-lib.h"
 #include "buffer.h"
@@ -20,7 +20,7 @@ struct http_response_parse_test {
 	const char *payload;
 };
 
-/* Valid header tests */
+/* Valid response tests */
 
 static const struct http_response_parse_test
 valid_response_parse_tests[] = {
@@ -39,7 +39,7 @@ valid_response_parse_tests[] = {
 			"This is a piece of stupid text.\r\n",
 		.status = 200,
 		.payload = "This is a piece of stupid text.\r\n"
-	},{ 
+	},{
 		.response =
 			"HTTP/1.1 200 OK\r\n"
 			"Date: Sun, 07 Oct 2012 13:02:27 GMT\r\n"
@@ -86,7 +86,7 @@ valid_response_parse_tests[] = {
 	}
 };
 
-unsigned int valid_response_parse_test_count =
+static const unsigned int valid_response_parse_test_count =
 	N_ELEMENTS(valid_response_parse_tests);
 
 static void test_http_response_parse_valid(void)
@@ -104,6 +104,7 @@ static void test_http_response_parse_valid(void)
 		unsigned int pos, response_text_len;
 		int ret = 0;
 
+		memset(&response, 0, sizeof(response));
 		test = &valid_response_parse_tests[i];
 		response_text = test->response;
 		response_text_len = strlen(response_text);
@@ -118,6 +119,8 @@ static void test_http_response_parse_valid(void)
 			ret = http_response_parse_next(parser, FALSE, &response, &error);
 		}
 		test_istream_set_size(input, response_text_len);
+		i_stream_unref(&input);
+
 		while (ret > 0) {
 			if (response.payload != NULL) {
 				buffer_set_used_size(payload_buffer, 0);
@@ -133,7 +136,7 @@ static void test_http_response_parse_valid(void)
 		}
 
 		test_out("parse success", ret == 0);
-		
+
 		if (ret == 0) {
 			/* verify last response only */
 			test_out(t_strdup_printf("response->status = %d",test->status),
@@ -155,6 +158,10 @@ static void test_http_response_parse_valid(void)
 	buffer_free(&payload_buffer);
 }
 
+/*
+ * Invalid response tests
+ */
+
 static const char *invalid_response_parse_tests[] = {
 	"XMPP/1.0 302 Found\r\n"
 	"Location: http://www.example.nl/\r\n"
@@ -173,12 +180,7 @@ static const char *invalid_response_parse_tests[] = {
 	"Cache-Control: private\n\r"
 };
 
-static unsigned char invalid_response_with_nuls[] =
-	"HTTP/1.1 200 OK\r\n"
-	"Server: text\0server\r\n"
-	"\r\n";
-
-unsigned int invalid_response_parse_test_count =
+static const unsigned int invalid_response_parse_test_count =
 	N_ELEMENTS(invalid_response_parse_tests);
 
 static void test_http_response_parse_invalid(void)
@@ -197,6 +199,7 @@ static void test_http_response_parse_invalid(void)
 		response_text = test;
 		input = i_stream_create_from_data(response_text, strlen(response_text));
 		parser = http_response_parser_init(input, NULL);
+		i_stream_unref(&input);
 
 		test_begin(t_strdup_printf("http response invalid [%d]", i));
 
@@ -206,16 +209,42 @@ static void test_http_response_parse_invalid(void)
 		test_end();
 		http_response_parser_deinit(&parser);
 	} T_END;
+}
+
+/*
+ * Bad response tests
+ */
+
+static const unsigned char bad_response_with_nuls[] =
+	"HTTP/1.1 200 OK\r\n"
+	"Server: text\0server\r\n"
+	"\r\n";
+
+static void test_http_response_parse_bad(void)
+{
+	struct http_response_parser *parser;
+	struct http_response response;
+	const char *header, *error;
+	struct istream *input;
+	int ret;
 
 	/* parse failure guarantees http_response_header.size equals
 	   strlen(http_response_header.value) */
 	test_begin("http response with NULs");
-	input = i_stream_create_from_data(invalid_response_with_nuls,
-					  sizeof(invalid_response_with_nuls)-1);
-	parser = http_response_parser_init(input, 0);
+	input = i_stream_create_from_data(bad_response_with_nuls,
+					  sizeof(bad_response_with_nuls)-1);
+	parser = http_response_parser_init(input, NULL);
+	i_stream_unref(&input);
 	while ((ret=http_response_parse_next(parser, FALSE, &response, &error)) > 0);
-	test_assert(ret < 0);
+	test_out("parse success", ret == 0);
+	header = http_response_header_get(&response, "server");
+	test_out("header present", header != NULL);
+	if (header != NULL) {
+		test_out(t_strdup_printf("header Server: %s", header),
+			strcmp(header, "textserver") == 0);
+	}
 	test_end();
+	http_response_parser_deinit(&parser);
 }
 
 int main(void)
@@ -223,6 +252,7 @@ int main(void)
 	static void (*test_functions[])(void) = {
 		test_http_response_parse_valid,
 		test_http_response_parse_invalid,
+		test_http_response_parse_bad,
 		NULL
 	};
 	return test_run(test_functions);

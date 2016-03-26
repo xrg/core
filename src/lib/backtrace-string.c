@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "str.h"
@@ -10,7 +10,6 @@
 #if defined(HAVE_BACKTRACE_SYMBOLS) && defined(HAVE_EXECINFO_H)
 /* Linux */
 #include <execinfo.h>
-#include <stdlib.h>
 
 int backtrace_append(string_t *str)
 {

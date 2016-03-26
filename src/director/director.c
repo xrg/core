@@ -1,9 +1,10 @@
-/* Copyright (c) 2010-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2010-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
 #include "array.h"
 #include "str.h"
+#include "strescape.h"
 #include "ipc-client.h"
 #include "user-directory.h"
 #include "mail-host.h"
@@ -16,7 +17,6 @@
 #define DIRECTOR_RECONNECT_RETRY_SECS 60
 #define DIRECTOR_RECONNECT_TIMEOUT_MSECS (30*1000)
 #define DIRECTOR_USER_MOVE_TIMEOUT_MSECS (30*1000)
-#define DIRECTOR_USER_MOVE_FINISH_DELAY_MSECS (2*1000)
 #define DIRECTOR_SYNC_TIMEOUT_MSECS (5*1000)
 #define DIRECTOR_RING_MIN_WAIT_SECS 20
 #define DIRECTOR_QUICK_RECONNECT_TIMEOUT_MSECS 1000
@@ -102,14 +102,28 @@ director_has_outgoing_connection(struct director *dir,
 
 int director_connect_host(struct director *dir, struct director_host *host)
 {
-	unsigned int port;
+	in_port_t port;
 	int fd;
 
 	if (director_has_outgoing_connection(dir, host))
 		return 0;
 
-	dir_debug("Connecting to %s:%u",
-		  net_ip2addr(&host->ip), host->port);
+	if (director_debug) {
+		string_t *str = t_str_new(128);
+
+		str_printfa(str, "Connecting to %s:%u (as %s",
+			    net_ip2addr(&host->ip), host->port,
+			    net_ip2addr(&dir->self_ip));
+		if (host->last_network_failure > 0) {
+			str_printfa(str, ", last network failure %ds ago",
+				    (int)(ioloop_time - host->last_network_failure));
+		}
+		if (host->last_protocol_failure > 0) {
+			str_printfa(str, ", last protocol failure %ds ago",
+				    (int)(ioloop_time - host->last_protocol_failure));
+		}
+		dir_debug("%s", str_c(str));
+	}
 	port = dir->test_port != 0 ? dir->test_port : host->port;
 	fd = net_connect_ip(&host->ip, port, &dir->self_ip);
 	if (fd == -1) {
@@ -274,7 +288,10 @@ void director_set_ring_synced(struct director *dir)
 	if (dir->to_handshake_warning != NULL)
 		timeout_remove(&dir->to_handshake_warning);
 	if (dir->ring_handshake_warning_sent) {
-		i_warning("Ring is synced, continuing delayed requests");
+		i_warning("Ring is synced, continuing delayed requests "
+			  "(syncing took %d secs, hosts_hash=%u)",
+			  (int)(ioloop_time - dir->ring_last_sync_time),
+			  mail_hosts_hash(dir->mail_hosts));
 		dir->ring_handshake_warning_sent = FALSE;
 	}
 
@@ -298,12 +315,13 @@ void director_set_ring_synced(struct director *dir)
 		timeout_remove(&dir->to_sync);
 	dir->ring_synced = TRUE;
 	dir->ring_last_sync_time = ioloop_time;
+	mail_hosts_set_synced(dir->mail_hosts);
 	director_set_state_changed(dir);
 }
 
 void director_sync_send(struct director *dir, struct director_host *host,
 			uint32_t seq, unsigned int minor_version,
-			unsigned int timestamp)
+			unsigned int timestamp, unsigned int hosts_hash)
 {
 	string_t *str;
 
@@ -313,7 +331,8 @@ void director_sync_send(struct director *dir, struct director_host *host,
 	if (minor_version > 0 &&
 	    director_connection_get_minor_version(dir->right) > 0) {
 		/* only minor_version>0 supports extra parameters */
-		str_printfa(str, "\t%u\t%u", minor_version, timestamp);
+		str_printfa(str, "\t%u\t%u\t%u", minor_version,
+			    timestamp, hosts_hash);
 	}
 	str_append_c(str, '\n');
 	director_connection_send(dir->right, str_c(str));
@@ -322,8 +341,7 @@ void director_sync_send(struct director *dir, struct director_host *host,
 	   if they are, we want to know it fast. */
 	if (dir->left != NULL)
 		director_connection_ping(dir->left);
-	if (dir->right != NULL)
-		director_connection_ping(dir->right);
+	director_connection_ping(dir->right);
 }
 
 bool director_resend_sync(struct director *dir)
@@ -332,7 +350,8 @@ bool director_resend_sync(struct director *dir)
 		/* send a new SYNC in case the previous one got dropped */
 		dir->self_host->last_sync_timestamp = ioloop_time;
 		director_sync_send(dir, dir->self_host, dir->sync_seq,
-				   DIRECTOR_VERSION_MINOR, ioloop_time);
+				   DIRECTOR_VERSION_MINOR, ioloop_time,
+				   mail_hosts_hash(dir->mail_hosts));
 		if (dir->to_sync != NULL)
 			timeout_reset(dir->to_sync);
 		return TRUE;
@@ -395,7 +414,8 @@ static void director_sync(struct director *dir)
 		director_connection_set_synced(dir->left, FALSE);
 	director_connection_set_synced(dir->right, FALSE);
 	director_sync_send(dir, dir->self_host, dir->sync_seq,
-			   DIRECTOR_VERSION_MINOR, ioloop_time);
+			   DIRECTOR_VERSION_MINOR, ioloop_time,
+			   mail_hosts_hash(dir->mail_hosts));
 }
 
 void director_sync_freeze(struct director *dir)
@@ -498,6 +518,59 @@ void director_ring_remove(struct director_host *removed_host,
 				     DIRECTOR_VERSION_RING_REMOVE, cmd);
 }
 
+static void
+director_send_host(struct director *dir, struct director_host *src,
+		   struct director_host *orig_src,
+		   struct mail_host *host)
+{
+	const char *host_tag = mail_host_get_tag(host);
+	string_t *str;
+
+	if (orig_src == NULL) {
+		orig_src = dir->self_host;
+		orig_src->last_seq++;
+	}
+
+	str = t_str_new(128);
+	str_printfa(str, "HOST\t%s\t%u\t%u\t%s\t%u",
+		    net_ip2addr(&orig_src->ip), orig_src->port,
+		    orig_src->last_seq,
+		    net_ip2addr(&host->ip), host->vhost_count);
+	if (dir->ring_min_version >= DIRECTOR_VERSION_TAGS_V2) {
+		str_append_c(str, '\t');
+		str_append_tabescaped(str, host_tag);
+	} else if (host_tag[0] != '\0' &&
+		   dir->ring_min_version < DIRECTOR_VERSION_TAGS_V2) {
+		if (dir->ring_min_version < DIRECTOR_VERSION_TAGS) {
+			i_error("Ring has directors that don't support tags - removing host %s with tag '%s'",
+				net_ip2addr(&host->ip), host_tag);
+		} else {
+			i_error("Ring has directors that support mixed versions of tags - removing host %s with tag '%s'",
+				net_ip2addr(&host->ip), host_tag);
+		}
+		director_remove_host(dir, NULL, NULL, host);
+		return;
+	}
+	if (dir->ring_min_version >= DIRECTOR_VERSION_UPDOWN) {
+		str_printfa(str, "\t%c%ld\t", host->down ? 'D' : 'U',
+			    (long)host->last_updown_change);
+		/* add any further version checks here - these directors ignore
+		   any extra unknown arguments */
+		if (host->hostname != NULL)
+			str_append_tabescaped(str, host->hostname);
+	}
+	str_append_c(str, '\n');
+	director_update_send(dir, src, str_c(str));
+}
+
+void director_resend_hosts(struct director *dir)
+{
+	struct mail_host *const *hostp;
+
+	array_foreach(mail_hosts_get(dir->mail_hosts), hostp)
+		director_send_host(dir, dir->self_host, NULL, *hostp);
+}
+
 void director_update_host(struct director *dir, struct director_host *src,
 			  struct director_host *orig_src,
 			  struct mail_host *host)
@@ -505,15 +578,18 @@ void director_update_host(struct director *dir, struct director_host *src,
 	/* update state in case this is the first mail host being added */
 	director_set_state_changed(dir);
 
-	if (orig_src == NULL) {
-		orig_src = dir->self_host;
-		orig_src->last_seq++;
-	}
+	dir_debug("Updating host %s vhost_count=%u "
+		  "down=%d last_updown_change=%ld (hosts_hash=%u)",
+		  net_ip2addr(&host->ip), host->vhost_count, host->down,
+		  (long)host->last_updown_change,
+		  mail_hosts_hash(dir->mail_hosts));
 
-	director_update_send(dir, src, t_strdup_printf(
-		"HOST\t%s\t%u\t%u\t%s\t%u\n",
-		net_ip2addr(&orig_src->ip), orig_src->port, orig_src->last_seq,
-		net_ip2addr(&host->ip), host->vhost_count));
+	director_send_host(dir, src, orig_src, host);
+
+	/* mark the host desynced until ring is synced again. except if we're
+	   alone in the ring that never happens. */
+	if (dir->right != NULL || dir->left != NULL)
+		host->desynced = TRUE;
 	director_sync(dir);
 }
 
@@ -534,7 +610,7 @@ void director_remove_host(struct director *dir, struct director_host *src,
 	}
 
 	user_directory_remove_host(dir->users, host);
-	mail_host_remove(dir->mail_hosts, host);
+	mail_host_remove(host);
 	director_sync(dir);
 }
 
@@ -566,9 +642,12 @@ void director_update_user(struct director *dir, struct director_host *src,
 }
 
 void director_update_user_weak(struct director *dir, struct director_host *src,
+			       struct director_connection *src_conn,
 			       struct director_host *orig_src,
 			       struct user *user)
 {
+	const char *cmd;
+
 	i_assert(src != NULL);
 	i_assert(user->weak);
 
@@ -577,10 +656,27 @@ void director_update_user_weak(struct director *dir, struct director_host *src,
 		orig_src->last_seq++;
 	}
 
-	director_update_send(dir, src, t_strdup_printf(
-		"USER-WEAK\t%s\t%u\t%u\t%u\t%s\n",
+	cmd = t_strdup_printf("USER-WEAK\t%s\t%u\t%u\t%u\t%s\n",
 		net_ip2addr(&orig_src->ip), orig_src->port, orig_src->last_seq,
-		user->username_hash, net_ip2addr(&user->host->ip)));
+		user->username_hash, net_ip2addr(&user->host->ip));
+
+	if (src != dir->self_host && dir->left != NULL && dir->right != NULL &&
+	    director_connection_get_host(dir->left) ==
+	    director_connection_get_host(dir->right)) {
+		/* only two directors in this ring and we're forwarding
+		   USER-WEAK from one director back to itself via another
+		   so it sees we've received it. we can't use
+		   director_update_send() for this, because it doesn't send
+		   data back to the source. */
+		if (dir->right == src_conn)
+			director_connection_send(dir->left, cmd);
+		else if (dir->left == src_conn)
+			director_connection_send(dir->right, cmd);
+		else
+			i_unreached();
+	} else {
+		director_update_send(dir, src, cmd);
+	}
 }
 
 struct director_user_kill_finish_ctx {
@@ -612,7 +708,10 @@ director_user_kill_finish_delayed(struct director *dir, struct user *user)
 	user->kill_state = USER_KILL_STATE_DELAY;
 	timeout_remove(&user->to_move);
 
-	user->to_move = timeout_add(DIRECTOR_USER_MOVE_FINISH_DELAY_MSECS,
+	/* wait for a while for the kills to finish in the backend server,
+	   so there are no longer any processes running for the user before we
+	   start letting new in connections to the new server. */
+	user->to_move = timeout_add(dir->set->director_user_kick_delay * 1000,
 				    director_user_kill_finish_delayed_to, ctx);
 }
 
@@ -736,6 +835,54 @@ void director_move_user(struct director *dir, struct director_host *src,
 		user->username_hash, net_ip2addr(&user->host->ip)));
 }
 
+static void
+director_kick_user_callback(enum ipc_client_cmd_state state ATTR_UNUSED,
+			    const char *data ATTR_UNUSED,
+			    void *context ATTR_UNUSED)
+{
+}
+
+void director_kick_user(struct director *dir, struct director_host *src,
+			struct director_host *orig_src, const char *username)
+{
+	const char *cmd;
+
+	cmd = t_strdup_printf("proxy\t*\tKICK\t%s", username);
+	ipc_client_cmd(dir->ipc_proxy, cmd,
+		       director_kick_user_callback, (void *)NULL);
+
+	if (orig_src == NULL) {
+		orig_src = dir->self_host;
+		orig_src->last_seq++;
+	}
+	cmd = t_strdup_printf("USER-KICK\t%s\t%u\t%u\t%s\n",
+		net_ip2addr(&orig_src->ip), orig_src->port, orig_src->last_seq,
+		username);
+	director_update_send_version(dir, src, DIRECTOR_VERSION_USER_KICK, cmd);
+}
+
+void director_kick_user_hash(struct director *dir, struct director_host *src,
+			     struct director_host *orig_src,
+			     unsigned int username_hash,
+			     const struct ip_addr *except_ip)
+{
+	const char *cmd;
+
+	cmd = t_strdup_printf("proxy\t*\tKICK-DIRECTOR-HASH\t%u\t%s",
+			      username_hash, net_ip2addr(except_ip));
+	ipc_client_cmd(dir->ipc_proxy, cmd,
+		       director_kick_user_callback, (void *)NULL);
+
+	if (orig_src == NULL) {
+		orig_src = dir->self_host;
+		orig_src->last_seq++;
+	}
+	cmd = t_strdup_printf("USER-KICK-HASH\t%s\t%u\t%u\t%u\t%s\n",
+		net_ip2addr(&orig_src->ip), orig_src->port, orig_src->last_seq,
+		username_hash, net_ip2addr(except_ip));
+	director_update_send_version(dir, src, DIRECTOR_VERSION_USER_KICK, cmd);
+}
+
 void director_user_killed(struct director *dir, unsigned int username_hash)
 {
 	struct user *user;
@@ -825,7 +972,7 @@ void director_update_send_version(struct director *dir,
 
 struct director *
 director_init(const struct director_settings *set,
-	      const struct ip_addr *listen_ip, unsigned int listen_port,
+	      const struct ip_addr *listen_ip, in_port_t listen_port,
 	      director_state_change_callback_t *callback)
 {
 	struct director *dir;
@@ -840,7 +987,7 @@ director_init(const struct director_settings *set,
 	i_array_init(&dir->connections, 8);
 	dir->users = user_directory_init(set->director_user_expire,
 					 set->director_username_hash);
-	dir->mail_hosts = mail_hosts_init();
+	dir->mail_hosts = mail_hosts_init(set->director_consistent_hashing);
 
 	dir->ipc_proxy = ipc_client_init(DIRECTOR_IPC_PROXY_PATH);
 	dir->ring_min_version = DIRECTOR_VERSION_MINOR;

@@ -2,7 +2,7 @@
 #define MESSAGE_PARSER_H
 
 #include "message-header-parser.h"
-#include "message-size.h"
+#include "message-part.h"
 
 enum message_parser_flags {
 	/* Don't return message bodies in message_blocks. */
@@ -17,38 +17,6 @@ enum message_parser_flags {
 	MESSAGE_PARSER_FLAG_INCLUDE_BOUNDARIES		= 0x08
 };
 
-/* Note that these flags are used directly by message-parser-serialize, so
-   existing flags can't be changed without breaking backwards compatibility */
-enum message_part_flags {
-	MESSAGE_PART_FLAG_MULTIPART		= 0x01,
-	MESSAGE_PART_FLAG_MULTIPART_DIGEST	= 0x02,
-	MESSAGE_PART_FLAG_MESSAGE_RFC822	= 0x04,
-
-	/* content-type: text/... */
-	MESSAGE_PART_FLAG_TEXT			= 0x08,
-
-	MESSAGE_PART_FLAG_UNUSED		= 0x10,
-
-	/* message part header or body contains NULs */
-	MESSAGE_PART_FLAG_HAS_NULS		= 0x20,
-
-	/* Mime-Version header exists. */
-	MESSAGE_PART_FLAG_IS_MIME		= 0x40
-};
-
-struct message_part {
-	struct message_part *parent;
-	struct message_part *next;
-	struct message_part *children;
-
-	uoff_t physical_pos; /* absolute position from beginning of message */
-	struct message_size header_size;
-	struct message_size body_size;
-
-	enum message_part_flags flags;
-	void *context;
-};
-
 struct message_parser_ctx;
 
 struct message_block {
@@ -58,7 +26,10 @@ struct message_block {
 	/* non-NULL if a header line was read */
 	struct message_header_line *hdr;
 
-	/* hdr = NULL, size = 0 block returned at the end of headers */
+	/* hdr = NULL, size = 0 block returned at the end of headers for the
+	   empty line between header and body (unless the header is truncated).
+	   Later on data and size>0 is returned for blocks of mail body that
+	   is read (see message_parser_flags for what is actually returned) */
 	const unsigned char *data;
 	size_t size;
 };
@@ -86,6 +57,13 @@ message_parser_init_from_parts(struct message_part *parts,
    didn't match the current message */
 int message_parser_deinit(struct message_parser_ctx **ctx,
 			  struct message_part **parts_r);
+/* Same as message_parser_deinit(), but return an error message describing
+   why the preparsed parts didn't match the message. This can also safely be
+   called even when preparsed parts weren't used - it'll always just return
+   success in that case. */
+int message_parser_deinit_from_parts(struct message_parser_ctx **_ctx,
+				     struct message_part **parts_r,
+				     const char **error_r);
 
 /* Read the next block of a message. Returns 1 if block is returned, 0 if
    input stream is non-blocking and more data needs to be read, -1 when all is

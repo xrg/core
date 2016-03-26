@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -68,10 +68,17 @@ index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
 	int ret = 0;
 
 	if (mailbox_get_metadata(box, MAILBOX_METADATA_PRECACHE_FIELDS,
-				 &metadata) < 0 ||
-	    mailbox_get_status(box, STATUS_MESSAGES | STATUS_LAST_CACHED_SEQ,
-			       &status) < 0)
+				 &metadata) < 0) {
+		i_error("Mailbox %s: Precache-fields lookup failed: %s",
+			mailbox_get_vname(box), mailbox_get_last_error(box, NULL));
 		return -1;
+	}
+	if (mailbox_get_status(box, STATUS_MESSAGES | STATUS_LAST_CACHED_SEQ,
+			       &status) < 0) {
+		i_error("Mailbox %s: Status lookup failed: %s",
+			mailbox_get_vname(box), mailbox_get_last_error(box, NULL));
+		return -1;
+	}
 	seq = status.last_cached_seq + 1;
 
 	trans = mailbox_transaction_begin(box, MAILBOX_TRANSACTION_FLAG_NO_CACHE_DEC);
@@ -99,10 +106,16 @@ index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
 							 counter, max);
 		}
 	}
-	if (mailbox_search_deinit(&ctx) < 0)
+	if (mailbox_search_deinit(&ctx) < 0) {
+		i_error("Mailbox %s: Mail search failed: %s",
+			mailbox_get_vname(box), mailbox_get_last_error(box, NULL));
 		ret = -1;
-	if (mailbox_transaction_commit(&trans) < 0)
+	}
+	if (mailbox_transaction_commit(&trans) < 0) {
+		i_error("Mailbox %s: Transaction commit failed: %s",
+			mailbox_get_vname(box), mailbox_get_last_error(box, NULL));
 		ret = -1;
+	}
 	if (ret == 0) {
 		i_info("Indexed %u messages in %s",
 		       counter, mailbox_get_vname(box));
@@ -126,14 +139,15 @@ index_mailbox(struct master_connection *conn, struct mail_user *user,
 	ns = mail_namespace_find(user->namespaces, mailbox);
 	box = mailbox_alloc(ns->list, mailbox, 0);
 	ret = mailbox_get_path_to(box, MAILBOX_LIST_PATH_TYPE_INDEX, &path);
-	if (ret <= 0) {
+	if (ret < 0) {
+		i_error("Getting path to mailbox %s failed: %s",
+			mailbox, mailbox_get_last_error(box, NULL));
 		mailbox_free(&box);
-		if (ret < 0) {
-			i_error("Getting path to mailbox %s failed: %s",
-				mailbox, mailbox_get_last_error(box, NULL));
-			return -1;
-		}
+		return -1;
+	}
+	if (ret == 0) {
 		i_info("Indexes disabled for mailbox %s, skipping", mailbox);
+		mailbox_free(&box);
 		return 0;
 	}
 	ret = 0;
@@ -187,9 +201,9 @@ master_connection_input_line(struct master_connection *conn, const char *line)
 	unsigned int max_recent_msgs;
 	int ret;
 
-	/* <username> <mailbox> <max_recent_msgs> [i][o] */
-	if (str_array_length(args) != 4 ||
-	    str_to_uint(args[2], &max_recent_msgs) < 0 || args[3][0] == '\0') {
+	/* <username> <mailbox> <session ID> <max_recent_msgs> [i][o] */
+	if (str_array_length(args) != 5 ||
+	    str_to_uint(args[3], &max_recent_msgs) < 0 || args[4][0] == '\0') {
 		i_error("Invalid input from master: %s", line);
 		return -1;
 	}
@@ -198,6 +212,12 @@ master_connection_input_line(struct master_connection *conn, const char *line)
 	input.module = "mail";
 	input.service = "indexer-worker";
 	input.username = args[0];
+	/* if session-id is given, use it as a prefix to a unique session ID.
+	   we can't use the session-id directly or stats process will complain
+	   about duplicates. (especially LMTP would use the same session-id for
+	   multiple users' indexing at the same time.) */
+	if (args[2][0] != '\0')
+		input.session_id_prefix = args[2];
 
 	if (mail_storage_service_lookup_next(conn->storage_service, &input,
 					     &service_user, &user, &error) <= 0) {
@@ -206,7 +226,7 @@ master_connection_input_line(struct master_connection *conn, const char *line)
 	} else {
 		indexer_worker_refresh_proctitle(user->username, args[1], 0, 0);
 		ret = index_mailbox(conn, user, args[1],
-				    max_recent_msgs, args[3]);
+				    max_recent_msgs, args[4]);
 		indexer_worker_refresh_proctitle(NULL, NULL, 0, 0);
 		mail_user_unref(&user);
 		mail_storage_service_user_free(&service_user);

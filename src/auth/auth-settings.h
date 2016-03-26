@@ -5,24 +5,32 @@ struct master_service;
 struct master_service_settings_output;
 
 struct auth_passdb_settings {
+	const char *name;
 	const char *driver;
 	const char *args;
 	const char *default_fields;
 	const char *override_fields;
+
 	const char *skip;
 	const char *result_success;
 	const char *result_failure;
 	const char *result_internalfail;
 	bool deny;
-	bool pass;
+	bool pass; /* deprecated, use result_success=continue instead */
 	bool master;
 };
 
 struct auth_userdb_settings {
+	const char *name;
 	const char *driver;
 	const char *args;
 	const char *default_fields;
 	const char *override_fields;
+
+	const char *skip;
+	const char *result_success;
+	const char *result_failure;
+	const char *result_internalfail;
 };
 
 struct auth_settings {
@@ -43,6 +51,7 @@ struct auth_settings {
 	const char *proxy_self;
 	unsigned int failure_delay;
 
+	bool stats;
 	bool verbose, debug, debug_passwords;
 	const char *verbose_passwords;
 	bool ssl_require_client_cert;

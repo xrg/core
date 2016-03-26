@@ -1,9 +1,11 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "buffer.h"
 #include "ioloop.h"
 #include "hash.h"
 #include "llist.h"
+#include "base64.h"
 #include "global-memory.h"
 #include "stats-settings.h"
 #include "mail-stats.h"
@@ -28,8 +30,8 @@ struct mail_user *mail_user_login(const char *username)
 	user = hash_table_lookup(mail_users_hash, username);
 	if (user != NULL) {
 		user->num_logins++;
-		user->domain->num_logins++;
 		mail_user_refresh(user, NULL);
+		mail_domain_login(user->domain);
 		return user;
 	}
 
@@ -39,10 +41,11 @@ struct mail_user *mail_user_login(const char *username)
 	else
 		domain = "";
 
-	user = i_new(struct mail_user, 1);
+	user = i_malloc(sizeof(struct mail_user) + stats_alloc_size());
+	user->stats = (void *)(user + 1);
 	user->name = i_strdup(username);
 	user->reset_timestamp = ioloop_time;
-	user->domain = mail_domain_login(domain);
+	user->domain = mail_domain_login_create(domain);
 
 	hash_table_insert(mail_users_hash, user->name, user);
 	DLLIST_PREPEND_FULL(&stable_mail_users, user,
@@ -57,6 +60,11 @@ struct mail_user *mail_user_login(const char *username)
 	user->last_update = ioloop_timeval;
 	global_memory_alloc(mail_user_memsize(user));
 	return user;
+}
+
+void mail_user_disconnected(struct mail_user *user)
+{
+	mail_domain_disconnected(user->domain);
 }
 
 struct mail_user *mail_user_lookup(const char *username)
@@ -99,16 +107,48 @@ static void mail_user_free(struct mail_user *user)
 }
 
 void mail_user_refresh(struct mail_user *user,
-		       const struct mail_stats *diff_stats)
+		       const struct stats *diff_stats)
 {
 	if (diff_stats != NULL)
-		mail_stats_add(&user->stats, diff_stats);
+		stats_add(user->stats, diff_stats);
 	user->last_update = ioloop_timeval;
 	DLLIST2_REMOVE_FULL(&mail_users_head, &mail_users_tail, user,
 			    sorted_prev, sorted_next);
 	DLLIST2_APPEND_FULL(&mail_users_head, &mail_users_tail, user,
 			    sorted_prev, sorted_next);
 	mail_domain_refresh(user->domain, diff_stats);
+}
+
+int mail_user_add_parse(const char *const *args, const char **error_r)
+{
+	struct mail_user *user;
+	struct stats *diff_stats;
+	buffer_t *buf;
+	const char *service, *error;
+
+	/* <user> <service> <diff stats> */
+	if (str_array_length(args) < 3) {
+		*error_r = "ADD-USER: Too few parameters";
+		return -1;
+	}
+
+	user = mail_user_login(args[0]);
+	service = args[1];
+
+	buf = buffer_create_dynamic(pool_datastack_create(), 256);
+	if (base64_decode(args[2], strlen(args[2]), NULL, buf) < 0) {
+		*error_r = t_strdup_printf("ADD-USER %s %s: Invalid base64 input",
+					   user->name, service);
+		return -1;
+	}
+	diff_stats = stats_alloc(pool_datastack_create());
+	if (!stats_import(buf->data, buf->used, user->stats, diff_stats, &error)) {
+		*error_r = t_strdup_printf("ADD-USER %s %s: %s",
+					   user->name, service, error);
+		return -1;
+	}
+	mail_user_refresh(user, diff_stats);
+	return 0;
 }
 
 void mail_users_free_memory(void)

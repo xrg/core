@@ -184,15 +184,6 @@ int i_my_setegid(gid_t egid);
 char *i_my_basename(char *path);
 #endif
 
-#ifndef HAVE_STRTOULL
-#  define strtoull i_my_strtoull
-unsigned long long int i_my_strtoull(const char *nptr, char **endptr, int base);
-#endif
-#ifndef HAVE_STRTOLL
-#  define strtoll i_my_strtoll
-unsigned long long int i_my_strtoll(const char *nptr, char **endptr, int base);
-#endif
-
 #ifdef HAVE_OLD_VSNPRINTF
 #  include <stdio.h>
 #  define vsnprintf i_my_vsnprintf
@@ -231,8 +222,12 @@ int i_my_clock_gettime(int clk_id, struct timespec *tp);
 
 #ifdef EDQUOT
 #  define ENOSPACE(errno) ((errno) == ENOSPC || (errno) == EDQUOT)
+#  define ENOQUOTA(errno) ((errno) == EDQUOT)
 #else
+/* probably all modern OSes have EDQUOT, but just in case one doesn't assume
+   that ENOSPC is the same as "over quota". */
 #  define ENOSPACE(errno) ((errno) == ENOSPC)
+#  define ENOQUOTA(errno) ((errno) == ENOSPC)
 #endif
 
 /* EPERM is returned sometimes if device doesn't support such modification */
@@ -249,6 +244,11 @@ int i_my_clock_gettime(int clk_id, struct timespec *tp);
 
 #define ECANTLINK(errno) \
 	((errno) == EXDEV || (errno) == EMLINK || (errno) == EPERM)
+
+/* Returns TRUE if unlink() failed because it attempted to delete a directory */
+#define UNLINK_EISDIR(errno) \
+	((errno) == EPERM || /* POSIX */ \
+	 (errno) == EISDIR) /* Linux */
 
 /* EBUSY is given by some NFS implementations */
 #define EDESTDIREXISTS(errno) \

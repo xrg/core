@@ -1,4 +1,4 @@
-/* Copyright (c) 2005-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2005-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -17,7 +17,6 @@
 #include "config-request.h"
 #include "config-parser-private.h"
 
-#include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
@@ -40,6 +39,8 @@ struct config_module_parser *config_module_parsers;
 struct config_filter_context *config_filter;
 struct module *modules;
 void (*hook_config_parser_begin)(struct config_parser_context *ctx);
+int (*hook_config_parser_end)(struct config_parser_context *ctx,
+			      const char **error_r);
 
 static const char *info_type_name_find(const struct setting_parser_info *info)
 {
@@ -277,16 +278,16 @@ config_filter_add_new_filter(struct config_parser_context *ctx,
 
 	if (strcmp(key, "protocol") == 0) {
 		if (parent->service != NULL)
-			ctx->error = "protocol must not be under protocol";
+			ctx->error = "Nested protocol { protocol { .. } } block not allowed";
 		else
 			filter->service = p_strdup(ctx->pool, value);
 	} else if (strcmp(key, "local") == 0) {
 		if (parent->remote_bits > 0)
-			ctx->error = "local must not be under remote";
+			ctx->error = "remote { local { .. } } not allowed (use local { remote { .. } } instead)";
 		else if (parent->service != NULL)
-			ctx->error = "local must not be under protocol";
+			ctx->error = "protocol { local { .. } } not allowed (use local { protocol { .. } } instead)";
 		else if (parent->local_name != NULL)
-			ctx->error = "local must not be under local_name";
+			ctx->error = "local_name { local { .. } } not allowed (use local { local_name { .. } } instead)";
 		else if (config_parse_net(value, &filter->local_net,
 					  &filter->local_bits, &error) < 0)
 			ctx->error = p_strdup(ctx->pool, error);
@@ -295,19 +296,19 @@ config_filter_add_new_filter(struct config_parser_context *ctx,
 			  !net_is_in_network(&filter->local_net,
 					     &parent->local_net,
 					     parent->local_bits)))
-			ctx->error = "local not a subset of parent local";
+			ctx->error = "local net1 { local net2 { .. } } requires net2 to be inside net1";
 		else
 			filter->local_host = p_strdup(ctx->pool, value);
 	} else if (strcmp(key, "local_name") == 0) {
 		if (parent->remote_bits > 0)
-			ctx->error = "local_name must not be under remote";
+			ctx->error = "remote { local_name { .. } } not allowed (use local_name { remote { .. } } instead)";
 		else if (parent->service != NULL)
-			ctx->error = "local_name must not be under protocol";
+			ctx->error = "protocol { local_name { .. } } not allowed (use local_name { protocol { .. } } instead)";
 		else
 			filter->local_name = p_strdup(ctx->pool, value);
 	} else if (strcmp(key, "remote") == 0) {
 		if (parent->service != NULL)
-			ctx->error = "remote must not be under protocol";
+			ctx->error = "protocol { remote { .. } } not allowed (use remote { protocol { .. } } instead)";
 		else if (config_parse_net(value, &filter->remote_net,
 					  &filter->remote_bits, &error) < 0)
 			ctx->error = p_strdup(ctx->pool, error);
@@ -316,7 +317,7 @@ config_filter_add_new_filter(struct config_parser_context *ctx,
 			  !net_is_in_network(&filter->remote_net,
 					     &parent->remote_net,
 					     parent->remote_bits)))
-			ctx->error = "remote not a subset of parent remote";
+			ctx->error = "remote net1 { remote net2 { .. } } requires net2 to be inside net1";
 		else
 			filter->remote_host = p_strdup(ctx->pool, value);
 	} else {
@@ -336,6 +337,10 @@ config_filter_parser_check(struct config_parser_context *ctx,
 			   const struct config_module_parser *p,
 			   const char **error_r)
 {
+	const char *error;
+	char *error_dup = NULL;
+	bool ok;
+
 	for (; p->root != NULL; p++) {
 		/* skip checking settings we don't care about */
 		if (!config_module_want_parser(ctx->root_parsers,
@@ -343,8 +348,17 @@ config_filter_parser_check(struct config_parser_context *ctx,
 			continue;
 
 		settings_parse_var_skip(p->parser);
-		if (!settings_parser_check(p->parser, ctx->pool, error_r))
+		T_BEGIN {
+			ok = settings_parser_check(p->parser, ctx->pool, &error);
+			if (!ok)
+				error_dup = i_strdup(error);
+		} T_END;
+		if (!ok) {
+			i_assert(error_dup != NULL);
+			*error_r = t_strdup(error_dup);
+			i_free(error_dup);
 			return -1;
+		}
 	}
 	return 0;
 }
@@ -392,7 +406,7 @@ config_all_parsers_check(struct config_parser_context *ctx,
 		return -1;
 	}
 
-	tmp_pool = pool_alloconly_create("config parsers check", 1024*64);
+	tmp_pool = pool_alloconly_create(MEMPOOL_GROWING"config parsers check", 1024*64);
 	parsers = array_get(&ctx->all_parsers, &count);
 	i_assert(count > 0 && parsers[count-1] == NULL);
 	count--;
@@ -476,7 +490,7 @@ static int settings_add_include(struct config_parser_context *ctx, const char *p
 	new_input = p_new(ctx->pool, struct input_stack, 1);
 	new_input->prev = ctx->cur_input;
 	new_input->path = p_strdup(ctx->pool, path);
-	new_input->input = i_stream_create_fd(fd, (size_t)-1, TRUE);
+	new_input->input = i_stream_create_fd_autoclose(&fd, (size_t)-1);
 	i_stream_set_return_partial_line(new_input->input, TRUE);
 	ctx->cur_input = new_input;
 	return 0;
@@ -587,7 +601,7 @@ config_parse_line(struct config_parser_context *ctx,
 			len--;
 		str_append_n(full_line, line, len);
 		str_append_c(full_line, ' ');
-		return CONFIG_LINE_TYPE_SKIP;
+		return CONFIG_LINE_TYPE_CONTINUE;
 	}
 	if (str_len(full_line) > 0) {
 		str_append(full_line, line);
@@ -669,7 +683,7 @@ config_parse_line(struct config_parser_context *ctx,
 			}
 		}
 		if (*line != '{') {
-			*value_r = "Expecting '='";
+			*value_r = "Expecting '{'";
 			return CONFIG_LINE_TYPE_ERROR;
 		}
 	}
@@ -684,13 +698,18 @@ static int config_parse_finish(struct config_parser_context *ctx, const char **e
 {
 	struct config_filter_context *new_filter;
 	const char *error;
-	int ret;
+	int ret = 0;
+
+	if (hook_config_parser_end != NULL)
+		ret = hook_config_parser_end(ctx, error_r);
 
 	new_filter = config_filter_init(ctx->pool);
 	array_append_zero(&ctx->all_parsers);
 	config_filter_add_all(new_filter, array_idx(&ctx->all_parsers, 0));
 
-	if (ctx->hide_errors)
+	if (ret < 0)
+		;
+	else if (ctx->hide_errors)
 		ret = 0;
 	else if ((ret = config_all_parsers_check(ctx, new_filter, &error)) < 0) {
 		*error_r = t_strdup_printf("Error in configuration file %s: %s",
@@ -824,6 +843,8 @@ void config_parser_apply_line(struct config_parser_context *ctx,
 	switch (type) {
 	case CONFIG_LINE_TYPE_SKIP:
 		break;
+	case CONFIG_LINE_TYPE_CONTINUE:
+		i_unreached();
 	case CONFIG_LINE_TYPE_ERROR:
 		ctx->error = p_strdup(ctx->pool, value);
 		break;
@@ -909,7 +930,7 @@ int config_parse_file(const char *path, bool expand_values,
 	}
 
 	memset(&ctx, 0, sizeof(ctx));
-	ctx.pool = pool_alloconly_create("config file parser", 1024*256);
+	ctx.pool = pool_alloconly_create(MEMPOOL_GROWING"config file parser", 1024*256);
 	ctx.path = path;
 	ctx.hide_errors = fd == -1;
 
@@ -936,12 +957,13 @@ int config_parse_file(const char *path, bool expand_values,
 	ctx.str = str_new(ctx.pool, 256);
 	full_line = str_new(default_pool, 512);
 	ctx.cur_input->input = fd != -1 ?
-		i_stream_create_fd(fd, (size_t)-1, TRUE) :
+		i_stream_create_fd_autoclose(&fd, (size_t)-1) :
 		i_stream_create_from_data("", 0);
 	i_stream_set_return_partial_line(ctx.cur_input->input, TRUE);
 	old_settings_init(&ctx);
-	if (hook_config_parser_begin != NULL)
+	if (hook_config_parser_begin != NULL) T_BEGIN {
 		hook_config_parser_begin(&ctx);
+	} T_END;
 
 prevfile:
 	while ((line = i_stream_read_next_line(ctx.cur_input->input)) != NULL) {
@@ -949,6 +971,8 @@ prevfile:
 		type = config_parse_line(&ctx, line, full_line,
 					 &key, &value);
 		str_truncate(ctx.str, ctx.pathlen);
+		if (type == CONFIG_LINE_TYPE_CONTINUE)
+			continue;
 
 		T_BEGIN {
 			handled = old_settings_handle(&ctx, type, key, value);

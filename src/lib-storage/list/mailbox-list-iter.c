@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -239,6 +239,15 @@ ns_is_match_within_ns(struct ns_list_iterate_context *ctx,
 	return FALSE;
 }
 
+static bool list_pattern_has_wildcards(const char *pattern)
+{
+	for (; *pattern != '\0'; pattern++) {
+		if (*pattern == '%' || *pattern == '*')
+			return TRUE;
+	}
+	return FALSE;
+}
+
 static bool ns_match_next(struct ns_list_iterate_context *ctx, 
 			  struct mail_namespace *ns, const char *pattern)
 {
@@ -256,8 +265,13 @@ static bool ns_match_next(struct ns_list_iterate_context *ctx,
 		/* non-listable namespace matches only with exact prefix */
 		if (strncmp(ns->prefix, pattern, ns->prefix_len) != 0)
 			return FALSE;
-		/* prefix="" list=no is never listed */
-		if (ns->prefix_len == 0)
+		/* with prefix="", list=no we don't want to show anything,
+		   except when the client explicitly lists a mailbox without
+		   wildcards (e.g. LIST "" mailbox). this is mainly useful
+		   for working around client bugs (and supporting a specific
+		   IMAP client behavior that's not exactly buggy but not very
+		   good IMAP behavior either). */
+		if (ns->prefix_len == 0 && list_pattern_has_wildcards(pattern))
 			return FALSE;
 	}
 
@@ -487,8 +501,7 @@ mailbox_list_ns_prefix_return(struct ns_list_iterate_context *ctx,
 		}
 	}
 
-	if ((ctx->ctx.flags & MAILBOX_LIST_ITER_RETURN_NO_FLAGS) == 0 &&
-	    (ctx->ns_info.flags & MAILBOX_SELECT) == 0) {
+	if ((ctx->ns_info.flags & MAILBOX_SELECT) == 0) {
 		/* see if namespace prefix is selectable */
 		box = mailbox_alloc(ns->list, ctx->ns_info.vname, 0);
 		if (mailbox_exists(box, TRUE, &existence) == 0 &&
@@ -944,7 +957,7 @@ mailbox_list_iter_next_call(struct mailbox_list_iterate_context *ctx)
 
 	ctx->list->ns->flags |= NAMESPACE_FLAG_USABLE;
 	if ((ctx->flags & MAILBOX_LIST_ITER_RETURN_SPECIALUSE) != 0) {
-		set = mailbox_settings_find(ctx->list->ns->user, info->vname);
+		set = mailbox_settings_find(ctx->list->ns, info->vname);
 		if (set != NULL && *set->special_use != '\0') {
 			ctx->specialuse_info = *info;
 			ctx->specialuse_info.special_use =

@@ -1,9 +1,8 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "mempool.h"
 
-#include <stdlib.h>
 
 static const char *pool_unsafe_data_stack_get_name(pool_t pool);
 static void pool_unsafe_data_stack_ref(pool_t pool);

@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "ioloop.h"
@@ -52,6 +52,7 @@ static MODULE_CONTEXT_DEFINE_INIT(cache_mail_index_transaction_module,
 				  &mail_index_module_register);
 
 static int mail_cache_transaction_lock(struct mail_cache_transaction_ctx *ctx);
+static size_t mail_cache_transaction_update_last_rec_size(struct mail_cache_transaction_ctx *ctx);
 
 static void mail_index_transaction_cache_reset(struct mail_index_transaction *t)
 {
@@ -167,6 +168,7 @@ mail_cache_transaction_compress(struct mail_cache_transaction_ctx *ctx)
 	struct mail_cache *cache = ctx->cache;
 	struct mail_index_view *view;
 	struct mail_index_transaction *trans;
+	struct mail_cache_compress_lock *lock;
 	int ret;
 
 	ctx->tried_compression = TRUE;
@@ -177,11 +179,13 @@ mail_cache_transaction_compress(struct mail_cache_transaction_ctx *ctx)
 	view = mail_index_view_open(cache->index);
 	trans = mail_index_transaction_begin(view,
 					MAIL_INDEX_TRANSACTION_FLAG_EXTERNAL);
-	if (mail_cache_compress(cache, trans) < 0) {
+	if (mail_cache_compress(cache, trans, &lock) < 0) {
 		mail_index_transaction_rollback(&trans);
 		ret = -1;
 	} else {
 		ret = mail_index_transaction_commit(&trans);
+		if (lock != NULL)
+			mail_cache_compress_unlock(&lock);
 	}
 	mail_index_view_close(&view);
 	mail_cache_transaction_reset(ctx);
@@ -250,7 +254,7 @@ static int mail_cache_transaction_lock(struct mail_cache_transaction_ctx *ctx)
 
 	mail_cache_transaction_open_if_needed(ctx);
 
-	if ((ret = mail_cache_lock(cache, FALSE)) <= 0) {
+	if ((ret = mail_cache_lock(cache)) <= 0) {
 		if (ret < 0)
 			return -1;
 
@@ -293,7 +297,14 @@ mail_cache_transaction_lookup_rec(struct mail_cache_transaction_ctx *ctx,
 						recs[i].cache_data_pos);
 		}
 	}
-	*trans_next_idx = i;
+	*trans_next_idx = i + 1;
+	if (seq == ctx->prev_seq && i == count) {
+		/* update the unfinished record's (temporary) size and
+		   return it */
+		mail_cache_transaction_update_last_rec_size(ctx);
+		return CONST_PTR_OFFSET(ctx->cache_data->data,
+					ctx->last_rec_pos);
+	}
 	return NULL;
 }
 
@@ -446,10 +457,9 @@ mail_cache_transaction_flush(struct mail_cache_transaction_ctx *ctx)
 	return ret;
 }
 
-static void
-mail_cache_transaction_update_last_rec(struct mail_cache_transaction_ctx *ctx)
+static size_t
+mail_cache_transaction_update_last_rec_size(struct mail_cache_transaction_ctx *ctx)
 {
-	struct mail_cache_transaction_rec *trans_rec;
 	struct mail_cache_record *rec;
 	void *data;
 	size_t size;
@@ -458,8 +468,17 @@ mail_cache_transaction_update_last_rec(struct mail_cache_transaction_ctx *ctx)
 	rec = PTR_OFFSET(data, ctx->last_rec_pos);
 	rec->size = size - ctx->last_rec_pos;
 	i_assert(rec->size > sizeof(*rec));
+	return rec->size;
+}
 
-	if (rec->size > MAIL_CACHE_RECORD_MAX_SIZE) {
+static void
+mail_cache_transaction_update_last_rec(struct mail_cache_transaction_ctx *ctx)
+{
+	struct mail_cache_transaction_rec *trans_rec;
+	size_t size;
+
+	size = mail_cache_transaction_update_last_rec_size(ctx);
+	if (size > MAIL_CACHE_RECORD_MAX_SIZE) {
 		buffer_set_used_size(ctx->cache_data, ctx->last_rec_pos);
 		return;
 	}
@@ -469,7 +488,7 @@ mail_cache_transaction_update_last_rec(struct mail_cache_transaction_ctx *ctx)
 	trans_rec = array_append_space(&ctx->cache_data_seq);
 	trans_rec->seq = ctx->prev_seq;
 	trans_rec->cache_data_pos = ctx->last_rec_pos;
-	ctx->last_rec_pos = size;
+	ctx->last_rec_pos = ctx->cache_data->used;
 }
 
 static void
@@ -576,6 +595,20 @@ static int mail_cache_header_add_field(struct mail_cache_transaction_ctx *ctx,
 	struct mail_cache *cache = ctx->cache;
 	int ret;
 
+	if (MAIL_INDEX_IS_IN_MEMORY(cache->index)) {
+		if (cache->file_fields_count <= field_idx) {
+			cache->file_field_map =
+				i_realloc(cache->file_field_map,
+					  cache->file_fields_count *
+					  sizeof(unsigned int),
+					  (field_idx+1) * sizeof(unsigned int));
+			cache->file_fields_count = field_idx+1;
+		}
+		cache->file_field_map[field_idx] = field_idx;
+		cache->field_file_map[field_idx] = field_idx;
+		return 0;
+	}
+
 	if (mail_cache_transaction_lock(ctx) <= 0) {
 		if (MAIL_CACHE_IS_UNUSABLE(cache))
 			return -1;
@@ -663,8 +696,12 @@ void mail_cache_add(struct mail_cache_transaction_ctx *ctx, uint32_t seq,
 		if (ret < 0)
 			return;
 
-		if (ctx->cache_file_seq == 0)
-			ctx->cache_file_seq = ctx->cache->hdr->file_seq;
+		if (ctx->cache_file_seq == 0) {
+			if (MAIL_INDEX_IS_IN_MEMORY(ctx->cache->index))
+				ctx->cache_file_seq = 1;
+			else
+				ctx->cache_file_seq = ctx->cache->hdr->file_seq;
+		}
 
 		file_field = ctx->cache->field_file_map[field_idx];
 		i_assert(file_field != (uint32_t)-1);
@@ -765,19 +802,4 @@ bool mail_cache_field_can_add(struct mail_cache_transaction_ctx *ctx,
 		return FALSE;
 
 	return mail_cache_field_exists(ctx->view, seq, field_idx) == 0;
-}
-
-void mail_cache_delete(struct mail_cache *cache)
-{
-	i_assert(cache->locked);
-
-	/* we'll only update the deleted record count in the header. we can't
-	   really do any actual deleting as other processes might still be
-	   using the data. also it's actually useful as old index views are
-	   still able to ask cached data for messages that have already been
-	   expunged. */
-	cache->hdr_copy.deleted_record_count++;
-	if (cache->hdr_copy.record_count > 0)
-		cache->hdr_copy.record_count--;
-	cache->hdr_modified = TRUE;
 }

@@ -1,8 +1,9 @@
-/* Copyright (c) 2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2013-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "passdb.h"
 
+#include "array.h"
 #include "str.h"
 #include "var-expand.h"
 #include "dict.h"
@@ -10,7 +11,6 @@
 #include "auth-cache.h"
 #include "db-dict.h"
 
-#include <stdlib.h>
 #include <string.h>
 
 struct dict_passdb_module {
@@ -29,12 +29,11 @@ struct passdb_dict_request {
 
 static int
 dict_query_save_results(struct auth_request *auth_request,
-			struct dict_connection *conn, const char *result)
+			struct dict_connection *conn,
+			struct db_dict_value_iter *iter)
 {
-	struct db_dict_value_iter *iter;
 	const char *key, *value, *error;
 
-	iter = db_dict_value_iter_init(conn, result);
 	while (db_dict_value_iter_next(iter, &key, &value)) {
 		if (value != NULL) {
 			auth_request_set_field(auth_request, key, value,
@@ -42,9 +41,7 @@ dict_query_save_results(struct auth_request *auth_request,
 		}
 	}
 	if (db_dict_value_iter_deinit(&iter, &error) < 0) {
-		auth_request_log_error(auth_request, "dict",
-			"Value '%s' not in valid %s format: %s",
-			result, conn->set.value_format, error);
+		auth_request_log_error(auth_request, AUTH_SUBSYS_DB, "%s", error);
 		return -1;
 	}
 	return 0;
@@ -52,29 +49,27 @@ dict_query_save_results(struct auth_request *auth_request,
 
 static enum passdb_result
 passdb_dict_lookup_key(struct auth_request *auth_request,
-		       struct dict_passdb_module *module, const char *key)
+		       struct dict_passdb_module *module)
 {
-	const char *value;
+	struct db_dict_value_iter *iter;
 	int ret;
 
-	auth_request_log_debug(auth_request, "dict", "lookup %s", key);
-	ret = dict_lookup(module->conn->dict, pool_datastack_create(),
-			  key, &value);
-	if (ret < 0) {
-		auth_request_log_error(auth_request, "dict", "Lookup failed");
+	ret = db_dict_value_iter_init(module->conn, auth_request,
+				      &module->conn->set.passdb_fields,
+				      &module->conn->set.parsed_passdb_objects,
+				      &iter);
+	if (ret < 0)
 		return PASSDB_RESULT_INTERNAL_FAILURE;
-	} else if (ret == 0) {
-		auth_request_log_unknown_user(auth_request, "dict");
+	else if (ret == 0) {
+		auth_request_log_unknown_user(auth_request, AUTH_SUBSYS_DB);
 		return PASSDB_RESULT_USER_UNKNOWN;
 	} else {
-		auth_request_log_debug(auth_request, "dict",
-				       "result: %s", value);
-		if (dict_query_save_results(auth_request, module->conn, value) < 0)
+		if (dict_query_save_results(auth_request, module->conn, iter) < 0)
 			return PASSDB_RESULT_INTERNAL_FAILURE;
 
 		if (auth_request->passdb_password == NULL &&
 		    !auth_fields_exists(auth_request->extra_fields, "nopassword")) {
-			auth_request_log_info(auth_request, "dict",
+			auth_request_log_info(auth_request, AUTH_SUBSYS_DB,
 				"No password returned (and no nopassword)");
 			return PASSDB_RESULT_PASSWORD_MISMATCH;
 		} else {
@@ -89,23 +84,17 @@ static void passdb_dict_lookup_pass(struct passdb_dict_request *dict_request)
 	struct passdb_module *_module = auth_request->passdb->passdb;
 	struct dict_passdb_module *module =
 		(struct dict_passdb_module *)_module;
-	string_t *key;
 	const char *password = NULL, *scheme = NULL;
 	enum passdb_result passdb_result;
 	int ret;
 
-	key = t_str_new(512);
-	str_append(key, DICT_PATH_SHARED);
-	var_expand(key, module->conn->set.password_key,
-		   auth_request_get_var_expand_table(auth_request, NULL));
-
-	if (*module->conn->set.password_key == '\0') {
-		auth_request_log_error(auth_request, "dict",
-				       "password_key not specified");
+	if (array_count(&module->conn->set.passdb_fields) == 0 &&
+	    array_count(&module->conn->set.parsed_passdb_objects) == 0) {
+		auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
+			"No passdb_objects or passdb_fields specified");
 		passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
 	} else {
-		passdb_result = passdb_dict_lookup_key(auth_request, module,
-						       str_c(key));
+		passdb_result = passdb_dict_lookup_key(auth_request, module);
 	}
 
 	if (passdb_result == PASSDB_RESULT_OK) {
@@ -125,7 +114,7 @@ static void passdb_dict_lookup_pass(struct passdb_dict_request *dict_request)
 		if (password != NULL) {
 			ret = auth_request_password_verify(auth_request,
 					auth_request->mech_password,
-					password, scheme, "dict");
+					password, scheme, AUTH_SUBSYS_DB);
 			passdb_result = ret > 0 ? PASSDB_RESULT_OK :
 				PASSDB_RESULT_PASSWORD_MISMATCH;
 		}
@@ -170,8 +159,9 @@ passdb_dict_preinit(pool_t pool, const char *args)
 	module->conn = conn = db_dict_init(args);
 
 	module->module.blocking = TRUE;
-	module->module.cache_key =
-		auth_cache_parse_key(pool, conn->set.password_key);
+	module->module.default_cache_key = auth_cache_parse_key(pool,
+		db_dict_parse_cache_key(&conn->set.keys, &conn->set.passdb_fields,
+					&conn->set.parsed_passdb_objects));
 	module->module.default_pass_scheme = conn->set.default_pass_scheme;
 	return &module->module;
 }

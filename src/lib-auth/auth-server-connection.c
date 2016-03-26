@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -14,7 +14,6 @@
 #include "auth-server-connection.h"
 
 #include <unistd.h>
-#include <stdlib.h>
 
 #define AUTH_SERVER_CONN_MAX_LINE_LENGTH AUTH_CLIENT_MAX_LINE_LENGTH
 #define AUTH_HANDSHAKE_TIMEOUT (30*1000)
@@ -269,7 +268,7 @@ static void auth_server_connection_input(struct auth_server_connection *conn)
 			i_error("Authentication server not compatible with "
 				"this client (mixed old and new binaries?)");
 			auth_server_connection_disconnect(conn,
-				"incompatible serevr");
+				"incompatible server");
 			return;
 		}
 		conn->version_received = TRUE;
@@ -476,6 +475,7 @@ auth_server_connection_add_request(struct auth_server_connection *conn,
 		/* wrapped - ID 0 not allowed */
 		id = ++conn->client->request_id_counter;
 	}
+	i_assert(hash_table_lookup(conn->requests, POINTER_CAST(id)) == NULL);
 	hash_table_insert(conn->requests, POINTER_CAST(id), request);
 	return id;
 }

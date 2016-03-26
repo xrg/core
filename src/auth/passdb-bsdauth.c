@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "passdb.h"
@@ -21,16 +21,16 @@ bsdauth_verify_plain(struct auth_request *request, const char *password,
 	const char *type;
 	int result;
 
-	auth_request_log_debug(request, "bsdauth", "lookup");
+	auth_request_log_debug(request, AUTH_SUBSYS_DB, "lookup");
 
 	switch (i_getpwnam(request->user, &pw)) {
 	case -1:
-		auth_request_log_error(request, "bsdauth",
+		auth_request_log_error(request, AUTH_SUBSYS_DB,
 				       "getpwnam() failed: %m");
 		callback(PASSDB_RESULT_INTERNAL_FAILURE, request);
 		return;
 	case 0:
-		auth_request_log_unknown_user(request, "bsdauth");
+		auth_request_log_unknown_user(request, AUTH_SUBSYS_DB);
 		callback(PASSDB_RESULT_USER_UNKNOWN, request);
 		return;
 	}
@@ -44,7 +44,7 @@ bsdauth_verify_plain(struct auth_request *request, const char *password,
 	safe_memset(pw.pw_passwd, 0, strlen(pw.pw_passwd));
 
 	if (result == 0) {
-		auth_request_log_password_mismatch(request, "bsdauth");
+		auth_request_log_password_mismatch(request, AUTH_SUBSYS_DB);
 		callback(PASSDB_RESULT_PASSWORD_MISMATCH, request);
 		return;
 	}
@@ -67,7 +67,7 @@ bsdauth_preinit(pool_t pool, const char *args)
 	if (strcmp(args, "blocking=no") == 0)
 		module->blocking = FALSE;
 	else if (strncmp(args, "cache_key=", 10) == 0)
-		module->cache_key = auth_cache_parse_key(pool, args + 10);
+		module->default_cache_key = auth_cache_parse_key(pool, args + 10);
 	else if (*args != '\0')
 		i_fatal("passdb bsdauth: Unknown setting: %s", args);
 	return module;

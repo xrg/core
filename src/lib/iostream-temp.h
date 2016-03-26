@@ -12,8 +12,16 @@ enum iostream_temp_flags {
    memory, and later to a temporary file that is immediately unlinked. */
 struct ostream *iostream_temp_create(const char *temp_path_prefix,
 				     enum iostream_temp_flags flags);
+struct ostream *iostream_temp_create_named(const char *temp_path_prefix,
+					   enum iostream_temp_flags flags,
+					   const char *name);
+struct ostream *iostream_temp_create_sized(const char *temp_path_prefix,
+					   enum iostream_temp_flags flags,
+					   const char *name,
+					   size_t max_mem_size);
 /* Finished writing to stream. Return input stream for it and free the
-   output stream. */
+   output stream. (It's also possible to abort iostream-temp by simply
+   destroying the ostream.) */
 struct istream *iostream_temp_finish(struct ostream **output,
 				     size_t max_buffer_size);
 

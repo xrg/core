@@ -1,4 +1,4 @@
-/* Copyright (c) 2007-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2007-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -18,7 +18,6 @@
 #include "sdbox-file.h"
 #include "sdbox-sync.h"
 
-#include <stdlib.h>
 
 struct sdbox_save_context {
 	struct dbox_save_context ctx;
@@ -38,7 +37,7 @@ sdbox_save_file_get_file(struct mailbox_transaction_context *t, uint32_t seq)
 {
 	struct sdbox_save_context *ctx =
 		(struct sdbox_save_context *)t->save_ctx;
-	struct dbox_file *const *files;
+	struct dbox_file *const *files, *file;
 	unsigned int count;
 
 	i_assert(seq >= ctx->first_saved_seq);
@@ -47,7 +46,9 @@ sdbox_save_file_get_file(struct mailbox_transaction_context *t, uint32_t seq)
 	i_assert(count > 0);
 	i_assert(seq - ctx->first_saved_seq < count);
 
-	return files[seq - ctx->first_saved_seq];
+	file = files[seq - ctx->first_saved_seq];
+	i_assert(((struct sdbox_file *)file)->written_to_disk);
+	return file;
 }
 
 struct mail_save_context *
@@ -144,6 +145,7 @@ static int dbox_save_mail_write_metadata(struct dbox_save_context *ctx,
 		dbox_file_set_syscall_error(file, "pwrite()");
 		return -1;
 	}
+	sfile->written_to_disk = TRUE;
 
 	/* remember the attachment paths until commit time */
 	extrefs_arr = index_attachment_save_get_extrefs(&ctx->ctx);

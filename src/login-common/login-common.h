@@ -2,6 +2,7 @@
 #define LOGIN_COMMON_H
 
 #include "lib.h"
+#include "net.h"
 #include "login-settings.h"
 
 /* Used only for string sanitization */
@@ -22,9 +23,9 @@ struct login_binary {
 	const char *process_name;
 
 	/* e.g. 143, 110 */
-	unsigned int default_port;
+	in_port_t default_port;
 	/* e.g. 993, 995. if there is no ssl port, use 0. */
-	unsigned int default_ssl_port;
+	in_port_t default_ssl_port;
 
 	/* if value is NULL, LOGIN_DEFAULT_SOCKET is used as the default */
 	const char *default_login_socket;
@@ -37,10 +38,15 @@ struct login_binary {
 	bool sasl_support_final_reply;
 };
 
+struct login_module_register {
+	unsigned int id;
+};
+extern struct login_module_register login_module_register;
+
 extern const struct login_binary *login_binary;
 extern struct auth_client *auth_client;
 extern struct master_auth *master_auth;
-extern bool closing_down;
+extern bool closing_down, login_debug;
 extern struct anvil_client *anvil;
 extern const char *login_rawlog_dir;
 extern unsigned int initial_service_count;
@@ -48,6 +54,9 @@ extern unsigned int initial_service_count;
 extern const struct login_settings *global_login_settings;
 extern const struct master_service_ssl_settings *global_ssl_settings;
 extern void **global_other_settings;
+
+extern const struct ip_addr *login_source_ips;
+extern unsigned int login_source_ips_idx, login_source_ips_count;
 
 void login_refresh_proctitle(void);
 void login_client_destroyed(void);

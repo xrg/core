@@ -1,4 +1,4 @@
-/* Copyright (c) 2006-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2006-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -10,7 +10,6 @@
 #include "index-storage.h"
 #include "index-sort-private.h"
 
-#include <stdlib.h>
 
 struct mail_sort_node_date {
 	uint32_t seq;
@@ -393,7 +392,7 @@ get_display_name(struct mail *mail, const char *header, const char **name_r)
 
 		str = t_str_new(len*2);
 		(void)message_header_decode_utf8(
-			(const unsigned char *)addr->name, len, str, FALSE);
+			(const unsigned char *)addr->name, len, str, NULL);
 		if (str_len(str) > 0) {
 			*name_r = str_c(str);
 			return 0;

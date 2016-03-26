@@ -1,12 +1,11 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "restrict-process-size.h"
+#include "auth-request-stats.h"
 #include "password-scheme.h"
 #include "passdb.h"
 #include "passdb-cache.h"
-
-#include <stdlib.h>
 
 struct auth_cache *passdb_cache = NULL;
 
@@ -21,34 +20,54 @@ passdb_cache_log_hit(struct auth_request *request, const char *value)
 		p = strchr(value, '\t');
 		value = t_strconcat(PASSWORD_HIDDEN_STR, p, NULL);
 	}
-	auth_request_log_debug(request, "cache", "hit: %s", value);
+	auth_request_log_debug(request, AUTH_SUBSYS_DB, "cache hit: %s", value);
+}
+
+static bool
+passdb_cache_lookup(struct auth_request *request, const char *key,
+		    bool use_expired, struct auth_cache_node **node_r,
+		    const char **value_r, bool *neg_expired_r)
+{
+	struct auth_stats *stats = auth_request_stats_get(request);
+	const char *value;
+	bool expired;
+
+	/* value = password \t ... */
+	value = auth_cache_lookup(passdb_cache, request, key, node_r,
+				  &expired, neg_expired_r);
+	if (value == NULL || (expired && !use_expired)) {
+		stats->auth_cache_miss_count++;
+		auth_request_log_debug(request, AUTH_SUBSYS_DB,
+				       value == NULL ? "cache miss" :
+				       "cache expired");
+		return FALSE;
+	}
+	stats->auth_cache_hit_count++;
+	passdb_cache_log_hit(request, value);
+
+	*value_r = value;
+	return TRUE;
 }
 
 bool passdb_cache_verify_plain(struct auth_request *request, const char *key,
 			       const char *password,
-			       enum passdb_result *result_r, int use_expired)
+			       enum passdb_result *result_r, bool use_expired)
 {
 	const char *value, *cached_pw, *scheme, *const *list;
 	struct auth_cache_node *node;
 	int ret;
-	bool expired, neg_expired;
+	bool neg_expired;
 
-	if (passdb_cache == NULL || key == NULL || request->master_user != NULL)
+	if (passdb_cache == NULL || key == NULL)
 		return FALSE;
 
-	/* value = password \t ... */
-	value = auth_cache_lookup(passdb_cache, request, key, &node,
-				  &expired, &neg_expired);
-	if (value == NULL || (expired && !use_expired)) {
-		auth_request_log_debug(request, "cache",
-				       value == NULL ? "miss" : "expired");
+	if (!passdb_cache_lookup(request, key, use_expired,
+				 &node, &value, &neg_expired))
 		return FALSE;
-	}
-	passdb_cache_log_hit(request, value);
 
 	if (*value == '\0') {
 		/* negative cache entry */
-		auth_request_log_unknown_user(request, "cache");
+		auth_request_log_unknown_user(request, AUTH_SUBSYS_DB);
 		*result_r = PASSDB_RESULT_USER_UNKNOWN;
 		return TRUE;
 	}
@@ -58,14 +77,15 @@ bool passdb_cache_verify_plain(struct auth_request *request, const char *key,
 	cached_pw = list[0];
 	if (*cached_pw == '\0') {
 		/* NULL password */
-		auth_request_log_info(request, "cache", "NULL password access");
+		auth_request_log_info(request, AUTH_SUBSYS_DB,
+				      "Cached NULL password access");
 		ret = 1;
 	} else {
 		scheme = password_get_scheme(&cached_pw);
 		i_assert(scheme != NULL);
 
 		ret = auth_request_password_verify(request, password, cached_pw,
-						   scheme, "cache");
+						   scheme, AUTH_SUBSYS_DB);
 
 		if (ret == 0 && (node->last_success || neg_expired)) {
 			/* a) the last authentication was successful. assume
@@ -95,19 +115,14 @@ bool passdb_cache_lookup_credentials(struct auth_request *request,
 {
 	const char *value, *const *list;
 	struct auth_cache_node *node;
-	bool expired, neg_expired;
+	bool neg_expired;
 
-	if (passdb_cache == NULL || request->master_user != NULL)
+	if (passdb_cache == NULL)
 		return FALSE;
 
-	value = auth_cache_lookup(passdb_cache, request, key, &node,
-				  &expired, &neg_expired);
-	if (value == NULL || (expired && !use_expired)) {
-		auth_request_log_debug(request, "cache",
-				       value == NULL ? "miss" : "expired");
+	if (!passdb_cache_lookup(request, key, use_expired,
+				 &node, &value, &neg_expired))
 		return FALSE;
-	}
-	passdb_cache_log_hit(request, value);
 
 	if (*value == '\0') {
 		/* negative cache entry */

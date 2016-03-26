@@ -36,6 +36,7 @@ struct mail_index_flag_update {
 };
 
 struct mail_index_transaction {
+	struct mail_index_transaction *prev, *next;
 	int refcount;
 
 	enum mail_index_transaction_flags flags;
@@ -92,6 +93,7 @@ struct mail_index_transaction {
 	unsigned int index_deleted:1;
 	unsigned int index_undeleted:1;
 	unsigned int commit_deleted_index:1;
+	unsigned int tail_offset_changed:1;
 	/* non-extension updates. flag updates don't change this because
 	   they may be added and removed, so be sure to check that the updates
 	   array is non-empty also. */

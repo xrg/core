@@ -1,8 +1,9 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
 #include "buffer.h"
+#include "llist.h"
 #include "mail-index-view-private.h"
 #include "mail-transaction-log.h"
 
@@ -47,7 +48,7 @@ void mail_index_view_clone(struct mail_index_view *dest,
 	i_array_init(&dest->module_contexts,
 		     I_MIN(5, mail_index_module_register.id));
 
-	dest->index->view_count++;
+	DLLIST_PREPEND(&dest->index->views, dest);
 }
 
 void mail_index_view_ref(struct mail_index_view *view)
@@ -58,9 +59,9 @@ void mail_index_view_ref(struct mail_index_view *view)
 static void view_close(struct mail_index_view *view)
 {
 	i_assert(view->refcount == 0);
-	i_assert(view->index->view_count > 0);
+	i_assert(view->index->views != NULL);
 
-	view->index->view_count--;
+	DLLIST_REMOVE(&view->index->views, view);
 
 	mail_transaction_log_view_close(&view->log_view);
 
@@ -169,7 +170,7 @@ view_lookup_full(struct mail_index_view *view, uint32_t seq,
 	i_assert(seq > 0 && seq <= mail_index_view_get_messages_count(view));
 
 	/* look up the record */
-	rec = MAIL_INDEX_MAP_IDX(view->map, seq-1);
+	rec = MAIL_INDEX_REC_AT_SEQ(view->map, seq);
 	if (unlikely(rec->uid == 0)) {
 		if (!view->inconsistent) {
 			mail_index_set_error(view->index,
@@ -214,11 +215,10 @@ view_lookup_full(struct mail_index_view *view, uint32_t seq,
 
 	map = view->index->map;
 	do {
-		seq--;
-		head_rec = MAIL_INDEX_MAP_IDX(map, seq);
+		head_rec = MAIL_INDEX_REC_AT_SEQ(map, seq);
 		if (head_rec->uid <= rec->uid)
 			break;
-	} while (seq > 0);
+	} while (--seq > 0);
 
 	if (head_rec->uid == rec->uid) {
 		/* found it. use it. reference the index mapping so that the
@@ -242,7 +242,7 @@ static void view_lookup_uid(struct mail_index_view *view, uint32_t seq,
 {
 	i_assert(seq > 0 && seq <= mail_index_view_get_messages_count(view));
 
-	*uid_r = MAIL_INDEX_MAP_IDX(view->map, seq-1)->uid;
+	*uid_r = MAIL_INDEX_REC_AT_SEQ(view->map, seq)->uid;
 }
 
 static void view_lookup_seq_range(struct mail_index_view *view,
@@ -280,7 +280,7 @@ static void view_lookup_first(struct mail_index_view *view,
 
 	i_assert(hdr->messages_count <= view->map->rec_map->records_count);
 	for (; seq <= hdr->messages_count; seq++) {
-		rec = MAIL_INDEX_MAP_IDX(view->map, seq-1);
+		rec = MAIL_INDEX_REC_AT_SEQ(view->map, seq);
 		if ((rec->flags & flags_mask) == (uint8_t)flags) {
 			*seq_r = seq;
 			break;
@@ -469,7 +469,7 @@ void mail_index_map_lookup_keywords(struct mail_index_map *map, uint32_t seq,
 	if (!mail_index_map_get_ext_idx(map, map->index->keywords_ext_id, &idx))
 		data = NULL;
 	else {
-		rec = MAIL_INDEX_MAP_IDX(map, seq-1);
+		rec = MAIL_INDEX_REC_AT_SEQ(map, seq);
 		ext = array_idx(&map->extensions, idx);
 		data = ext->record_offset == 0 ? NULL :
 			CONST_PTR_OFFSET(rec, ext->record_offset);
@@ -492,7 +492,7 @@ void mail_index_lookup_view_flags(struct mail_index_view *view, uint32_t seq,
 
 	i_assert(seq > 0 && seq <= mail_index_view_get_messages_count(view));
 
-	rec = MAIL_INDEX_MAP_IDX(view->map, seq-1);
+	rec = MAIL_INDEX_REC_AT_SEQ(view->map, seq);
 	*flags_r = rec->flags;
 
 	keyword_data = view_map_lookup_ext_full(view->map, rec,
@@ -626,8 +626,7 @@ mail_index_view_open_with_map(struct mail_index *index,
 
 	i_array_init(&view->module_contexts,
 		     I_MIN(5, mail_index_module_register.id));
-
-	index->view_count++;
+	DLLIST_PREPEND(&index->views, view);
 	return view;
 }
 

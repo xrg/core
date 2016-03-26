@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 #include "auth-common.h"
 #include "passdb.h"
@@ -8,13 +8,11 @@
 #include "ioloop.h"
 #include "array.h"
 #include "str.h"
-#include "var-expand.h"
 #include "password-scheme.h"
 #include "auth-cache.h"
 #include "db-ldap.h"
 
 #include <ldap.h>
-#include <stdlib.h>
 
 struct ldap_passdb_module {
 	struct passdb_module module;
@@ -36,6 +34,7 @@ struct passdb_ldap_request {
 	} callback;
 
 	unsigned int entries;
+	bool require_password;
 };
 
 static void
@@ -54,7 +53,7 @@ ldap_query_save_result(struct ldap_connection *conn,
 			continue;
 		}
 		if (values[1] != NULL) {
-			auth_request_log_warning(auth_request, "ldap",
+			auth_request_log_warning(auth_request, AUTH_SUBSYS_DB,
 				"Multiple values found for '%s', "
 				"using value '%s'", name, values[0]);
 		}
@@ -77,14 +76,15 @@ ldap_lookup_finish(struct auth_request *auth_request,
 		passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
 	} else if (ldap_request->entries == 0) {
 		passdb_result = PASSDB_RESULT_USER_UNKNOWN;
-		auth_request_log_unknown_user(auth_request, "ldap");
+		auth_request_log_unknown_user(auth_request, AUTH_SUBSYS_DB);
 	} else if (ldap_request->entries > 1) {
-		auth_request_log_error(auth_request, "ldap",
+		auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 			"pass_filter matched multiple objects, aborting");
 		passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
 	} else if (auth_request->passdb_password == NULL &&
+		   ldap_request->require_password &&
 		   !auth_fields_exists(auth_request->extra_fields, "nopassword")) {
-		auth_request_log_info(auth_request, "ldap",
+		auth_request_log_info(auth_request, AUTH_SUBSYS_DB,
 			"No password returned (and no nopassword)");
 		passdb_result = PASSDB_RESULT_PASSWORD_MISMATCH;
 	} else {
@@ -106,7 +106,7 @@ ldap_lookup_finish(struct auth_request *auth_request,
 		if (password != NULL) {
 			ret = auth_request_password_verify(auth_request,
 					auth_request->mech_password,
-					password, scheme, "ldap");
+					password, scheme, AUTH_SUBSYS_DB);
 			passdb_result = ret > 0 ? PASSDB_RESULT_OK :
 				PASSDB_RESULT_PASSWORD_MISMATCH;
 		}
@@ -161,13 +161,15 @@ ldap_auth_bind_callback(struct ldap_connection *conn,
 						  auth_request->mech_password,
 						  ")", NULL);
 			}
-			auth_request_log_info(auth_request, "ldap", "%s", str);
+			auth_request_log_info(auth_request, AUTH_SUBSYS_DB,
+					      "%s", str);
 			passdb_result = PASSDB_RESULT_PASSWORD_MISMATCH;
 		} else if (ret == LDAP_NO_SUCH_OBJECT) {
 			passdb_result = PASSDB_RESULT_USER_UNKNOWN;
-			auth_request_log_unknown_user(auth_request, "ldap");
+			auth_request_log_unknown_user(auth_request,
+						      AUTH_SUBSYS_DB);
 		} else {
-			auth_request_log_error(auth_request, "ldap",
+			auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 					       "ldap_bind() failed: %s",
 					       ldap_err2string(ret));
 		}
@@ -189,7 +191,7 @@ static void ldap_auth_bind(struct ldap_connection *conn,
 		/* Assume that empty password fails. This is especially
 		   important with Windows 2003 AD, which always returns success
 		   with empty passwords. */
-		auth_request_log_info(auth_request, "ldap",
+		auth_request_log_info(auth_request, AUTH_SUBSYS_DB,
 				      "Login attempt with empty password");
 		passdb_ldap_request->callback.
 			verify_plain(PASSDB_RESULT_PASSWORD_MISMATCH,
@@ -212,10 +214,10 @@ ldap_bind_lookup_dn_fail(struct auth_request *auth_request,
 		passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
 	else if (request->entries == 0) {
 		passdb_result = PASSDB_RESULT_USER_UNKNOWN;
-		auth_request_log_unknown_user(auth_request, "ldap");
+		auth_request_log_unknown_user(auth_request, AUTH_SUBSYS_DB);
 	} else {
 		i_assert(request->entries > 1);
-		auth_request_log_error(auth_request, "ldap",
+		auth_request_log_error(auth_request, AUTH_SUBSYS_DB,
 			"pass_filter matched multiple objects, aborting");
 		passdb_result = PASSDB_RESULT_INTERNAL_FAILURE;
 	}
@@ -236,7 +238,7 @@ static void ldap_bind_lookup_dn_callback(struct ldap_connection *conn,
 	struct passdb_ldap_request *passdb_ldap_request =
 		(struct passdb_ldap_request *)ldap_request;
 	struct auth_request *auth_request = ldap_request->auth_request;
-	struct ldap_request_bind *brequest;
+	struct passdb_ldap_request *brequest;
 	char *dn;
 
 	if (res != NULL && ldap_msgtype(res) == LDAP_RES_SEARCH_ENTRY) {
@@ -256,44 +258,53 @@ static void ldap_bind_lookup_dn_callback(struct ldap_connection *conn,
 	} else if (res == NULL || passdb_ldap_request->entries != 1) {
 		/* failure */
 		ldap_bind_lookup_dn_fail(auth_request, passdb_ldap_request, res);
+	} else if (auth_request->skip_password_check) {
+		/* we've already verified that the password matched -
+		   we just wanted to get any extra fields */
+		passdb_ldap_request->callback.
+			verify_plain(PASSDB_RESULT_OK, auth_request);
+		auth_request_unref(&auth_request);
 	} else {
-		/* convert search request to bind request */
-		brequest = &passdb_ldap_request->request.bind;
-		memset(brequest, 0, sizeof(*brequest));
-		brequest->request.type = LDAP_REQUEST_TYPE_BIND;
-		brequest->request.auth_request = auth_request;
+		/* create a new bind request */
+		brequest = p_new(auth_request->pool,
+				 struct passdb_ldap_request, 1);
 		brequest->dn = passdb_ldap_request->dn;
+		brequest->callback = passdb_ldap_request->callback;
+		brequest->request.bind.dn = brequest->dn;
+		brequest->request.bind.request.type = LDAP_REQUEST_TYPE_BIND;
+		brequest->request.bind.request.auth_request = auth_request;
 
-		ldap_auth_bind(conn, brequest);
+		ldap_auth_bind(conn, &brequest->request.bind);
 	}
 }
 
 static void ldap_lookup_pass(struct auth_request *auth_request,
-			     struct passdb_ldap_request *request)
+			     struct passdb_ldap_request *request,
+			     bool require_password)
 {
 	struct passdb_module *_module = auth_request->passdb->passdb;
 	struct ldap_passdb_module *module =
 		(struct ldap_passdb_module *)_module;
 	struct ldap_connection *conn = module->conn;
 	struct ldap_request_search *srequest = &request->request.search;
-	const struct var_expand_table *vars;
 	const char **attr_names = (const char **)conn->pass_attr_names;
 	string_t *str;
 
+	request->require_password = require_password;
 	srequest->request.type = LDAP_REQUEST_TYPE_SEARCH;
-	vars = auth_request_get_var_expand_table(auth_request, ldap_escape);
 
 	str = t_str_new(512);
-	var_expand(str, conn->set.base, vars);
+	auth_request_var_expand(str, conn->set.base, auth_request, ldap_escape);
 	srequest->base = p_strdup(auth_request->pool, str_c(str));
 
 	str_truncate(str, 0);
-	var_expand(str, conn->set.pass_filter, vars);
+	auth_request_var_expand(str, conn->set.pass_filter,
+				auth_request, ldap_escape);
 	srequest->filter = p_strdup(auth_request->pool, str_c(str));
 	srequest->attr_map = &conn->pass_attr_map;
 	srequest->attributes = conn->pass_attr_names;
 
-	auth_request_log_debug(auth_request, "ldap", "pass search: "
+	auth_request_log_debug(auth_request, AUTH_SUBSYS_DB, "pass search: "
 			       "base=%s scope=%s filter=%s fields=%s",
 			       srequest->base, conn->set.scope,
 			       srequest->filter, attr_names == NULL ? "(all)" :
@@ -311,18 +322,17 @@ static void ldap_bind_lookup_dn(struct auth_request *auth_request,
 		(struct ldap_passdb_module *)_module;
 	struct ldap_connection *conn = module->conn;
 	struct ldap_request_search *srequest = &request->request.search;
-	const struct var_expand_table *vars;
 	string_t *str;
 
 	srequest->request.type = LDAP_REQUEST_TYPE_SEARCH;
-	vars = auth_request_get_var_expand_table(auth_request, ldap_escape);
 
 	str = t_str_new(512);
-	var_expand(str, conn->set.base, vars);
+	auth_request_var_expand(str, conn->set.base, auth_request, ldap_escape);
 	srequest->base = p_strdup(auth_request->pool, str_c(str));
 
 	str_truncate(str, 0);
-	var_expand(str, conn->set.pass_filter, vars);
+	auth_request_var_expand(str, conn->set.pass_filter,
+				auth_request, ldap_escape);
 	srequest->filter = p_strdup(auth_request->pool, str_c(str));
 
 	/* we don't need the attributes to perform authentication, but they
@@ -331,7 +341,7 @@ static void ldap_bind_lookup_dn(struct auth_request *auth_request,
 	srequest->attr_map = &conn->pass_attr_map;
 	srequest->attributes = conn->pass_attr_names;
 
-	auth_request_log_debug(auth_request, "ldap",
+	auth_request_log_debug(auth_request, AUTH_SUBSYS_DB,
 			       "bind search: base=%s filter=%s",
 			       srequest->base, srequest->filter);
 
@@ -348,14 +358,12 @@ ldap_verify_plain_auth_bind_userdn(struct auth_request *auth_request,
 		(struct ldap_passdb_module *)_module;
 	struct ldap_connection *conn = module->conn;
 	struct ldap_request_bind *brequest = &request->request.bind;
-        const struct var_expand_table *vars;
 	string_t *dn;
 
 	brequest->request.type = LDAP_REQUEST_TYPE_BIND;
 
-	vars = auth_request_get_var_expand_table(auth_request, ldap_escape);
 	dn = t_str_new(512);
-	var_expand(dn, conn->set.auth_bind_userdn, vars);
+	auth_request_var_expand(dn, conn->set.auth_bind_userdn, auth_request, ldap_escape);
 
 	brequest->dn = p_strdup(auth_request->pool, str_c(dn));
         ldap_auth_bind(conn, brequest);
@@ -386,7 +394,7 @@ ldap_verify_plain(struct auth_request *request,
 	ldap_request->request.ldap.auth_request = request;
 
 	if (!conn->set.auth_bind)
-		ldap_lookup_pass(request, ldap_request);
+		ldap_lookup_pass(request, ldap_request, TRUE);
 	else if (conn->set.auth_bind_userdn == NULL)
 		ldap_bind_lookup_dn(request, ldap_request);
 	else
@@ -396,7 +404,11 @@ ldap_verify_plain(struct auth_request *request,
 static void ldap_lookup_credentials(struct auth_request *request,
 				    lookup_credentials_callback_t *callback)
 {
+	struct passdb_module *_module = request->passdb->passdb;
+	struct ldap_passdb_module *module =
+		(struct ldap_passdb_module *)_module;
 	struct passdb_ldap_request *ldap_request;
+	bool require_password;
 
 	ldap_request = p_new(request->pool, struct passdb_ldap_request, 1);
 	ldap_request->callback.lookup_credentials = callback;
@@ -404,7 +416,11 @@ static void ldap_lookup_credentials(struct auth_request *request,
 	auth_request_ref(request);
 	ldap_request->request.ldap.auth_request = request;
 
-        ldap_lookup_pass(request, ldap_request);
+	/* with auth_bind=yes we don't necessarily have a password.
+	   this will fail actual password credentials lookups, but it's fine
+	   for passdb lookups done by lmtp/doveadm */
+	require_password = !module->conn->set.auth_bind;
+        ldap_lookup_pass(request, ldap_request, require_password);
 }
 
 static struct passdb_module *
@@ -419,9 +435,11 @@ passdb_ldap_preinit(pool_t pool, const char *args)
 	db_ldap_set_attrs(conn, conn->set.pass_attrs, &conn->pass_attr_names,
 			  &conn->pass_attr_map,
 			  conn->set.auth_bind ? "password" : NULL);
-	module->module.cache_key =
+	module->module.blocking = conn->set.blocking;
+	module->module.default_cache_key =
 		auth_cache_parse_key(pool,
 				     t_strconcat(conn->set.base,
+						 conn->set.pass_attrs,
 						 conn->set.pass_filter, NULL));
 	module->module.default_pass_scheme = conn->set.default_pass_scheme;
 	return &module->module;
@@ -432,12 +450,7 @@ static void passdb_ldap_init(struct passdb_module *_module)
 	struct ldap_passdb_module *module =
 		(struct ldap_passdb_module *)_module;
 
-	(void)db_ldap_connect(module->conn);
-
-	if (module->conn->set.auth_bind) {
-		/* Credential lookups can't be done with authentication binds */
-		_module->iface.lookup_credentials = NULL;
-	}
+	db_ldap_connect_delayed(module->conn);
 }
 
 static void passdb_ldap_deinit(struct passdb_module *_module)

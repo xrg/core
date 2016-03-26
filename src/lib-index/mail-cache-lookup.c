@@ -1,4 +1,4 @@
-/* Copyright (c) 2003-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2003-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -6,7 +6,6 @@
 #include "str.h"
 #include "mail-cache-private.h"
 
-#include <stdlib.h>
 
 #define CACHE_PREFETCH IO_BLOCK_SIZE
 
@@ -191,15 +190,17 @@ mail_cache_lookup_iter_next_record(struct mail_cache_lookup_iterate_ctx *ctx)
 	if (ctx->offset == 0) {
 		/* end of this record list. check newly appended data. */
 		if (view->trans_seq1 > ctx->seq ||
-		    view->trans_seq2 < ctx->seq ||
-		    MAIL_CACHE_IS_UNUSABLE(view->cache))
+		    view->trans_seq2 < ctx->seq)
 			return 0;
-		/* check data still in memory */
+		/* check data still in memory. this works for recent mails
+		   even with INDEX=MEMORY */
 		if (!ctx->memory_appends_checked) {
 			if (mail_cache_lookup_iter_transaction(ctx))
 				return 1;
 			ctx->memory_appends_checked = TRUE;
 		}
+		if (MAIL_CACHE_IS_UNUSABLE(view->cache))
+			return 0;
 
 		/* check data already written to cache file */
 		if (ctx->disk_appends_checked ||
@@ -540,7 +541,7 @@ mail_cache_lookup_headers_real(struct mail_cache_view *view, string_t *dest,
 	/* lookup the fields */
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.view = view;
-	ctx.pool = *pool_r = pool_alloconly_create("mail cache headers", 1024);
+	ctx.pool = *pool_r = pool_alloconly_create(MEMPOOL_GROWING"mail cache headers", 1024);
 	t_array_init(&ctx.lines, 32);
 
 	mail_cache_lookup_iter_init(view, seq, &iter);

@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 /* doc/thread-refs.txt describes the incremental algorithm we use here. */
 
@@ -13,7 +13,6 @@
 #include "index-storage.h"
 #include "index-thread-private.h"
 
-#include <stdlib.h>
 
 #define MAIL_THREAD_CONTEXT(obj) \
 	MODULE_CONTEXT(obj, mail_thread_storage_module)

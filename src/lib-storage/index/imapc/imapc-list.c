@@ -1,6 +1,7 @@
-/* Copyright (c) 2011-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2011-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
+#include "ioloop.h"
 #include "str.h"
 #include "imap-arg.h"
 #include "imap-match.h"
@@ -65,7 +66,6 @@ static struct mailbox_list *imapc_list_alloc(void)
 static int imapc_list_init(struct mailbox_list *_list, const char **error_r)
 {
 	struct imapc_mailbox_list *list = (struct imapc_mailbox_list *)_list;
-	char sep;
 
 	list->set = mail_user_set_get_driver_settings(_list->ns->user->set_info,
 						      _list->ns->user->set,
@@ -80,17 +80,6 @@ static int imapc_list_init(struct mailbox_list *_list, const char **error_r)
 	imapc_storage_client_register_untagged(list->client, "LSUB",
 					       imapc_untagged_lsub);
 	imapc_list_send_hierarcy_sep_lookup(list);
-	if ((_list->ns->flags & NAMESPACE_FLAG_INBOX_USER) != 0) {
-		/* we're using imapc for the INBOX namespace. wait and make
-		   sure we can successfully access the IMAP server (so if the
-		   username is invalid we don't just keep failing every
-		   command). */
-		if (imapc_list_try_get_root_sep(list, &sep) < 0) {
-			imapc_storage_client_unref(&list->client);
-			*error_r = "Failed to access imapc backend";
-			return -1;
-		}
-	}
 	return 0;
 }
 
@@ -101,6 +90,7 @@ static void imapc_list_deinit(struct mailbox_list *_list)
 	/* make sure all pending commands are aborted before anything is
 	   deinitialized */
 	if (list->client != NULL) {
+		list->client->destroying = TRUE;
 		imapc_client_disconnect(list->client->client);
 		imapc_storage_client_unref(&list->client);
 	}
@@ -139,6 +129,8 @@ static void imapc_list_simple_callback(const struct imapc_command_reply *reply,
 		imapc_list_copy_error_from_reply(ctx->client->_list,
 						 MAIL_ERROR_PARAMS, reply);
 		ctx->ret = -1;
+	} else if (ctx->client->auth_failed) {
+		ctx->ret = -1;
 	} else {
 		mailbox_list_set_critical(&ctx->client->_list->list,
 			"imapc: Command failed: %s", reply->text_full);
@@ -159,6 +151,28 @@ imap_list_flag_parse(const char *str, enum mailbox_info_flags *flag_r)
 		}
 	}
 	return FALSE;
+}
+
+static const char *
+imapc_list_to_vname(struct imapc_mailbox_list *list, const char *imapc_name)
+{
+	const char *list_name;
+
+	/* typically mailbox_list_escape_name() is used to escape vname into
+	   a list name. but we want to convert remote IMAP name to a list name,
+	   so we need to use the remote IMAP separator. */
+	list_name = mailbox_list_escape_name_params(imapc_name, "", list->root_sep,
+		mailbox_list_get_hierarchy_sep(&list->list),
+		list->list.set.escape_char, "");
+	/* list_name is now valid, so we can convert it to vname */
+	return mailbox_list_get_vname(&list->list, list_name);
+}
+
+const char *imapc_list_to_remote(struct imapc_mailbox_list *list, const char *name)
+{
+	return mailbox_list_unescape_name_params(name, "", list->root_sep,
+				mailbox_list_get_hierarchy_sep(&list->list),
+				list->list.set.escape_char);
 }
 
 static struct mailbox_node *
@@ -184,8 +198,7 @@ imapc_list_update_tree(struct imapc_mailbox_list *list,
 	}
 
 	T_BEGIN {
-		const char *vname =
-			mailbox_list_get_vname(&list->list, name);
+		const char *vname = imapc_list_to_vname(list, name);
 
 		if ((info_flags & MAILBOX_NONEXISTENT) != 0)
 			node = mailbox_tree_lookup(tree, vname);
@@ -269,6 +282,8 @@ static void imapc_storage_sep_callback(const struct imapc_command_reply *reply,
 		imapc_list_sep_verify(list);
 	else if (reply->state == IMAPC_COMMAND_STATE_NO)
 		imapc_list_copy_error_from_reply(list, MAIL_ERROR_PARAMS, reply);
+	else if (list->client->auth_failed)
+		;
 	else if (!list->list.ns->user->deinitializing) {
 		mailbox_list_set_critical(&list->list,
 			"imapc: Command failed: %s", reply->text_full);
@@ -292,6 +307,8 @@ static void imapc_list_send_hierarcy_sep_lookup(struct imapc_mailbox_list *list)
 int imapc_list_try_get_root_sep(struct imapc_mailbox_list *list, char *sep_r)
 {
 	if (list->root_sep == '\0') {
+		if (list->client->auth_failed)
+			return -1;
 		imapc_list_send_hierarcy_sep_lookup(list);
 		while (list->root_sep_pending)
 			imapc_client_run(list->client->client);
@@ -493,7 +510,8 @@ static void imapc_list_delete_unused_indexes(struct imapc_mailbox_list *list)
 				      MAILBOX_LIST_ITER_RETURN_NO_FLAGS);
 	while ((info = mailbox_list_iter_next(iter)) != NULL) T_BEGIN {
 		vname = info->vname;
-		if (imapc_list_prefix_len > 0) {
+		if (imapc_list_prefix_len > 0 &&
+		    strcasecmp(vname, "INBOX") != 0) {
 			/* skip over the namespace prefix */
 			i_assert(strncmp(vname, fs_list->ns->prefix,
 					 fs_list->ns->prefix_len) == 0);
@@ -564,6 +582,8 @@ static int imapc_list_refresh(struct imapc_mailbox_list *list)
 
 	if (ctx.ret == 0) {
 		list->refreshed_mailboxes = TRUE;
+		list->refreshed_mailboxes_recently = TRUE;
+		list->last_refreshed_mailboxes = ioloop_time;
 		imapc_list_delete_unused_indexes(list);
 	}
 	return ctx.ret;
@@ -660,7 +680,8 @@ imapc_list_write_special_use(struct imapc_mailbox_list_iterate_context *ctx,
 	str_truncate(ctx->special_use, 0);
 
 	for (i = 0; i < N_ELEMENTS(imap_list_flags); i++) {
-		if ((node->flags & imap_list_flags[i].flag) != 0) {
+		if ((node->flags & imap_list_flags[i].flag) != 0 &&
+		    (node->flags & MAILBOX_SPECIALUSE_MASK) != 0) {
 			str_append(ctx->special_use, imap_list_flags[i].str);
 			str_append_c(ctx->special_use, ' ');
 		}
@@ -679,6 +700,8 @@ imapc_list_iter_next(struct mailbox_list_iterate_context *_ctx)
 {
 	struct imapc_mailbox_list_iterate_context *ctx =
 		(struct imapc_mailbox_list_iterate_context *)_ctx;
+	struct imapc_mailbox_list *list =
+		(struct imapc_mailbox_list *)_ctx->list;
 	struct mailbox_node *node;
 	const char *vname;
 
@@ -693,6 +716,14 @@ imapc_list_iter_next(struct mailbox_list_iterate_context *_ctx)
 		if (node == NULL)
 			return NULL;
 	} while ((node->flags & MAILBOX_MATCHED) == 0);
+
+	if (ctx->info.ns->prefix_len > 0 &&
+	    strncmp(vname, ctx->info.ns->prefix, ctx->info.ns->prefix_len-1) == 0 &&
+	    vname[ctx->info.ns->prefix_len] == '\0' &&
+	    list->set->imapc_list_prefix[0] == '\0') {
+		/* don't return "" name */
+		return imapc_list_iter_next(_ctx);
+	}
 
 	ctx->info.vname = vname;
 	ctx->info.flags = node->flags;
@@ -779,7 +810,8 @@ static int imapc_list_set_subscribed(struct mailbox_list *_list,
 	struct imapc_simple_context ctx;
 
 	cmd = imapc_list_simple_context_init(&ctx, list);
-	imapc_command_sendf(cmd, set ? "SUBSCRIBE %s" : "UNSUBSCRIBE %s", name);
+	imapc_command_sendf(cmd, set ? "SUBSCRIBE %s" : "UNSUBSCRIBE %s",
+			    imapc_list_to_remote(list, name));
 	imapc_simple_run(&ctx);
 	return ctx.ret;
 }
@@ -796,15 +828,19 @@ imapc_list_delete_mailbox(struct mailbox_list *_list, const char *name)
 	capa = imapc_client_get_capabilities(list->client->client);
 
 	cmd = imapc_list_simple_context_init(&ctx, list);
-	imapc_command_set_flags(cmd, IMAPC_COMMAND_FLAG_SELECT);
-	if ((capa & IMAPC_CAPABILITY_UNSELECT) != 0)
-		imapc_command_sendf(cmd, "UNSELECT");
-	else
-		imapc_command_sendf(cmd, "SELECT \"~~~\"");
-	imapc_simple_run(&ctx);
+	if (!imapc_command_connection_is_selected(cmd))
+		imapc_command_abort(&cmd);
+	else {
+		imapc_command_set_flags(cmd, IMAPC_COMMAND_FLAG_SELECT);
+		if ((capa & IMAPC_CAPABILITY_UNSELECT) != 0)
+			imapc_command_sendf(cmd, "UNSELECT");
+		else
+			imapc_command_sendf(cmd, "SELECT \"~~~\"");
+		imapc_simple_run(&ctx);
+	}
 
 	cmd = imapc_list_simple_context_init(&ctx, list);
-	imapc_command_sendf(cmd, "DELETE %s", name);
+	imapc_command_sendf(cmd, "DELETE %s", imapc_list_to_remote(list, name));
 	imapc_simple_run(&ctx);
 
 	if (fs_list != NULL && ctx.ret == 0) {
@@ -851,7 +887,9 @@ imapc_list_rename_mailbox(struct mailbox_list *oldlist, const char *oldname,
 	}
 
 	cmd = imapc_list_simple_context_init(&ctx, list);
-	imapc_command_sendf(cmd, "RENAME %s %s", oldname, newname);
+	imapc_command_sendf(cmd, "RENAME %s %s",
+			    imapc_list_to_remote(list, oldname),
+			    imapc_list_to_remote(list, newname));
 	imapc_simple_run(&ctx);
 	if (ctx.ret == 0 && fs_list != NULL && oldlist == newlist) {
 		oldname = imapc_list_get_fs_name(list, oldname);
@@ -866,23 +904,14 @@ int imapc_list_get_mailbox_flags(struct mailbox_list *_list, const char *name,
 				 enum mailbox_info_flags *flags_r)
 {
 	struct imapc_mailbox_list *list = (struct imapc_mailbox_list *)_list;
-	struct imapc_command *cmd;
-	struct imapc_simple_context sctx;
 	struct mailbox_node *node;
 	const char *vname;
 
 	vname = mailbox_list_get_vname(_list, name);
-	if (!list->refreshed_mailboxes) {
-		node = mailbox_tree_lookup(list->mailboxes, vname);
-		if (node != NULL)
-			node->flags |= MAILBOX_NONEXISTENT;
-
-		/* refresh the mailbox flags */
-		cmd = imapc_list_simple_context_init(&sctx, list);
-		imapc_command_sendf(cmd, "LIST \"\" %s", name);
-		imapc_simple_run(&sctx);
-		if (sctx.ret < 0)
+	if (!list->refreshed_mailboxes_recently) {
+		if (imapc_list_refresh(list) < 0)
 			return -1;
+		i_assert(list->refreshed_mailboxes_recently);
 	}
 
 	node = mailbox_tree_lookup(list->mailboxes, vname);

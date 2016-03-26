@@ -5,16 +5,26 @@
 #include "mail-storage-settings.h"
 
 struct module;
+struct stats;
+struct fs_settings;
+struct ssl_iostream_settings;
 struct mail_user;
 
 struct mail_user_vfuncs {
 	void (*deinit)(struct mail_user *user);
+	void (*stats_fill)(struct mail_user *user, struct stats *stats);
 };
 
 struct mail_user {
 	pool_t pool;
 	struct mail_user_vfuncs v, *vlast;
 	int refcount;
+
+	/* User's creator if such exists. For example for autocreated shared
+	   mailbox users their creator is the logged in user. */
+	struct mail_user *creator;
+	/* Set if user was created via mail_storage_service. */
+	struct mail_storage_service_user *_service_user;
 
 	const char *username;
 	/* don't access the home directly. It may be set lazily. */
@@ -23,8 +33,10 @@ struct mail_user {
 	uid_t uid;
 	gid_t gid;
 	const char *service;
+	const char *session_id;
 	struct ip_addr *local_ip, *remote_ip;
-	const char *auth_token;
+	const char *auth_token, *auth_user;
+	const char *const *userdb_fields;
 
 	const struct var_expand_table *var_expand_table;
 	/* If non-NULL, fail the user initialization with this error.
@@ -38,7 +50,6 @@ struct mail_user {
 	struct mail_storage *storages;
 	ARRAY(const struct mail_storage_hooks *) hooks;
 
-	struct mountpoint_list *mountpoints;
 	normalizer_func_t *default_normalizer;
 	/* Filled lazily by mailbox_attribute_*() when accessing attributes. */
 	struct dict *_attr_dict;
@@ -58,6 +69,10 @@ struct mail_user {
 	unsigned int autocreated:1;
 	/* mail_user_init() has been called */
 	unsigned int initialized:1;
+	/* SET_STR_VARS in user's all settings have been expanded.
+	   This happens near the beginning of the user initialization,
+	   so this is rarely needed to be checked. */
+	unsigned int settings_expanded:1;
 	/* Shortcut to mail_storage_settings.mail_debug */
 	unsigned int mail_debug:1;
 	/* If INBOX can't be opened, log an error, but only once. */
@@ -70,6 +85,12 @@ struct mail_user {
 	unsigned int attr_dict_failed:1;
 	/* We're deinitializing the user */
 	unsigned int deinitializing:1;
+	/* Enable administrator user commands for the user */
+	unsigned int admin:1;
+	/* Enable all statistics gathering */
+	unsigned int stats_enabled:1;
+	/* Enable autoexpunging at deinit. */
+	unsigned int autoexpunge_enabled:1;
 };
 
 struct mail_user_module_register {
@@ -82,6 +103,7 @@ union mail_user_module_context {
 };
 extern struct mail_user_module_register mail_user_module_register;
 extern struct auth_master_connection *mail_user_auth_master_conn;
+extern const struct var_expand_func_table *mail_user_var_expand_func_table;
 
 struct mail_user *mail_user_alloc(const char *username,
 				  const struct setting_parser_info *set_info,
@@ -91,6 +113,10 @@ int mail_user_init(struct mail_user *user, const char **error_r);
 
 void mail_user_ref(struct mail_user *user);
 void mail_user_unref(struct mail_user **user);
+
+/* Duplicate a mail_user. mail_user_init() and mail_namespaces_init() need to
+   be called before the user is usable. */
+struct mail_user *mail_user_dup(struct mail_user *user);
 
 /* Find another user from the given user's namespaces. */
 struct mail_user *mail_user_find(struct mail_user *user, const char *name);
@@ -136,16 +162,19 @@ const char *mail_user_home_expand(struct mail_user *user, const char *path);
 int mail_user_try_home_expand(struct mail_user *user, const char **path);
 /* Returns unique user+ip identifier for anvil. */
 const char *mail_user_get_anvil_userip_ident(struct mail_user *user);
-/* Returns FALSE if path is in a mountpoint that should be mounted,
-   but isn't mounted. In such a situation it's better to fail than to attempt
-   any kind of automatic file/dir creations. error_r gives an error about which
-   mountpoint should be mounted. */
-bool mail_user_is_path_mounted(struct mail_user *user, const char *path,
-			       const char **error_r);
 
 /* Basically the same as mail_storage_find_class(), except automatically load
    storage plugins when needed. */
 struct mail_storage *
 mail_user_get_storage_class(struct mail_user *user, const char *name);
+
+/* Initialize fs_settings from mail_user settings. */
+void mail_user_init_fs_settings(struct mail_user *user,
+				struct fs_settings *fs_set,
+				struct ssl_iostream_settings *ssl_set);
+
+/* Fill statistics for user. By default there are no statistics, so stats
+   plugin must be loaded to have anything filled. */
+void mail_user_stats_fill(struct mail_user *user, struct stats *stats);
 
 #endif

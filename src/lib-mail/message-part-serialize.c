@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "buffer.h"
@@ -123,7 +123,7 @@ message_part_deserialize_part(struct deserialize_context *ctx,
 			      unsigned int siblings,
 			      struct message_part **part_r)
 {
-	struct message_part *part, *first_part, **next_part;
+	struct message_part *p, *part, *first_part, **next_part;
 	unsigned int children_count;
 	uoff_t pos;
 	bool root = parent == NULL;
@@ -135,6 +135,8 @@ message_part_deserialize_part(struct deserialize_context *ctx,
 
 		part = p_new(ctx->pool, struct message_part, 1);
 		part->parent = parent;
+		for (p = parent; p != NULL; p = p->parent)
+			p->children_count++;
 
 		if (!read_next(ctx, &part->flags, sizeof(part->flags)))
 			return FALSE;

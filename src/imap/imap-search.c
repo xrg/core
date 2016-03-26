@@ -1,4 +1,4 @@
-/* Copyright (c) 2002-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2002-2016 Dovecot authors, see the included COPYING file */
 
 #include "imap-common.h"
 #include "ostream.h"
@@ -15,7 +15,6 @@
 #include "imap-search-args.h"
 #include "imap-search.h"
 
-#include <stdlib.h>
 
 static int imap_search_deinit(struct imap_search_context *ctx);
 
@@ -236,9 +235,11 @@ imap_search_send_partial(struct imap_search_context *ctx, string_t *str)
 	ctx->partial1--;
 	ctx->partial2--;
 
-	/* we need to be able to handle non-sorted seq ranges, so do this
-	   ourself instead of using seq_range_array_*() functions. */
+	/* we need to be able to handle non-sorted seq ranges (for SORT
+	   replies), so do this ourself instead of using seq_range_array_*()
+	   functions. */
 	range = array_get_modifiable(&ctx->result, &count);
+	/* delete everything up to partial1 */
 	delete_count = 0;
 	for (i = n = 0; i < count; i++) {
 		diff = range[i].seq2 - range[i].seq1;
@@ -249,16 +250,22 @@ imap_search_send_partial(struct imap_search_context *ctx, string_t *str)
 		}
 		n += diff + 1;
 	}
-	for (n = ctx->partial1; i < count; i++) {
-		diff = range[i].seq2 - range[i].seq1;
-		if (n + diff >= ctx->partial2) {
-			range[i].seq2 = range[i].seq1 + (ctx->partial2 - n);
-			array_delete(&ctx->result, i + 1, count-(i+1));
-			break;
+	if (i == count) {
+		/* partial1 points past the result */
+		array_clear(&ctx->result);
+	} else {
+		/* delete everything after partial2 */
+		for (n = ctx->partial1; i < count; i++) {
+			diff = range[i].seq2 - range[i].seq1;
+			if (n + diff >= ctx->partial2) {
+				range[i].seq2 = range[i].seq1 + (ctx->partial2 - n);
+				array_delete(&ctx->result, i + 1, count-(i+1));
+				break;
+			}
+			n += diff + 1;
 		}
-		n += diff + 1;
+		array_delete(&ctx->result, 0, delete_count);
 	}
-	array_delete(&ctx->result, 0, delete_count);
 
 	if (array_count(&ctx->result) == 0) {
 		/* no results (in range) */
@@ -407,12 +414,10 @@ static bool cmd_search_more(struct client_command_context *cmd)
 	enum search_return_options opts = ctx->return_options;
 	struct mail *mail;
 	enum mailbox_sync_flags sync_flags;
-	struct timeval end_time;
 	const struct seq_range *range;
 	unsigned int count;
 	uint32_t id, id_min, id_max;
 	const char *ok_reply;
-	int time_msecs;
 	bool tryagain, minmax, lost_data;
 
 	if (cmd->cancel) {
@@ -491,23 +496,16 @@ static bool cmd_search_more(struct client_command_context *cmd)
 
 	lost_data = mailbox_search_seen_lost_data(ctx->search_ctx);
 	if (imap_search_deinit(ctx) < 0) {
-		client_send_storage_error(cmd,
-			mailbox_get_storage(cmd->client->mailbox));
+		client_send_box_error(cmd, cmd->client->mailbox);
 		return TRUE;
 	}
-
-	if (gettimeofday(&end_time, NULL) < 0)
-		memset(&end_time, 0, sizeof(end_time));
-
-	time_msecs = timeval_diff_msecs(&end_time, &ctx->start_time);
 
 	sync_flags = MAILBOX_SYNC_FLAG_FAST;
 	if (!cmd->uid || ctx->have_seqsets)
 		sync_flags |= MAILBOX_SYNC_FLAG_NO_EXPUNGES;
-	ok_reply = t_strdup_printf("OK %s%s completed (%d.%03d secs).",
+	ok_reply = t_strdup_printf("OK %s%s completed",
 		lost_data ? "["IMAP_RESP_CODE_EXPUNGEISSUED"] " : "",
-		!ctx->sorting ? "Search"  : "Sort",
-		time_msecs/1000, time_msecs%1000);
+		!ctx->sorting ? "Search"  : "Sort");
 	return cmd_sync(cmd, sync_flags, 0, ok_reply);
 }
 
@@ -517,7 +515,7 @@ static void cmd_search_more_callback(struct client_command_context *cmd)
 	bool finished;
 
 	o_stream_cork(client->output);
-	finished = cmd_search_more(cmd);
+	finished = command_exec(cmd);
 	o_stream_uncork(client->output);
 
 	if (!finished)
@@ -587,7 +585,6 @@ bool imap_search_start(struct imap_search_context *ctx,
 	ctx->search_ctx =
 		mailbox_search_init(ctx->trans, sargs, sort_program, 0, NULL);
 	ctx->sorting = sort_program != NULL;
-	(void)gettimeofday(&ctx->start_time, NULL);
 	i_array_init(&ctx->result, 128);
 	if ((ctx->return_options & SEARCH_RETURN_UPDATE) != 0)
 		imap_search_result_save(ctx);

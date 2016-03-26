@@ -1,4 +1,4 @@
-/* Copyright (c) 2004-2013 Dovecot authors, see the included COPYING file */
+/* Copyright (c) 2004-2016 Dovecot authors, see the included COPYING file */
 
 #include "lib.h"
 #include "array.h"
@@ -143,8 +143,13 @@ void io_loop_handle_remove(struct io_file *io, bool closed)
 		op = last ? EPOLL_CTL_DEL : EPOLL_CTL_MOD;
 
 		if (epoll_ctl(ctx->epfd, op, io->fd, &event) < 0) {
-			i_error("epoll_ctl(%s, %d) failed: %m",
+			const char *errstr = t_strdup_printf(
+				"epoll_ctl(%s, %d) failed: %m",
 				op == EPOLL_CTL_DEL ? "del" : "mod", io->fd);
+			if (errno == EBADF)
+				i_panic("%s", errstr);
+			else
+				i_error("%s", errstr);
 		}
 	}
 	if (last) {
@@ -156,7 +161,7 @@ void io_loop_handle_remove(struct io_file *io, bool closed)
 	i_free(io);
 }
 
-void io_loop_handler_run(struct ioloop *ioloop)
+void io_loop_handler_run_internal(struct ioloop *ioloop)
 {
 	struct ioloop_handler_context *ctx = ioloop->handler_context;
 	struct epoll_event *events;
@@ -172,7 +177,7 @@ void io_loop_handler_run(struct ioloop *ioloop)
 	msecs = io_loop_get_wait_time(ioloop, &tv);
 
 	events = array_get_modifiable(&ctx->events, &events_count);
-	if (events_count > 0) {
+	if (ioloop->io_files != NULL && events_count > ctx->deleted_count) {
 		ret = epoll_wait(ctx->epfd, events, events_count, msecs);
 		if (ret < 0 && errno != EINTR)
 			i_fatal("epoll_wait(): %m");
