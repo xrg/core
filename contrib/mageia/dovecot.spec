@@ -417,3 +417,6 @@ find %{buildroot} -name '*.la' -delete
 %{_includedir}/%{name}/*
 %{_libdir}/%{name}/dovecot-config
 %{_datadir}/aclocal/%{name}.m4
+
+
+%changelog -f %{_sourcedir}/%{name}-changelog.gitrpm.txt
