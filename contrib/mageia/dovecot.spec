@@ -333,6 +333,7 @@ find %{buildroot} -name '*.la' -delete
 %{_libdir}/%{name}/libdovecot-login.so*
 %{_libdir}/%{name}/libdovecot-sql.so*
 %{_libdir}/%{name}/libdovecot-storage.so*
+%{_libdir}/%{name}/libdovecot-dsync.so*
 
 %dir %{_libexecdir}/%{name}
 %{_libexecdir}/%{name}/aggregator
@@ -353,6 +354,7 @@ find %{buildroot} -name '*.la' -delete
 %{_libexecdir}/%{name}/imap-urlauth
 %{_libexecdir}/%{name}/imap-urlauth-login
 %{_libexecdir}/%{name}/imap-urlauth-worker
+%{_libexecdir}/%{name}/imap-hibernate
 %{_libexecdir}/%{name}/indexer
 %{_libexecdir}/%{name}/indexer-worker
 %{_libexecdir}/%{name}/ipc
@@ -382,6 +384,8 @@ find %{buildroot} -name '*.la' -delete
 %{_mandir}/man7/doveadm*.7*
 
 %{_var}/lib/rpm/filetriggers/%{name}.*
+
+%dir %{_datadir}/%{name}
 
 %if %{build_ldap}
 %files plugins-ldap
