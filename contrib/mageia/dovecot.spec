@@ -52,7 +52,7 @@ BuildRequires:	libcap-devel
 BuildRequires:	gettext-devel
 BuildRequires:	libgc-devel
 %if %{build_ldap}
-BuildRequires:	openldap-devel
+BuildRequires:	openldap2-devel
 %endif
 %if %{build_lucene}
 BuildRequires:	clucene-devel
