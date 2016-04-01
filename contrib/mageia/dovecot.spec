@@ -51,7 +51,6 @@ BuildRequires:	openssl-devel
 BuildRequires:	libsasl-devel
 BuildRequires:	libcap-devel
 BuildRequires:	gettext-devel
-BuildRequires:	libgc-devel
 %if %{build_ldap}
 BuildRequires:	openldap2-devel
 %endif
@@ -182,8 +181,6 @@ This package contains development files for dovecot.
 %prep
 %git_get_source
 %setup -q
-# Bug #27491
-
 
 
 %build
@@ -198,7 +195,7 @@ sed -i '/DEFAULT_INCLUDES *=/s|$| '"$(pkg-config --cflags libclucene-core)|" src
     --with-sql=plugin \
     --with-ssl=openssl \
     --with-nss \
-    --with-gc \
+    --without-gc \
     --with-libcap \
 %if %{build_ldap}
     --with-ldap=plugin \
