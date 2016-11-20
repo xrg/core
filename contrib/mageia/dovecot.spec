@@ -345,6 +345,7 @@ find %{buildroot} -name '*.la' -delete
 %{_libdir}/%{name}/libdovecot-sql.so*
 %{_libdir}/%{name}/libdovecot-storage.so*
 %{_libdir}/%{name}/libdovecot-dsync.so*
+%{_libdir}/%{name}/libdcrypt_openssl.so*
 
 %dir %{_libexecdir}/%{name}
 %{_libexecdir}/%{name}/aggregator
@@ -401,6 +402,7 @@ find %{buildroot} -name '*.la' -delete
 %if %{build_ldap}
 %files plugins-ldap
 %{_libdir}/%{name}/modules/auth/libauthdb_ldap.so
+%{_libdir}/%{name}/libdovecot-ldap.so*
 %endif
 
 %if %{build_gssapi}
