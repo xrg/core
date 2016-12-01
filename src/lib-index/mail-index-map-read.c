@@ -8,6 +8,7 @@
 #include "mail-index-private.h"
 #include "mail-index-sync-private.h"
 #include "mail-transaction-log-private.h"
+#include "ioloop.h"
 
 static void mail_index_map_copy_hdr(struct mail_index_map *map,
 				    const struct mail_index_header *hdr)
@@ -47,8 +48,11 @@ static int mail_index_mmap(struct mail_index_map *map, uoff_t file_size)
 				  MAP_PRIVATE, index->fd, 0);
 	if (rec_map->mmap_base == MAP_FAILED) {
 		rec_map->mmap_base = NULL;
-		mail_index_set_syscall_error(index, t_strdup_printf(
-			"mmap(size=%"PRIuUOFF_T")", file_size));
+		if (ioloop_time != index->last_mmap_error_time) {
+			index->last_mmap_error_time = ioloop_time;
+			mail_index_set_syscall_error(index, t_strdup_printf(
+				"mmap(size=%"PRIuUOFF_T")", file_size));
+		}
 		return -1;
 	}
 	rec_map->mmap_size = file_size;
@@ -72,7 +76,7 @@ static int mail_index_mmap(struct mail_index_map *map, uoff_t file_size)
 		/* Can't use this file */
 		mail_index_set_error(index, "Corrupted index file %s: %s",
 				     index->filepath, error);
-		return -1;
+		return 0;
 	}
 
 	rec_map->mmap_used_size = hdr->header_size +
@@ -155,7 +159,7 @@ mail_index_try_read_map(struct mail_index_map *map,
 			/* Can't use this file */
 			mail_index_set_error(index, "Corrupted index file %s: %s",
 					     index->filepath, error);
-			return -1;
+			return 0;
 		}
 
 		initial_buf_pos = pos;
@@ -437,6 +441,14 @@ int mail_index_map(struct mail_index *index,
 				   from transaction log */
 				ret = mail_index_sync_map(&index->map, type,
 							  TRUE, reason);
+			}
+			if (ret == 0) {
+				/* we fsck'd the index. try opening again. */
+				ret = mail_index_map_latest_file(index, &reason);
+				if (ret > 0 && index->indexid != 0) {
+					ret = mail_index_sync_map(&index->map,
+						type, TRUE, reason);
+				}
 			}
 		} else if (ret == 0 && !index->readonly) {
 			/* make sure we don't try to open the file again */

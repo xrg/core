@@ -48,6 +48,11 @@ struct mail_storage_vfuncs {
 					 const char *vname,
 					 enum mailbox_flags flags);
 	int (*purge)(struct mail_storage *storage);
+	/* Called when mailbox list index corruption has been detected.
+	   The callback should add any missing mailboxes to the list index.
+	   Returns 0 on success, -1 on temporary failure that didn't properly
+	   fix the index. */
+	int (*list_index_corrupted)(struct mail_storage *storage);
 };
 
 union mail_storage_module_context {
@@ -81,7 +86,9 @@ enum mail_storage_class_flags {
 	MAIL_STORAGE_CLASS_FLAG_HAVE_MAIL_GUID128 = 0x200,
 	/* Storage deletes all files internally - mailbox list's
 	   delete_mailbox() shouldn't delete anything itself. */
-	MAIL_STORAGE_CLASS_FLAG_NO_LIST_DELETES	= 0x400
+	MAIL_STORAGE_CLASS_FLAG_NO_LIST_DELETES	= 0x400,
+	/* Storage supports stubs (used for caching purposes). */
+	MAIL_STORAGE_CLASS_FLAG_STUBS = 0x800,
 };
 
 struct mail_binary_cache {
@@ -636,6 +643,10 @@ struct mail_save_data {
 struct mail_save_context {
 	struct mailbox_transaction_context *transaction;
 	struct mail *dest_mail;
+	/* Set during mailbox_copy(). This is useful when copying is
+	   implemented via save, and the save_*() methods want to access the
+	   source mail. */
+	struct mail *copy_src_mail;
 
 	/* data that changes for each saved mail */
 	struct mail_save_data data;

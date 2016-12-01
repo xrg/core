@@ -12,6 +12,12 @@
 
 #define MAILBOX_LIST_INDEX_REFRESH_DELAY_MSECS 1000
 
+/* dovecot.list.index.log doesn't have to be kept for that long. */
+#define MAILBOX_LIST_INDEX_LOG_ROTATE_MIN_SIZE (8*1024)
+#define MAILBOX_LIST_INDEX_LOG_ROTATE_MAX_SIZE (64*1024)
+#define MAILBOX_LIST_INDEX_LOG_ROTATE_SECS_AGO (5*60)
+#define MAILBOX_LIST_INDEX_LOG2_STALE_SECS (10*60)
+
 static void mailbox_list_index_init_finish(struct mailbox_list *list);
 
 struct mailbox_list_index_module mailbox_list_index_module =
@@ -73,6 +79,11 @@ int mailbox_list_index_index_open(struct mailbox_list *list)
 	mail_index_set_permissions(ilist->index, perm.file_create_mode,
 				   perm.file_create_gid,
 				   perm.file_create_gid_origin);
+	mail_index_set_log_rotation(ilist->index,
+				    MAILBOX_LIST_INDEX_LOG_ROTATE_MIN_SIZE,
+				    MAILBOX_LIST_INDEX_LOG_ROTATE_MAX_SIZE,
+				    MAILBOX_LIST_INDEX_LOG_ROTATE_SECS_AGO,
+				    MAILBOX_LIST_INDEX_LOG2_STALE_SECS);
 
 	mail_index_set_fsync_mode(ilist->index, set->parsed_fsync_mode, 0);
 	mail_index_set_lock_method(ilist->index, set->parsed_lock_method,
@@ -402,6 +413,8 @@ int mailbox_list_index_parse(struct mailbox_list *list,
 		/* nothing changed */
 		return 0;
 	}
+	if ((hdr->flags & MAIL_INDEX_HDR_FLAG_FSCKD) != 0)
+		ilist->call_corruption_callback = TRUE;
 
 	mailbox_list_index_reset(ilist);
 	ilist->sync_log_file_seq = hdr->log_file_seq;
@@ -414,7 +427,8 @@ int mailbox_list_index_parse(struct mailbox_list *list,
 			mail_index_mark_corrupted(ilist->index);
 			return -1;
 		}
-		ilist->corrupted = TRUE;
+		ilist->call_corruption_callback = TRUE;
+		ilist->corrupted_names_or_parents = TRUE;
 	}
 	if (mailbox_list_index_parse_records(ilist, view, &error) < 0) {
 		mailbox_list_set_critical(list,
@@ -426,7 +440,8 @@ int mailbox_list_index_parse(struct mailbox_list *list,
 		}
 		/* FIXME: find any missing mailboxes, add them and write the
 		   index back. */
-		ilist->corrupted = TRUE;
+		ilist->call_corruption_callback = TRUE;
+		ilist->corrupted_names_or_parents = TRUE;
 	}
 	return 0;
 }
@@ -489,6 +504,9 @@ int mailbox_list_index_refresh_force(struct mailbox_list *list)
 		ret = mailbox_list_index_parse(list, view, FALSE);
 	}
 	mail_index_view_close(&view);
+
+	if (mailbox_list_index_handle_corruption(list) < 0)
+		ret = -1;
 	return ret;
 }
 
@@ -535,6 +553,51 @@ void mailbox_list_index_refresh_later(struct mailbox_list *list)
 			timeout_add(MAILBOX_LIST_INDEX_REFRESH_DELAY_MSECS,
 				    mailbox_list_index_refresh_timeout, list);
 	}
+}
+
+int mailbox_list_index_handle_corruption(struct mailbox_list *list)
+{
+	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT(list);
+	struct mail_storage *const *storagep;
+	int ret = 0;
+
+	if (!ilist->call_corruption_callback)
+		return 0;
+
+	/* make sure we don't recurse */
+	if (ilist->handling_corruption)
+		return 0;
+	ilist->handling_corruption = TRUE;
+
+	array_foreach(&list->ns->all_storages, storagep) {
+		if ((*storagep)->v.list_index_corrupted != NULL) {
+			if ((*storagep)->v.list_index_corrupted(*storagep) < 0)
+				ret = -1;
+			else {
+				/* FIXME: implement a generic handler that
+				   just lists mailbox directories in filesystem
+				   and adds the missing ones to the index. */
+			}
+		}
+	}
+	if (ret == 0)
+		ret = mailbox_list_index_set_uncorrupted(list);
+	ilist->handling_corruption = FALSE;
+	return ret;
+}
+
+int mailbox_list_index_set_uncorrupted(struct mailbox_list *list)
+{
+	struct mailbox_list_index *ilist = INDEX_LIST_CONTEXT(list);
+	struct mailbox_list_index_sync_context *sync_ctx;
+
+	ilist->call_corruption_callback = FALSE;
+
+	if (mailbox_list_index_sync_begin(list, &sync_ctx) < 0)
+		return -1;
+
+	mail_index_unset_fscked(sync_ctx->trans);
+	return mailbox_list_index_sync_end(&sync_ctx, TRUE);
 }
 
 static void mailbox_list_index_deinit(struct mailbox_list *list)

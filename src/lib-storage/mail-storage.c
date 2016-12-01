@@ -1157,6 +1157,14 @@ static bool mailbox_try_undelete(struct mailbox *box)
 
 int mailbox_open(struct mailbox *box)
 {
+	/* check that the storage supports stubs if require them */
+	if (((box->flags & MAILBOX_FLAG_USE_STUBS) != 0) &&
+	    ((box->storage->storage_class->class_flags & MAIL_STORAGE_CLASS_FLAG_STUBS) == 0)) {
+		mail_storage_set_error(box->storage, MAIL_ERROR_NOTPOSSIBLE,
+				       "Mailbox does not support mail stubs");
+		return -1;
+	}
+
 	if (mailbox_open_full(box, NULL) < 0) {
 		if (!box->mailbox_deleted)
 			return -1;
@@ -1322,6 +1330,13 @@ int mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 	box->creating = FALSE;
 	if (ret == 0)
 		box->list->guid_cache_updated = TRUE;
+	else if (box->opened) {
+		/* Creation failed after (partially) opening the mailbox.
+		   It may not be in a valid state, so close it. */
+		mail_storage_last_error_push(box->storage);
+		mailbox_close(box);
+		mail_storage_last_error_pop(box->storage);
+	}
 	return ret;
 }
 
@@ -2250,7 +2265,9 @@ static int mailbox_copy_int(struct mail_save_context **_ctx, struct mail *mail)
 	}
 
 	i_assert(!ctx->copying_or_moving);
+	i_assert(ctx->copy_src_mail == NULL);
 	ctx->copying_or_moving = TRUE;
+	ctx->copy_src_mail = mail;
 	ctx->finishing = TRUE;
 	T_BEGIN {
 		ret = t->box->v.copy(ctx, backend_mail);
@@ -2265,6 +2282,7 @@ static int mailbox_copy_int(struct mail_save_context **_ctx, struct mail *mail)
 		mailbox_keywords_unref(&keywords);
 	i_assert(!ctx->unfinished);
 
+	ctx->copy_src_mail = NULL;
 	ctx->copying_via_save = FALSE;
 	ctx->copying_or_moving = FALSE;
 	ctx->saving = FALSE; /* if we came from mailbox_save_using_mail() */

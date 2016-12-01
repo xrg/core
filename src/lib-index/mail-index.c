@@ -16,7 +16,8 @@
 #include "mail-index-view-private.h"
 #include "mail-index-sync-private.h"
 #include "mail-index-modseq.h"
-#include "mail-transaction-log.h"
+#include "mail-transaction-log-private.h"
+#include "mail-transaction-log-view-private.h"
 #include "mail-cache.h"
 
 #include <stdio.h>
@@ -48,6 +49,15 @@ struct mail_index *mail_index_alloc(const char *dir, const char *prefix)
 	index->gid = (gid_t)-1;
 	index->lock_method = FILE_LOCK_METHOD_FCNTL;
 	index->max_lock_timeout_secs = UINT_MAX;
+
+	index->log_rotate_min_size =
+		MAIL_TRANSACTION_LOG_ROTATE_DEFAULT_MIN_SIZE;
+	index->log_rotate_max_size =
+		MAIL_TRANSACTION_LOG_ROTATE_DEFAULT_MAX_SIZE;
+	index->log_rotate_min_created_ago_secs =
+		MAIL_TRANSACTION_LOG_ROTATE_DEFAULT_TIME;
+	index->log_rotate_log2_stale_secs =
+		MAIL_TRANSACTION_LOG2_DEFAULT_STALE_SECS;
 
 	index->keywords_ext_id =
 		mail_index_ext_register(index, MAIL_INDEX_EXT_KEYWORDS,
@@ -110,6 +120,17 @@ void mail_index_set_lock_method(struct mail_index *index,
 {
 	index->lock_method = lock_method;
 	index->max_lock_timeout_secs = max_timeout_secs;
+}
+
+void mail_index_set_log_rotation(struct mail_index *index,
+				 uoff_t min_size, uoff_t max_size,
+				 unsigned int min_created_ago_secs,
+				 unsigned int log2_stale_secs)
+{
+	index->log_rotate_min_size = min_size;
+	index->log_rotate_max_size = max_size;
+	index->log_rotate_min_created_ago_secs = min_created_ago_secs;
+	index->log_rotate_log2_stale_secs = log2_stale_secs;
 }
 
 void mail_index_set_ext_init_data(struct mail_index *index, uint32_t ext_id,
@@ -600,7 +621,15 @@ int mail_index_open(struct mail_index *index, enum mail_index_open_flags flags)
 		mail_index_close_nonopened(index);
 		return ret;
 	}
+
 	index->open_count++;
+
+	if (index->log->head == NULL) {
+		mail_index_close(index);
+		mail_index_set_error(index, "Index is corrupted "
+					    "(log->view->head == NULL)");
+		return -1;
+	}
 
 	i_assert(index->map != NULL);
 	mail_index_alloc_cache_index_opened(index);
@@ -768,10 +797,7 @@ void mail_index_set_error(struct mail_index *index, const char *fmt, ...)
 		index->error = i_strdup_vprintf(fmt, va);
 		va_end(va);
 
-		if (ioloop_time != index->last_error_time) {
-			index->last_error_time = ioloop_time;
-			i_error("%s", index->error);
-		}
+		i_error("%s", index->error);
 	}
 }
 

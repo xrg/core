@@ -46,7 +46,10 @@ enum mail_index_header_compat_flags {
 enum mail_index_header_flag {
 	/* Index file is corrupted, reopen or recreate it. */
 	MAIL_INDEX_HDR_FLAG_CORRUPTED		= 0x0001,
-	MAIL_INDEX_HDR_FLAG_HAVE_DIRTY		= 0x0002
+	MAIL_INDEX_HDR_FLAG_HAVE_DIRTY		= 0x0002,
+	/* Index has been fsck'd. The caller may want to resync the index
+	   to make sure it's valid and drop this flag. */
+	MAIL_INDEX_HDR_FLAG_FSCKD		= 0x0004,
 };
 
 enum mail_index_mail_flags {
@@ -246,6 +249,14 @@ void mail_index_set_permissions(struct mail_index *index,
 void mail_index_set_lock_method(struct mail_index *index,
 				enum file_lock_method lock_method,
 				unsigned int max_timeout_secs);
+/* Rotate transaction log after it's a) min_size or larger and it was created
+   at least min_created_ago_secs or b) larger than max_size. Delete .log.2 when
+   it's older than log2_stale_secs. The defaults are min_size=32kB, max_size=1M,
+   min_created_ago_secs=5min, log2_stale_secs=2d. */
+void mail_index_set_log_rotation(struct mail_index *index,
+				 uoff_t min_size, uoff_t max_size,
+				 unsigned int min_created_ago_secs,
+				 unsigned int log2_stale_secs);
 /* When creating a new index file or reseting an existing one, add the given
    extension header data immediately to it. */
 void mail_index_set_ext_init_data(struct mail_index *index, uint32_t ext_id,
@@ -512,6 +523,9 @@ void mail_index_update_highest_modseq(struct mail_index_transaction *t,
 /* Reset the index before committing this transaction. This is usually done
    only when UIDVALIDITY changes. */
 void mail_index_reset(struct mail_index_transaction *t);
+/* Remove MAIL_INDEX_HDR_FLAG_FSCKD from header if it exists. This must be
+   called only during syncing so that the mailbox is locked. */
+void mail_index_unset_fscked(struct mail_index_transaction *t);
 /* Mark index deleted. No further changes will be possible after the
    transaction has been committed. */
 void mail_index_set_deleted(struct mail_index_transaction *t);
