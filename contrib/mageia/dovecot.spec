@@ -185,7 +185,8 @@ This package contains development files for dovecot.
 
 %build
 %serverbuild
-./autogen.sh
+DISTRO_BUILD=y ./autogen.sh
+
 %if %{build_lucene}
 sed -i '/DEFAULT_INCLUDES *=/s|$| '"$(pkg-config --cflags libclucene-core)|" src/plugins/fts-lucene/Makefile.in
 %endif

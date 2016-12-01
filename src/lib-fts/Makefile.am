@@ -41,13 +41,9 @@ EXTRA_DIST = \
 	word-break-data.c \
 	stopwords/stopwords_malformed.txt
 
-WordBreakProperty.txt:
-	test -f WordBreakProperty.txt || wget http://www.unicode.org/Public/UNIDATA/auxiliary/WordBreakProperty.txt
 $(srcdir)/word-boundary-data.c: word-properties.pl WordBreakProperty.txt
 	perl word-properties.pl boundaries WordBreakProperty.txt > $@
 
-PropList.txt:
-	test -f PropList.txt || wget http://www.unicode.org/Public/UNIDATA/PropList.txt
 $(srcdir)/word-break-data.c: word-properties.pl PropList.txt
 	perl word-properties.pl breaks PropList.txt > $@
 

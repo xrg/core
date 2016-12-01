@@ -17,7 +17,7 @@ for dir in $GETTEXT_DIR /usr/share/gettext /usr/local/share/gettext; do
   fi
 done
 
-if test ! -f doc/wiki/Authentication.txt; then
+if test "x$DISTRO_BUILD" == "x" && test ! -f doc/wiki/Authentication.txt; then
   cd doc
   wget https://www.dovecot.org/tmp/wiki2-export.tar.gz
   tar xzf wiki2-export.tar.gz
