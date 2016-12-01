@@ -193,6 +193,7 @@ sed -i '/DEFAULT_INCLUDES *=/s|$| '"$(pkg-config --cflags libclucene-core)|" src
 
 %configure2_5x \
     --disable-static \
+    --without-docs \
     --with-sql=plugin \
     --with-ssl=openssl \
     --with-nss \
@@ -288,11 +289,11 @@ find %{buildroot} -name '*.la' -delete
 %files
 %doc AUTHORS COPYING* NEWS README TODO
 %doc mboxcrypt.pl migration_wuimp_to_dovecot.pl
-%doc %{_docdir}/%{name}
+# dir %{_docdir}/%{name}/
 
 %dir %{_sysconfdir}/dovecot
 %dir %{_sysconfdir}/dovecot/conf.d
-%config(noreplace) %{_sysconfdir}/dovecot/README
+# config(noreplace) %{_sysconfdir}/dovecot/README
 #list all so we'll be noticed if upstream changes anything
 %config(noreplace) %{_sysconfdir}/dovecot/dovecot.conf
 %config(noreplace) %{_sysconfdir}/dovecot/dovecot-dict-auth.conf.ext
